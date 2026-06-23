@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbossh"
+version = "1.0.0"
+description = "SSH / serial / SFTP toolkit for automotive & embedded work — a Python library, a CLI, and a PyQt5 GUI with a real VT100 terminal. Native serial-over-RDP and offline OpenSSH install included."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "TurboSSH contributors" }]
+keywords = ["ssh", "sftp", "scp", "serial", "paramiko", "automation", "pyqt5",
+            "testing", "embedded", "automotive", "qnx", "rdp", "winrm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Terminals :: Serial",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "paramiko>=3.0",     # SSH / SFTP
+    "scp>=0.14",         # SCP-protocol transfers
+    "pyserial>=3.5",     # serial / COM-port handler
+    "keyring>=23.0",     # confidential password storage (OS vault)
+    "pywinrm>=0.4.3",    # WinRM bootstrap (enable sshd on Windows w/o SSH)
+    "pyte>=0.8.1",       # VT100 emulation for the GUI terminal (htop/vim/top)
+]
+
+[project.urls]
+Homepage = "https://nvnkennedy.github.io/turbossh/"
+Repository = "https://github.com/nvnkennedy/turbossh"
+Documentation = "https://github.com/nvnkennedy/turbossh#readme"
+Changelog = "https://github.com/nvnkennedy/turbossh/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Only PyQt5 stays optional: it's a large GUI toolkit you only need when
+# building a GUI, and forcing it would bloat headless/CI installs.
+gui = ["PyQt5>=5.15"]
+all = ["PyQt5>=5.15"]
+
+[project.scripts]
+turbossh = "turbossh.cli:main"
+turbossh-setup = "turbossh.cli:setup_server_main"
+turbossh-docs = "turbossh.cli:open_docs"
+turbossh-shortcut = "turbossh.cli:create_shortcut"
+
+[project.gui-scripts]
+turbossh-gui = "turbossh.cli:launch_gui"
+
+[tool.setuptools]
+packages = ["turbossh", "turbossh.gui", "turbossh.gui.tabs"]
+
+[tool.setuptools.package-data]
+turbossh = ["*.ps1", "*.md", "openssh/*.zip", "assets/*.ico", "assets/*.png",
+            "bin/*.exe"]

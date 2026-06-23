@@ -1,0 +1,7 @@
+# Core (always required)
+paramiko>=3.0
+
+# Optional — install what you need:
+keyring>=23.0    # confidential password storage in the OS credential vault
+scp>=0.14        # SCP-protocol transfers (SFTP push/pull works without this)
+PyQt5>=5.15      # only for the PyQt5 worker (ssh_handler.pyqt_worker)

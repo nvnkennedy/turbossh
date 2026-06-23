@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+# PyInstaller writes a spec to the repo root on --onefile; keep only the
+# maintained one under scripts/.
+/turbossh-gui.spec
+# The bundled GUI executable (~75 MB) is a build artifact — it ships inside the
+# PyPI wheel and as a GitHub Release asset, not in the source tree. Rebuild it
+# with `python scripts/build_exe.py --onefile` and copy it here before building
+# the wheel.
+turbossh/bin/*.exe
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

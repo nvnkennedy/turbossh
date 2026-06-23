@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TurboSSH — SSH, serial & SFTP for embedded work</title>
+<meta name="description" content="A Paramiko-based SSH / serial / SFTP toolkit you can use as a Python library, a CLI, or a desktop GUI. Native serial-over-RDP, offline OpenSSH install, and a real VT100 terminal.">
+<link rel="icon" href="logo.png">
+<style>
+  :root{
+    --bg:#0a0a0c; --panel:#131317; --raised:#1b1b21; --border:#2a2d33;
+    --text:#e8eaee; --dim:#9aa3ad; --accent:#28c2d6; --accent2:#48d6e8;
+    --danger:#ff6b5e; --radius:14px; --max:1080px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:16px/1.65 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent2); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre{font-family:"SF Mono",Consolas,Menlo,monospace}
+  .wrap{max-width:var(--max); margin:0 auto; padding:0 22px}
+
+  header{
+    position:sticky; top:0; z-index:10; backdrop-filter:blur(10px);
+    background:rgba(10,10,12,.72); border-bottom:1px solid var(--border);
+  }
+  header .wrap{display:flex; align-items:center; gap:14px; height:62px}
+  header img{width:30px; height:30px}
+  header .name{font-weight:700; letter-spacing:.3px}
+  header nav{margin-left:auto; display:flex; gap:22px; font-size:15px}
+  header nav a{color:var(--dim)}
+  header nav a:hover{color:var(--text); text-decoration:none}
+
+  .hero{padding:84px 0 60px; text-align:center}
+  .hero img{width:96px; height:96px; margin-bottom:18px;
+    filter:drop-shadow(0 6px 22px rgba(40,194,214,.35))}
+  .hero h1{font-size:54px; margin:0 0 10px; letter-spacing:-1px}
+  .hero .tag{font-size:21px; color:var(--dim); max-width:680px; margin:0 auto 30px}
+  .hero .tag b{color:var(--text); font-weight:600}
+
+  .install{
+    display:inline-flex; align-items:center; gap:14px; background:var(--panel);
+    border:1px solid var(--border); border-radius:12px; padding:12px 16px;
+    font-family:Consolas,monospace; font-size:16px; margin-bottom:26px;
+  }
+  .install .dollar{color:var(--accent)}
+  .install button{
+    background:var(--raised); color:var(--dim); border:1px solid var(--border);
+    border-radius:7px; padding:5px 11px; cursor:pointer; font-size:13px;
+  }
+  .install button:hover{color:var(--text); border-color:var(--accent)}
+
+  .cta{display:flex; gap:14px; justify-content:center; flex-wrap:wrap}
+  .btn{
+    display:inline-block; padding:13px 26px; border-radius:11px; font-weight:700;
+    font-size:16px; cursor:pointer; border:1px solid transparent;
+  }
+  .btn.primary{background:var(--accent); color:#042830}
+  .btn.primary:hover{background:var(--accent2); text-decoration:none}
+  .btn.ghost{background:transparent; color:var(--text); border-color:var(--border)}
+  .btn.ghost:hover{border-color:var(--accent); text-decoration:none}
+
+  section{padding:54px 0; border-top:1px solid var(--border)}
+  h2{font-size:30px; margin:0 0 8px; letter-spacing:-.4px}
+  .sub{color:var(--dim); margin:0 0 34px; font-size:17px}
+
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:18px}
+  .card{
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    padding:22px; transition:border-color .15s, transform .15s;
+  }
+  .card:hover{border-color:var(--accent); transform:translateY(-2px)}
+  .card .ico{font-size:24px; margin-bottom:10px}
+  .card h3{margin:0 0 7px; font-size:18px}
+  .card p{margin:0; color:var(--dim); font-size:15px}
+
+  pre{
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    padding:20px 22px; overflow:auto; font-size:14.5px; line-height:1.7;
+  }
+  pre .c{color:var(--dim)}        /* comment */
+  pre .k{color:var(--accent2)}    /* keyword/name */
+  pre .s{color:#7ee0b0}          /* string */
+
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:22px}
+  @media(max-width:760px){
+    .hero h1{font-size:40px} .two{grid-template-columns:1fr}
+    header nav{gap:14px}
+  }
+
+  footer{padding:40px 0 60px; color:var(--dim); font-size:14px; text-align:center;
+    border-top:1px solid var(--border)}
+  footer a{color:var(--dim)}
+</style>
+</head>
+<body>
+
+<header><div class="wrap">
+  <img src="logo.png" alt="TurboSSH logo">
+  <span class="name">TurboSSH</span>
+  <nav>
+    <a href="#features">Features</a>
+    <a href="#start">Quick start</a>
+    <a href="https://pypi.org/project/turbossh/">PyPI</a>
+    <a href="https://github.com/nvnkennedy/turbossh">GitHub</a>
+  </nav>
+</div></header>
+
+<div class="hero"><div class="wrap">
+  <img src="logo.png" alt="TurboSSH">
+  <h1>TurboSSH</h1>
+  <p class="tag">SSH, serial, and SFTP for people who live on <b>embedded and
+    automotive</b> boxes. One toolkit — a <b>Python library</b>, a <b>CLI</b>,
+    and a <b>desktop GUI</b> with a real VT100 terminal.</p>
+
+  <div class="install">
+    <span><span class="dollar">$</span> pip install turbossh</span>
+    <button onclick="navigator.clipboard.writeText('pip install turbossh');this.textContent='Copied'">Copy</button>
+  </div>
+
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/nvnkennedy/turbossh/releases/latest">Download the GUI (Windows)</a>
+    <a class="btn ghost" href="https://pypi.org/project/turbossh/">View on PyPI</a>
+  </div>
+</div></div>
+
+<section id="features"><div class="wrap">
+  <h2>What it does</h2>
+  <p class="sub">Everything below is available from the library, the command
+    line, and the GUI.</p>
+  <div class="grid">
+    <div class="card"><div class="ico">🔌</div><h3>SSH, jump hosts, legacy gear</h3>
+      <p>Connect directly, through an RDP/Windows jump box, or to old ECUs that
+        only speak deprecated crypto. Typed results — exit code, stdout, timing.</p></div>
+    <div class="card"><div class="ico">📜</div><h3>Live logs</h3>
+      <p><code>slog2info -w</code>, <code>journalctl -f</code>, <code>dmesg -w</code>
+        streamed line by line, with regex matching and tee-to-file.</p></div>
+    <div class="card"><div class="ico">📁</div><h3>SFTP &amp; SCP</h3>
+      <p>A full remote-filesystem API and a graphical browser under every
+        session. Transfers run on their own channel, so nothing blocks.</p></div>
+    <div class="card"><div class="ico">🖥️</div><h3>Native serial over RDP</h3>
+      <p>Open a COM port that's plugged into the remote Windows box and type
+        into it like a real terminal — Tab-completion, Ctrl-C, the lot.</p></div>
+    <div class="card"><div class="ico">🔎</div><h3>Scan remote ports</h3>
+      <p>Ask the machine you're about to connect to which COM ports it actually
+        has, with friendly device names.</p></div>
+    <div class="card"><div class="ico">🖧</div><h3>Offline OpenSSH install</h3>
+      <p>Stand up <code>sshd</code> on a locked-down Windows box with no
+        internet — on the machine, or to a remote one over WinRM.</p></div>
+    <div class="card"><div class="ico">🚇</div><h3>Port forwarding</h3>
+      <p><code>ssh -L</code> / <code>ssh -R</code> tunnels through the same
+        connection or jump host.</p></div>
+    <div class="card"><div class="ico">🪟</div><h3>The GUI</h3>
+      <p>Tabbed sessions, split view, SFTP browser, log viewer, 10k-line
+        scrollback, and save-the-whole-session-to-disk.</p></div>
+    <div class="card"><div class="ico">🔐</div><h3>Credentials in the vault</h3>
+      <p>Passwords live in the OS keyring and are masked in logs — never in
+        plaintext in your scripts or on disk.</p></div>
+  </div>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <h2>Quick start</h2>
+  <p class="sub">The same object works as a library in a test framework or a
+    one-off script.</p>
+  <div class="two">
+    <pre><span class="c"># Python — in a test framework</span>
+<span class="k">from</span> turbossh <span class="k">import</span> SSHHandler, SSHConfig
+
+<span class="k">with</span> SSHHandler(SSHConfig(
+        host=<span class="s">"192.168.1.50"</span>,
+        username=<span class="s">"root"</span>, password=<span class="s">"…"</span>)) <span class="k">as</span> ssh:
+    print(ssh.run(<span class="s">"uname -a"</span>).text)
+    ssh.push(<span class="s">"build/app"</span>, <span class="s">"/tmp/app"</span>)
+    ssh.serial_stream(<span class="s">"COM4"</span>, on_line=print)</pre>
+    <pre><span class="c"># CLI — in a shell script</span>
+$ turbossh run    --host H --user U uname -a
+$ turbossh stream --host H --user U slog2info -w
+$ turbossh serial-ssh --host H --user U \
+      --device COM4 --baud 115200 --save log.txt
+$ turbossh scan-ports --host H --user U
+
+<span class="c"># or just launch the desktop app</span>
+$ turbossh-gui</pre>
+  </div>
+</div></section>
+
+<section id="download"><div class="wrap">
+  <h2>Get it</h2>
+  <p class="sub">Pick whichever fits how you work.</p>
+  <div class="grid">
+    <div class="card"><h3>pip</h3><p>Library + CLI + the GUI launcher.<br>
+      <code>pip install turbossh</code> then <code>turbossh-gui</code>.</p></div>
+    <div class="card"><h3>Windows .exe</h3><p>The GUI as a single self-contained
+      executable — <a href="https://github.com/nvnkennedy/turbossh/releases/latest">download the latest release</a>, no Python needed.</p></div>
+    <div class="card"><h3>Docs</h3><p>Read the
+      <a href="https://github.com/nvnkennedy/turbossh#readme">full README</a> and the
+      <a href="https://github.com/nvnkennedy/turbossh/blob/main/ARCHITECTURE.md">architecture notes</a>.</p></div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  TurboSSH · MIT licensed ·
+  <a href="https://pypi.org/project/turbossh/">PyPI</a> ·
+  <a href="https://github.com/nvnkennedy/turbossh">GitHub</a>
+</div></footer>
+
+</body>
+</html>
