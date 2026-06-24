@@ -48,41 +48,6 @@ class _PortScanThread(QThread):
                     pass
 
 
-class _CamScanThread(QThread):
-    """Connect over SSH, make sure ffmpeg is on the remote, and list its cameras."""
-    progress = pyqtSignal(str)
-    done = pyqtSignal(list)
-    fail = pyqtSignal(str)
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-
-    def run(self):
-        from ..core import SSHHandler
-        from ..results import OperationResult
-        from . import ffmpeg_tools
-        h = None
-        try:
-            local = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit)
-            h = SSHHandler(self.cfg, safe=True)
-            res = h.connect()
-            if isinstance(res, OperationResult) and not res.success:
-                self.fail.emit(str(res.error)); return
-            remote = ffmpeg_tools.ensure_remote_ffmpeg(h, local, self.progress.emit)
-            r = h.list_cameras(ffmpeg=remote)
-            cams = r.value if isinstance(r, OperationResult) else r
-            self.done.emit(list(cams or []))
-        except Exception as exc:
-            self.fail.emit(f"{type(exc).__name__}: {exc}")
-        finally:
-            if h is not None:
-                try:
-                    h.disconnect()
-                except Exception:
-                    pass
-
-
 def _hint(text: str) -> QLabel:
     """A small dim description line shown under a group title."""
     lab = QLabel(text)
@@ -132,11 +97,9 @@ class SessionDialog(QDialog):
         trow = QHBoxLayout()
         self.rb = {"ssh": QRadioButton("SSH"),
                    "serial": QRadioButton("Serial")}
-        # Camera is an opt-in feature — only offer it when enabled in Settings.
-        from . import settings as _s
-        self._camera_enabled = bool(_s.get("camera_enabled"))
-        if self._camera_enabled:
-            self.rb["camera"] = QRadioButton("Camera")
+        # Camera is NOT a session type — it's its own panel (Local/Remote), so the
+        # session dialog only handles SSH and Serial.
+        self.cam_box = None
         self._grp = QButtonGroup(self)
         for k, b in self.rb.items():
             self._grp.addButton(b)
@@ -254,34 +217,6 @@ class SessionDialog(QDialog):
                                   "the COM port there. Use ‘Scan remote’ to list its ports.")
         rv.addWidget(self.ser_ssh_hint)
         lay.addWidget(self.ser_box)
-
-        # --- Camera group (only built when the feature is enabled) ---
-        self.cam_box = None
-        if self._camera_enabled:
-            self.cam_box = QGroupBox("Camera")
-            cv = QVBoxLayout(self.cam_box)
-            cv.addWidget(_hint("Stream a webcam on the RDP machine. Fill the machine's "
-                               "SSH details above, then ‘Scan cameras’ and pick one."))
-            cf = QFormLayout(); cv.addLayout(cf)
-            self.camera = QComboBox(); self.camera.setEditable(True)
-            self.cam_scan = QPushButton("🔍 Scan cameras"); self.cam_scan.setProperty("role", "ghost")
-            self.cam_scan.clicked.connect(self._scan_cameras)
-            cam_row = QHBoxLayout(); cam_row.setContentsMargins(0, 0, 0, 0)
-            cam_row.addWidget(self.camera, 1); cam_row.addWidget(self.cam_scan)
-            cam_w = QWidget(); cam_w.setLayout(cam_row)
-            self.cam_res = QComboBox()
-            self.cam_res.addItems(["640x480", "800x600", "1280x720", "1920x1080"])
-            self.cam_res.setCurrentText("640x480")
-            self.cam_fps = QComboBox()
-            self.cam_fps.addItems(["10", "15", "20", "30"]); self.cam_fps.setCurrentText("15")
-            cf.addRow("Camera", cam_w)
-            cf.addRow("Resolution", self.cam_res)
-            cf.addRow("FPS", self.cam_fps)
-            self.cam_status = QLabel(""); self.cam_status.setWordWrap(True)
-            self.cam_status.setStyleSheet("color:#8a8a8a; font-size:8.5pt;")
-            cv.addWidget(self.cam_status)
-            lay.addWidget(self.cam_box)
-
         lay.addStretch(1)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -494,48 +429,6 @@ class SessionDialog(QDialog):
             "Could not list the serial ports:\n\n" + msg +
             "\n\nCheck the Host / User / Password (and jump host, if used) are "
             "correct, then try again.")
-
-    # ---- scan remote cameras (needs ffmpeg on the remote) ----
-    def _scan_cameras(self):
-        if not self.host.text().strip():
-            QMessageBox.warning(self, "RDP host needed",
-                                "Enter the RDP machine's host and login above, then "
-                                "Scan cameras.")
-            return
-        from .session_widgets import config_from_session
-        cfg = config_from_session(self.result_session(),
-                                  self.password_value(), self.jump_password_value())
-        self.cam_scan.setEnabled(False)
-        self.cam_status.setText("⏳ Preparing ffmpeg and scanning cameras "
-                                "(first run downloads ffmpeg)…")
-        self._camscan = _CamScanThread(cfg)
-        self._camscan.progress.connect(lambda m: self.cam_status.setText(m))
-        self._camscan.done.connect(self._cam_scan_done)
-        self._camscan.fail.connect(self._cam_scan_fail)
-        self._camscan.start()
-
-    def _cam_scan_done(self, cams):
-        self.cam_scan.setEnabled(True)
-        keep = self.camera.currentText().strip()
-        self.camera.clear()
-        for c in cams:
-            self.camera.addItem(c)
-        if cams:
-            self.camera.setCurrentText(keep if keep in cams else cams[0])
-            self.cam_status.setText(f"✓ Found {len(cams)} camera(s): {', '.join(cams)}")
-        else:
-            if keep:
-                self.camera.setEditText(keep)
-            self.cam_status.setText("No cameras found on that machine.")
-        self._refit()
-
-    def _cam_scan_fail(self, msg):
-        self.cam_scan.setEnabled(True)
-        self.cam_status.setText("✗ Scan failed (see popup).")
-        QMessageBox.warning(self, "Couldn't scan cameras",
-                            "Could not list cameras:\n\n" + msg +
-                            "\n\nCheck the RDP host/login, and that ffmpeg could be "
-                            "fetched (or set a local ffmpeg path in Settings).")
 
     def _screen(self):
         from PyQt5.QtWidgets import QApplication

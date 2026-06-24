@@ -2,6 +2,19 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.2.0 — 2026-06-24
+
+### Changed
+- **Reworked the camera into a Local/Remote panel.** It's now its own tab with
+  a source selector — **Local (this PC)** by default, or any saved machine as a
+  remote source — instead of a connect-a-session flow. Pick a source, pick a
+  camera, Start. The live view is front-and-centre.
+
+### Added
+- **View any local camera** (no SSH needed), as well as remote ones.
+- More reliable camera detection — handles both ffmpeg `-list_devices` output
+  formats, so cameras that previously showed as "not available" are found.
+
 ## 1.1.0 — 2026-06-24
 
 ### Added

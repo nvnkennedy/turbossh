@@ -195,7 +195,7 @@ class MainWindow(QMainWindow):
                          QKeySequence("Ctrl+N"))
         from . import settings as _s
         if _s.get("camera_enabled"):
-            m_file.addAction(ic("📷"), "New camera session…", self.new_camera_session)
+            m_file.addAction(ic("📷"), "Camera…", self.open_camera_panel)
         m_file.addAction(ic("💾"), "Save terminal output…", self._save_current_output,
                          QKeySequence("Ctrl+S"))
         m_file.addSeparator()
@@ -431,7 +431,7 @@ class MainWindow(QMainWindow):
         ]
         # Camera is opt-in — only add its ribbon button when enabled in Settings.
         if _s.get("camera_enabled"):
-            items.insert(1, ("📷", "Camera", self.new_camera_session))
+            items.insert(1, ("📷", "Camera", self.open_camera_panel))
         for emoji, label, slot in items:
             act = QAction(theme.emoji_icon(emoji), label, self)
             act.triggered.connect(slot)
@@ -619,8 +619,6 @@ class MainWindow(QMainWindow):
             if t == "serial":
                 icon = "📡" if s.get("via_ssh") else "🔌"
                 sub = "serial/ssh" if s.get("via_ssh") else "serial"
-            elif t == "camera":
-                icon = "📷"; sub = "camera"
             else:
                 icon = "🖥"; sub = "ssh"
             it = QListWidgetItem(f"{icon}  {s.get('name')}   ·  {sub}")
@@ -699,9 +697,13 @@ class MainWindow(QMainWindow):
                     break
             self.open_selected()
 
-    def new_camera_session(self, *_):
-        """Open the New-session dialog with the Camera type pre-selected."""
-        self.new_session(prefer_type="camera")
+    def open_camera_panel(self, *_):
+        """Open the Camera viewer in its own tab (Local/Remote, not a session)."""
+        from .camera_widget import CameraPanel
+        panel = CameraPanel(self.store)
+        panel.log.connect(self.log_panel.append)
+        idx = self.tabs.addTab(panel, "📷 Camera")
+        self.tabs.setCurrentIndex(idx)
 
     def edit_session(self):
         name = self._selected_name()
@@ -743,13 +745,8 @@ class MainWindow(QMainWindow):
                         return
                     self._close_tab(i)
                     break
-        if kind == "camera":
-            from .camera_widget import CameraSessionWidget
-            w = CameraSessionWidget(s, pw, jpw)
-        elif kind == "serial":
-            w = SerialSessionWidget(s, pw, jpw)
-        else:
-            w = SshSessionWidget(s, pw, jpw)
+        w = SerialSessionWidget(s, pw, jpw) if kind == "serial" \
+            else SshSessionWidget(s, pw, jpw)
         w.log.connect(self.log_panel.append)
         # connection popups / status (SSH sessions emit connected/failed)
         if hasattr(w, "failed"):

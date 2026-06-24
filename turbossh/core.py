@@ -42,6 +42,38 @@ except Exception:  # pragma: no cover
     _HAS_SCP = False
 
 
+def parse_dshow_devices(text: str) -> list:
+    """Parse camera names out of ffmpeg's ``-list_devices`` output. Handles both
+    formats: the newer ``"Cam" (video)`` lines and the older section-header style
+    (``DirectShow video devices`` … ``DirectShow audio devices``). Used for both
+    local and remote enumeration so they behave identically."""
+    import re
+    cams, in_video = [], False
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if "directshow video devices" in low:
+            in_video = True
+            continue
+        if "directshow audio devices" in low:
+            in_video = False
+            continue
+        if "alternative name" in low:
+            continue
+        m = re.search(r'"([^"]+)"', line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name.startswith("@device"):       # alt-name device path, skip
+            continue
+        if "(video)" in low or in_video:
+            cams.append(name)
+    seen, out = set(), []
+    for c in cams:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Interactive shell session
 # --------------------------------------------------------------------------- #
@@ -1102,17 +1134,7 @@ class SSHHandler:
             cmd = (f'"{ffmpeg}" -hide_banner -list_devices true -f dshow -i dummy')
             r = self._run(cmd, timeout=20, check=False, get_pty=False,
                           environment=None, encoding="utf-8")
-            text = (r.stdout or "") + "\n" + (r.stderr or "")
-            cams, in_video = [], False
-            import re
-            for line in text.splitlines():
-                if "(video)" in line:
-                    m = re.search(r'"([^"]+)"', line)
-                    if m:
-                        cams.append(m.group(1))
-                elif "(audio)" in line:
-                    in_video = False
-            return cams
+            return parse_dshow_devices((r.stdout or "") + "\n" + (r.stderr or ""))
         return self._guard("list_cameras", _do, safe=safe)
 
     def webcam_channel(self, camera: str, *, ffmpeg: str = "ffmpeg",

@@ -30,7 +30,7 @@ the GUI**, and **on the command line**.
 - [Connecting](#connecting) · [Running commands](#running-commands) ·
   [Live logs](#live-logs) · [Files (SFTP / SCP)](#files-sftp--scp)
 - [Serial ports](#serial-ports) · [Serial over RDP](#serial-over-rdp) ·
-  [Scanning remote ports](#scanning-remote-ports) · [Remote webcam](#remote-webcam)
+  [Scanning remote ports](#scanning-remote-ports) · [Camera](#camera)
 - [Port forwarding](#port-forwarding) ·
   [Installing an SSH server](#installing-an-ssh-server) ·
   [Credentials](#credentials)
@@ -334,28 +334,30 @@ turbossh scan-ports --host H --user U
 
 ---
 
-## Remote webcam
+## Camera
 
-Watch a webcam that's plugged into the RDP machine, live in TurboSSH. It runs
-ffmpeg on the remote box, streams MJPEG back over its **own** SSH connection and
-threads (so it never slows the terminal/serial work), and shows it in a Camera
-tab with snapshot / record / pause / stop. It's **opt-in** — turn it on in
-**Settings → Enable camera** first (the Camera button stays hidden otherwise).
+Watch any camera — **on your own machine** or **on a remote machine** — live in
+TurboSSH. It's **opt-in**: turn it on in **Settings → Enable camera** and a
+**📷 Camera** button appears in the ribbon (it stays hidden otherwise).
+
+**In the GUI.** The Camera button opens a panel with the view front-and-centre:
+1. Pick a **Source** — *Local (this PC)* (the default, no connecting) or any
+   saved machine as a remote source.
+2. Pick a **Camera** from the list (Refresh re-scans), then **Start**.
+3. Use **Snapshot**, **Record**, **Pause**; saved files show an *open folder*
+   link. Files save on your laptop.
+
+Local needs nothing but ffmpeg. For a remote source, it connects over that
+saved machine's own SSH connection on its own threads (so it never slows the
+terminal/serial work), runs ffmpeg there, and streams MJPEG back; closing the
+tab releases the remote camera. If a remote camera is busy it offers to take it.
 
 ffmpeg isn't bundled in the pip wheel (it would blow past PyPI's size limit), so
-the first time you use the camera it's fetched once from a GitHub release,
-cached, and pushed to the remote machine. For a fully offline setup, point
-**Settings → ffmpeg path** at a local `ffmpeg.exe`.
+the first time you use the camera it's fetched once from a public GitHub build,
+cached, and (for a remote source) pushed to that machine. For a fully offline
+setup, point **Settings → ffmpeg path** at a local `ffmpeg.exe`.
 
-**In the GUI.**
-1. **Settings → Enable camera**, then a **Camera** button appears in the ribbon.
-2. New session → **Camera** → fill in the RDP machine's SSH details.
-3. **Scan cameras** → pick one, set resolution/FPS, **OK**.
-4. The feed opens in its own tab: **Snapshot**, **Record**, **Pause**, **Stop**,
-   and an *open folder* link for saved files. Close the tab and the camera is
-   released. If it's already in use, it asks before taking it.
-
-**In a script.**
+**In a script** (the remote path):
 
 ```python
 for cam in ssh.list_cameras(ffmpeg=r"C:\ffmpeg\ffmpeg.exe"):

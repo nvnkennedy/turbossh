@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 import zipfile
+import subprocess
 import urllib.request
+
+from ..core import parse_dshow_devices
 
 _CACHE = os.path.join(os.path.expanduser("~"), ".turbossh", "ffmpeg")
 # BtbN's FFmpeg-Builds "latest" release — a stable, public Windows build URL.
@@ -94,3 +97,27 @@ def ensure_remote_ffmpeg(ssh, local_ffmpeg: str, log=lambda m: None) -> str:
         pass
     ssh.push(local_ffmpeg, remote_exe)
     return remote_exe
+
+
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def list_local_cameras(ffmpeg: str) -> list:
+    """List DirectShow cameras on THIS machine (Windows)."""
+    try:
+        p = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true",
+                            "-f", "dshow", "-i", "dummy"],
+                           capture_output=True, text=True, timeout=20,
+                           creationflags=_NO_WINDOW)
+        return parse_dshow_devices((p.stdout or "") + "\n" + (p.stderr or ""))
+    except Exception:
+        return []
+
+
+def local_capture_args(ffmpeg: str, camera: str, *, width: int = 640,
+                       height: int = 480, fps: int = 15, quality: int = 6) -> list:
+    """ffmpeg argv to capture a LOCAL camera and emit MJPEG on stdout."""
+    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "dshow",
+            "-rtbufsize", "64M", "-i", f"video={camera}",
+            "-vf", f"scale={int(width)}:{int(height)}", "-r", str(int(fps)),
+            "-f", "mjpeg", "-q:v", str(int(quality)), "-"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turbossh"
-version = "1.1.0"
+version = "1.2.0"
 description = "SSH / serial / SFTP toolkit for automotive & embedded work — a Python library, a CLI, and a PyQt5 GUI with a real VT100 terminal. Native serial-over-RDP and offline OpenSSH install included."
 readme = "README.md"
 requires-python = ">=3.8"
