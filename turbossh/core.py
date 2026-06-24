@@ -1090,6 +1090,72 @@ class SSHHandler:
 
         return self._guard("remote_serial_ports", _do, safe=safe)
 
+    # ------------------------------------------------------------------ #
+    # Remote webcam (ffmpeg/dshow on the remote -> MJPEG over SSH)
+    # ------------------------------------------------------------------ #
+    def list_cameras(self, *, ffmpeg: str = "ffmpeg", safe: Optional[bool] = None):
+        """List DirectShow video capture devices on the remote (Windows) host.
+        ``ffmpeg`` is the remote ffmpeg path. Returns a list of camera names."""
+        def _do():
+            self._ensure_connected()
+            # ffmpeg prints the device list to stderr; -list_devices then exits.
+            cmd = (f'"{ffmpeg}" -hide_banner -list_devices true -f dshow -i dummy')
+            r = self._run(cmd, timeout=20, check=False, get_pty=False,
+                          environment=None, encoding="utf-8")
+            text = (r.stdout or "") + "\n" + (r.stderr or "")
+            cams, in_video = [], False
+            import re
+            for line in text.splitlines():
+                if "(video)" in line:
+                    m = re.search(r'"([^"]+)"', line)
+                    if m:
+                        cams.append(m.group(1))
+                elif "(audio)" in line:
+                    in_video = False
+            return cams
+        return self._guard("list_cameras", _do, safe=safe)
+
+    def webcam_channel(self, camera: str, *, ffmpeg: str = "ffmpeg",
+                       width: int = 640, height: int = 480, fps: int = 15,
+                       quality: int = 6, force: bool = False):
+        """Open a raw SSH channel streaming the remote webcam as MJPEG (a series
+        of JPEG frames) on stdout. Read frames with ``.recv()``; close the channel
+        to stop. NO PTY (binary stream). ``force`` first clears a stale turbossh
+        ffmpeg holding the camera. Returns the paramiko channel."""
+        self._ensure_connected()
+        marker = "turbossh_cam"
+        # Run ffmpeg directly so the channel's process IS ffmpeg; its command line
+        # carries the marker (the pushed-ffmpeg path), so webcam_release can find
+        # and kill only our process. dshow capture -> rescale -> MJPEG to stdout.
+        cap = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow '
+               f'-rtbufsize 64M -i video="{camera}" '
+               f'-vf scale={int(width)}:{int(height)} -r {int(fps)} '
+               f'-f mjpeg -q:v {int(quality)} -')
+        if force:
+            kill = (
+                "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -eq 'ffmpeg.exe' -and $_.CommandLine -like "
+                f"'*{marker}*' }} | ForEach-Object {{ try{{ Stop-Process -Id "
+                "$_.ProcessId -Force }catch{} }; Start-Sleep -Milliseconds 400\" & ")
+            cmd = kill + cap
+        else:
+            cmd = cap
+        chan = self._client.get_transport().open_session()
+        chan.exec_command(cmd)
+        return chan
+
+    def webcam_release(self, *, ffmpeg_marker: str = "turbossh_cam",
+                       safe: Optional[bool] = None):
+        """Kill the remote ffmpeg started by :meth:`webcam_channel` (matched by
+        the pushed-ffmpeg path marker) so the camera is released cleanly."""
+        ps = (
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "
+            f"'ffmpeg.exe' -and $_.CommandLine -like '*{ffmpeg_marker}*' }} | "
+            "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} };"
+            "'released'")
+        cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
+        return self.run(cmd, timeout=15, safe=safe)
+
     def sudo(self, command: str, password: Optional[Union[str, Secret]] = None,
              *, timeout: Optional[float] = None, check: bool = False,
              safe: Optional[bool] = None):

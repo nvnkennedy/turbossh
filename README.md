@@ -30,7 +30,7 @@ the GUI**, and **on the command line**.
 - [Connecting](#connecting) · [Running commands](#running-commands) ·
   [Live logs](#live-logs) · [Files (SFTP / SCP)](#files-sftp--scp)
 - [Serial ports](#serial-ports) · [Serial over RDP](#serial-over-rdp) ·
-  [Scanning remote ports](#scanning-remote-ports)
+  [Scanning remote ports](#scanning-remote-ports) · [Remote webcam](#remote-webcam)
 - [Port forwarding](#port-forwarding) ·
   [Installing an SSH server](#installing-an-ssh-server) ·
   [Credentials](#credentials)
@@ -333,6 +333,40 @@ turbossh scan-ports --host H --user U
 ```
 
 ---
+
+## Remote webcam
+
+Watch a webcam that's plugged into the RDP machine, live in TurboSSH. It runs
+ffmpeg on the remote box, streams MJPEG back over its **own** SSH connection and
+threads (so it never slows the terminal/serial work), and shows it in a Camera
+tab with snapshot / record / pause / stop. It's **opt-in** — turn it on in
+**Settings → Enable camera** first (the Camera button stays hidden otherwise).
+
+ffmpeg isn't bundled in the pip wheel (it would blow past PyPI's size limit), so
+the first time you use the camera it's fetched once from a GitHub release,
+cached, and pushed to the remote machine. For a fully offline setup, point
+**Settings → ffmpeg path** at a local `ffmpeg.exe`.
+
+**In the GUI.**
+1. **Settings → Enable camera**, then a **Camera** button appears in the ribbon.
+2. New session → **Camera** → fill in the RDP machine's SSH details.
+3. **Scan cameras** → pick one, set resolution/FPS, **OK**.
+4. The feed opens in its own tab: **Snapshot**, **Record**, **Pause**, **Stop**,
+   and an *open folder* link for saved files. Close the tab and the camera is
+   released. If it's already in use, it asks before taking it.
+
+**In a script.**
+
+```python
+for cam in ssh.list_cameras(ffmpeg=r"C:\ffmpeg\ffmpeg.exe"):
+    print(cam)
+chan = ssh.webcam_channel("Integrated Camera", ffmpeg=r"C:\ffmpeg\ffmpeg.exe",
+                          width=640, height=480, fps=15)
+# chan.recv() yields MJPEG (concatenated JPEG frames); chan.close() to stop
+ssh.webcam_release()
+```
+
+(There's no CLI subcommand for the camera — it's a GUI/library feature.)
 
 ## Port forwarding
 

@@ -193,6 +193,9 @@ class MainWindow(QMainWindow):
         m_file = mb.addMenu("&File")
         m_file.addAction(ic("🖥"), "New session…", self.new_session,
                          QKeySequence("Ctrl+N"))
+        from . import settings as _s
+        if _s.get("camera_enabled"):
+            m_file.addAction(ic("📷"), "New camera session…", self.new_camera_session)
         m_file.addAction(ic("💾"), "Save terminal output…", self._save_current_output,
                          QKeySequence("Ctrl+S"))
         m_file.addSeparator()
@@ -412,6 +415,7 @@ class MainWindow(QMainWindow):
         tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         tb.setIconSize(QSize(26, 26))
         self.addToolBar(tb)
+        from . import settings as _s
         items = [
             ("🖥", "Session", self.new_session),
             ("📁", "SFTP", lambda: self._show_inner("SFTP")),
@@ -425,6 +429,9 @@ class MainWindow(QMainWindow):
             ("⚙", "Settings", self.show_settings),
             ("❓", "Help", self._open_docs),
         ]
+        # Camera is opt-in — only add its ribbon button when enabled in Settings.
+        if _s.get("camera_enabled"):
+            items.insert(1, ("📷", "Camera", self.new_camera_session))
         for emoji, label, slot in items:
             act = QAction(theme.emoji_icon(emoji), label, self)
             act.triggered.connect(slot)
@@ -612,6 +619,8 @@ class MainWindow(QMainWindow):
             if t == "serial":
                 icon = "📡" if s.get("via_ssh") else "🔌"
                 sub = "serial/ssh" if s.get("via_ssh") else "serial"
+            elif t == "camera":
+                icon = "📷"; sub = "camera"
             else:
                 icon = "🖥"; sub = "ssh"
             it = QListWidgetItem(f"{icon}  {s.get('name')}   ·  {sub}")
@@ -669,10 +678,12 @@ class MainWindow(QMainWindow):
         it = self.session_list.currentItem()
         return it.data(Qt.UserRole) if it else None
 
-    def new_session(self, *_, prefill_host=None):
+    def new_session(self, *_, prefill_host=None, prefer_type=None):
         dlg = SessionDialog(self)
         if prefill_host:
             dlg.host.setText(prefill_host)
+        if prefer_type and prefer_type in dlg.rb:
+            dlg.rb[prefer_type].setChecked(True)
         if dlg.exec_() == dlg.Accepted:
             s = dlg.result_session()
             if not s["name"]:
@@ -687,6 +698,10 @@ class MainWindow(QMainWindow):
                     self.session_list.setCurrentRow(i)
                     break
             self.open_selected()
+
+    def new_camera_session(self, *_):
+        """Open the New-session dialog with the Camera type pre-selected."""
+        self.new_session(prefer_type="camera")
 
     def edit_session(self):
         name = self._selected_name()
@@ -728,8 +743,13 @@ class MainWindow(QMainWindow):
                         return
                     self._close_tab(i)
                     break
-        w = SerialSessionWidget(s, pw, jpw) if kind == "serial" \
-            else SshSessionWidget(s, pw, jpw)
+        if kind == "camera":
+            from .camera_widget import CameraSessionWidget
+            w = CameraSessionWidget(s, pw, jpw)
+        elif kind == "serial":
+            w = SerialSessionWidget(s, pw, jpw)
+        else:
+            w = SshSessionWidget(s, pw, jpw)
         w.log.connect(self.log_panel.append)
         # connection popups / status (SSH sessions emit connected/failed)
         if hasattr(w, "failed"):

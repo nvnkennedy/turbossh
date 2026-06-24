@@ -17,6 +17,11 @@ DEFAULTS = {
     # teed to disk, so "Save all output" is unlimited regardless of this value.
     "term_scrollback": 10000,
     "default_baud": 115200,
+    # Camera (remote webcam over SSH via ffmpeg). Off by default — when off the
+    # Camera button/menu are hidden entirely. ffmpeg_path is an optional local
+    # ffmpeg.exe to use instead of the auto-fetched one (fully offline).
+    "camera_enabled": False,
+    "ffmpeg_path": "",
     "open_docs_first_run": True,
     "make_shortcut_first_run": True,
     # shared jump host (the RDP/Windows machine) — entered once in Settings and

@@ -71,8 +71,21 @@ class SettingsDialog(QDialog):
         sf.addWidget(self.docs); sf.addWidget(self.shortcut)
         lay.addWidget(startup)
 
-        lay.addWidget(QLabel("Theme & font apply immediately. Open tabs keep their "
-                             "current font until reopened."))
+        # Camera (remote webcam) — opt-in; when off the Camera button is hidden.
+        camera = QGroupBox("Camera (remote webcam over SSH)")
+        cf = QFormLayout(camera)
+        self.camera_enabled = QCheckBox("Enable camera feature")
+        self.camera_enabled.setChecked(self.cfg.get("camera_enabled", False))
+        self.camera_enabled.setToolTip("Adds a Camera session type + button. Needs "
+                                       "ffmpeg (auto-downloaded once, or set a path below).")
+        self.ffmpeg_path = QLineEdit(self.cfg.get("ffmpeg_path", ""))
+        self.ffmpeg_path.setPlaceholderText("optional: path to ffmpeg.exe (else auto-fetched)")
+        cf.addRow(self.camera_enabled)
+        cf.addRow("ffmpeg path", self.ffmpeg_path)
+        lay.addWidget(camera)
+
+        lay.addWidget(QLabel("Theme & font apply immediately. The Camera toggle and "
+                             "open tabs apply after reopening."))
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
@@ -91,4 +104,6 @@ class SettingsDialog(QDialog):
             "jump_host": self.jhost.text().strip(),
             "jump_user": self.juser.text().strip(),
             "jump_domain": self.jdomain.text().strip(),
+            "camera_enabled": self.camera_enabled.isChecked(),
+            "ffmpeg_path": self.ffmpeg_path.text().strip(),
         }

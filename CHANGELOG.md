@@ -2,6 +2,20 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.1.0 — 2026-06-24
+
+### Added
+- **Remote webcam** — stream a camera on the RDP machine over its own SSH
+  connection and dedicated threads (independent of the terminal/serial work).
+  A **Camera** session type with snapshot, video record, pause, stop, and an
+  open-folder link; files save locally. It checks whether the camera is in use
+  and offers to take it. Opt-in via **Settings → Enable camera** (the Camera
+  button/menu stay hidden until then).
+- ffmpeg is fetched once from a GitHub release, cached, and pushed to the remote
+  over SFTP — it is **not** bundled in the wheel (keeps it under PyPI's limit).
+  A local ffmpeg path can be set for fully offline use.
+- API: `list_cameras()`, `webcam_channel()`, `webcam_release()`.
+
 ## 1.0.1 — 2026-06-24
 
 ### Changed
