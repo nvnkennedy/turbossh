@@ -2,6 +2,12 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.0.1 — 2026-06-24
+
+### Changed
+- Documentation expanded with step-by-step usage for every feature across all
+  three interfaces (library, CLI, GUI). No code changes.
+
 ## 1.0.0 — 2026-06-24
 
 First stable release. The library, the CLI, and the GUI now cover the same

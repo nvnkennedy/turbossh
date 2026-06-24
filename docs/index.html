@@ -87,6 +87,21 @@
   pre .s{color:#7ee0b0}          /* string */
 
   .two{display:grid; grid-template-columns:1fr 1fr; gap:22px}
+
+  .feat{margin:0 0 34px}
+  .feat h3{font-size:21px; margin:0 0 4px; color:var(--accent2)}
+  .feat .d{color:var(--dim); margin:0 0 14px; font-size:15.5px; max-width:760px}
+  .ways{display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; align-items:start}
+  .way{background:var(--panel); border:1px solid var(--border);
+    border-radius:12px; padding:15px 17px}
+  .way .lbl{font-size:11.5px; text-transform:uppercase; letter-spacing:.7px;
+    color:var(--accent); font-weight:700; margin-bottom:9px}
+  .way pre{background:transparent; border:none; padding:0; font-size:12.7px;
+    line-height:1.6; margin:0}
+  .way ol{margin:0; padding-left:18px; color:var(--dim); font-size:13.5px; line-height:1.6}
+  .way li{margin-bottom:3px}
+
+  @media(max-width:880px){.ways{grid-template-columns:1fr}}
   @media(max-width:760px){
     .hero h1{font-size:40px} .two{grid-template-columns:1fr}
     header nav{gap:14px}
@@ -104,7 +119,7 @@
   <span class="name">TurboSSH</span>
   <nav>
     <a href="#features">Features</a>
-    <a href="#start">Quick start</a>
+    <a href="#usage">Usage</a>
     <a href="https://pypi.org/project/turbossh/">PyPI</a>
     <a href="https://github.com/nvnkennedy/turbossh">GitHub</a>
   </nav>
@@ -186,6 +201,125 @@ $ turbossh scan-ports --host H --user U
 
 <span class="c"># or just launch the desktop app</span>
 $ turbossh-gui</pre>
+  </div>
+</div></section>
+
+<section id="usage"><div class="wrap">
+  <h2>How to use each feature</h2>
+  <p class="sub">Every feature, three ways. The full reference is in the
+    <a href="https://github.com/nvnkennedy/turbossh#readme">README</a>.</p>
+
+  <div class="feat">
+    <h3>Connect — direct, jump host, or legacy gear</h3>
+    <p class="d">Nest a config in <code>jump_host</code> to hop through an RDP box first.</p>
+    <div class="ways">
+      <div class="way"><div class="lbl">Script</div><pre><span class="k">from</span> turbossh <span class="k">import</span> SSHHandler, SSHConfig
+cfg = SSHConfig(host=<span class="s">"target"</span>, username=<span class="s">"root"</span>,
+   jump_host=SSHConfig(host=<span class="s">"rdpbox"</span>,
+     username=<span class="s">"EU\\me"</span>, password=<span class="s">"…"</span>))
+ssh = SSHHandler(cfg)</pre></div>
+      <div class="way"><div class="lbl">GUI</div><ol>
+        <li>New session → <b>SSH</b></li>
+        <li>Host, User, Password</li>
+        <li>Tick <b>jump host</b> if needed</li>
+        <li>OK → terminal opens</li></ol></div>
+      <div class="way"><div class="lbl">CLI</div><pre>turbossh run \
+  --host H --user U \
+  --password uname -a</pre></div>
+    </div>
+  </div>
+
+  <div class="feat">
+    <h3>Run commands</h3>
+    <p class="d">Typed result back — exit code, stdout, stderr, timing.</p>
+    <div class="ways">
+      <div class="way"><div class="lbl">Script</div><pre>res = ssh.run(<span class="s">"systemctl is-active sshd"</span>)
+res.ok        <span class="c"># exit==0</span>
+res.text      <span class="c"># stdout</span>
+ssh.sudo(<span class="s">"mount -o remount,rw /"</span>)</pre></div>
+      <div class="way"><div class="lbl">GUI</div><ol>
+        <li>Open the <b>Terminal</b> tab</li>
+        <li>Type — Tab-complete, Ctrl-C and history all work</li>
+        <li><b>Quick</b> buttons fire common commands</li></ol></div>
+      <div class="way"><div class="lbl">CLI</div><pre>turbossh run \
+  --host H --user U \
+  uname -a</pre></div>
+    </div>
+  </div>
+
+  <div class="feat">
+    <h3>Follow live logs</h3>
+    <p class="d">slog2info / journalctl / dmesg, with regex match and tee-to-file.</p>
+    <div class="ways">
+      <div class="way"><div class="lbl">Script</div><pre>ssh.stream(<span class="s">"slog2info -w"</span>,
+   on_line=print,
+   match=<span class="s">r"E/.*panic"</span>,
+   save_to=<span class="s">"boot.log"</span>)</pre></div>
+      <div class="way"><div class="lbl">GUI</div><ol>
+        <li>Open the <b>Logs</b> tab</li>
+        <li>Pick a preset or type a command</li>
+        <li>Add a regex filter, hit <b>Start</b></li></ol></div>
+      <div class="way"><div class="lbl">CLI</div><pre>turbossh stream \
+  --host H --user U \
+  --match panic slog2info -w</pre></div>
+    </div>
+  </div>
+
+  <div class="feat">
+    <h3>Move files (SFTP / SCP)</h3>
+    <p class="d">A full remote filesystem, plus a browser in the GUI.</p>
+    <div class="ways">
+      <div class="way"><div class="lbl">Script</div><pre>ssh.push(<span class="s">"dist/"</span>, <span class="s">"/opt/app"</span>,
+         recursive=<span class="k">True</span>)
+ssh.pull(<span class="s">"/var/log"</span>, <span class="s">"logs/"</span>)
+ssh.read_text(<span class="s">"/proc/version"</span>)</pre></div>
+      <div class="way"><div class="lbl">GUI</div><ol>
+        <li>Open the <b>SFTP</b> tab</li>
+        <li>Browse, upload, download, mkdir, rename</li>
+        <li>Runs on its own channel — never blocks</li></ol></div>
+      <div class="way"><div class="lbl">CLI</div><pre>turbossh push --host H --user U \
+  ./build /opt/app --recursive
+turbossh pull … /var/log ./logs</pre></div>
+    </div>
+  </div>
+
+  <div class="feat">
+    <h3>Serial over RDP</h3>
+    <p class="d">A COM port on the remote Windows box, as a native terminal.</p>
+    <div class="ways">
+      <div class="way"><div class="lbl">Script</div><pre>ssh.serial_stream(<span class="s">"COM4"</span>,
+   baudrate=<span class="s">115200</span>, on_line=print,
+   save_to=<span class="s">"console.log"</span>)
+ssh.serial_write(<span class="s">"COM4"</span>, <span class="s">"reboot\n"</span>)</pre></div>
+      <div class="way"><div class="lbl">GUI</div><ol>
+        <li>New session → <b>Serial</b></li>
+        <li>Tick <b>Port is on the RDP machine</b></li>
+        <li><b>Scan remote</b> → pick the port</li>
+        <li>OK → type into it natively</li></ol></div>
+      <div class="way"><div class="lbl">CLI</div><pre>turbossh serial-ssh \
+  --host H --user U \
+  --device COM4 --baud 115200</pre></div>
+    </div>
+  </div>
+
+  <div class="feat">
+    <h3>Install an SSH server (offline)</h3>
+    <p class="d">Bundled OpenSSH, no internet. On the box, or to a remote one over WinRM.</p>
+    <div class="ways">
+      <div class="way"><div class="lbl">Script</div><pre><span class="k">from</span> turbossh <span class="k">import</span> \
+  enable_openssh_via_winrm_offline
+enable_openssh_via_winrm_offline(
+  <span class="s">"rdpbox"</span>, <span class="s">"EU\\me"</span>, <span class="s">"pw"</span>,
+  openssh_dir, log=print)</pre></div>
+      <div class="way"><div class="lbl">GUI</div><ol>
+        <li><b>SSH server</b> button</li>
+        <li><b>This PC</b> or <b>A remote machine</b></li>
+        <li>Approve the admin prompt</li></ol></div>
+      <div class="way"><div class="lbl">CLI</div><pre>turbossh-setup   <span class="c"># this PC</span>
+
+turbossh install-ssh-remote \
+  --host H --user "DOM\\admin"</pre></div>
+    </div>
   </div>
 </div></section>
 
