@@ -3,14 +3,15 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TurboSSH — SSH, serial & SFTP for embedded work</title>
-<meta name="description" content="A Paramiko-based SSH / serial / SFTP toolkit you can use as a Python library, a CLI, or a desktop GUI. Native serial-over-RDP, offline OpenSSH install, and a real VT100 terminal.">
+<title>TurboSSH — SSH, serial, SFTP &amp; remote camera for embedded work</title>
+<meta name="description" content="A Paramiko-based SSH / serial / SFTP toolkit you can use as a Python library, a CLI, or a desktop GUI. Native serial-over-RDP, remote webcam over SSH, offline OpenSSH install, and a real VT100 terminal with MobaXterm-style keyword highlighting.">
 <link rel="icon" href="logo.png">
 <style>
   :root{
     --bg:#0a0a0c; --panel:#131317; --raised:#1b1b21; --border:#2a2d33;
     --text:#e8eaee; --dim:#9aa3ad; --accent:#28c2d6; --accent2:#48d6e8;
-    --danger:#ff6b5e; --radius:14px; --max:1080px;
+    --green:#5fd38a; --amber:#d9bd6b; --danger:#ff6b5e;
+    --radius:14px; --max:1120px;
   }
   *{box-sizing:border-box}
   html{scroll-behavior:smooth}
@@ -23,29 +24,34 @@
   a:hover{text-decoration:underline}
   code,pre{font-family:"SF Mono",Consolas,Menlo,monospace}
   .wrap{max-width:var(--max); margin:0 auto; padding:0 22px}
+  p code,li code,td code{background:var(--raised); border:1px solid var(--border);
+    border-radius:6px; padding:1px 6px; font-size:13.5px; color:#cfe9ee}
 
   header{
-    position:sticky; top:0; z-index:10; backdrop-filter:blur(10px);
-    background:rgba(10,10,12,.72); border-bottom:1px solid var(--border);
+    position:sticky; top:0; z-index:20; backdrop-filter:blur(10px);
+    background:rgba(10,10,12,.78); border-bottom:1px solid var(--border);
   }
-  header .wrap{display:flex; align-items:center; gap:14px; height:62px}
-  header img{width:30px; height:30px}
+  header .wrap{display:flex; align-items:center; gap:14px; height:60px}
+  header img{width:28px; height:28px}
   header .name{font-weight:700; letter-spacing:.3px}
-  header nav{margin-left:auto; display:flex; gap:22px; font-size:15px}
+  header nav{margin-left:auto; display:flex; gap:20px; font-size:14.5px; flex-wrap:wrap}
   header nav a{color:var(--dim)}
   header nav a:hover{color:var(--text); text-decoration:none}
 
-  .hero{padding:84px 0 60px; text-align:center}
-  .hero img{width:96px; height:96px; margin-bottom:18px;
+  .hero{padding:78px 0 56px; text-align:center}
+  .hero img{width:92px; height:92px; margin-bottom:18px;
     filter:drop-shadow(0 6px 22px rgba(40,194,214,.35))}
   .hero h1{font-size:54px; margin:0 0 10px; letter-spacing:-1px}
-  .hero .tag{font-size:21px; color:var(--dim); max-width:680px; margin:0 auto 30px}
+  .hero .tag{font-size:20px; color:var(--dim); max-width:720px; margin:0 auto 18px}
   .hero .tag b{color:var(--text); font-weight:600}
+  .pills{display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin:0 auto 28px}
+  .pill{font-size:12.5px; color:var(--dim); background:var(--panel);
+    border:1px solid var(--border); border-radius:999px; padding:5px 12px}
 
   .install{
     display:inline-flex; align-items:center; gap:14px; background:var(--panel);
     border:1px solid var(--border); border-radius:12px; padding:12px 16px;
-    font-family:Consolas,monospace; font-size:16px; margin-bottom:26px;
+    font-family:Consolas,monospace; font-size:16px; margin-bottom:24px;
   }
   .install .dollar{color:var(--accent)}
   .install button{
@@ -64,9 +70,10 @@
   .btn.ghost{background:transparent; color:var(--text); border-color:var(--border)}
   .btn.ghost:hover{border-color:var(--accent); text-decoration:none}
 
-  section{padding:54px 0; border-top:1px solid var(--border)}
+  section{padding:56px 0; border-top:1px solid var(--border)}
   h2{font-size:30px; margin:0 0 8px; letter-spacing:-.4px}
-  .sub{color:var(--dim); margin:0 0 34px; font-size:17px}
+  h2 .em{color:var(--accent2)}
+  .sub{color:var(--dim); margin:0 0 34px; font-size:17px; max-width:780px}
 
   .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:18px}
   .card{
@@ -80,36 +87,85 @@
 
   pre{
     background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
-    padding:20px 22px; overflow:auto; font-size:14.5px; line-height:1.7;
+    padding:18px 20px; overflow:auto; font-size:14px; line-height:1.7;
   }
   pre .c{color:var(--dim)}        /* comment */
   pre .k{color:var(--accent2)}    /* keyword/name */
-  pre .s{color:#7ee0b0}          /* string */
+  pre .s{color:#7ee0b0}           /* string */
+  pre .o{color:var(--amber)}      /* option flag */
 
   .two{display:grid; grid-template-columns:1fr 1fr; gap:22px}
 
-  .feat{margin:0 0 34px}
-  .feat h3{font-size:21px; margin:0 0 4px; color:var(--accent2)}
-  .feat .d{color:var(--dim); margin:0 0 14px; font-size:15.5px; max-width:760px}
+  /* ---- CLI reference ---- */
+  .toc{display:flex; gap:8px; flex-wrap:wrap; margin:0 0 30px}
+  .toc a{font-size:13px; color:var(--dim); background:var(--panel);
+    border:1px solid var(--border); border-radius:8px; padding:6px 12px}
+  .toc a:hover{color:var(--text); border-color:var(--accent); text-decoration:none}
+
+  .grouptitle{font-size:13px; text-transform:uppercase; letter-spacing:1px;
+    color:var(--accent); font-weight:700; margin:30px 0 14px}
+  .cmd{background:var(--panel); border:1px solid var(--border);
+    border-radius:12px; padding:18px 20px; margin-bottom:14px}
+  .cmd-head{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px}
+  .cmd-head .cn{font-size:16px; font-weight:700; color:var(--text)}
+  .cmd-d{margin:0 0 12px; color:var(--dim); font-size:15px}
+  .cmd pre{margin:0 0 10px; background:#0d0d10; font-size:13.3px; padding:12px 14px}
+  .cmd .opts{margin:0; font-size:13.5px; color:var(--dim)}
+  .cmd .opts b{color:var(--text); font-weight:600}
+  .badge{font-size:11px; font-weight:700; letter-spacing:.4px; text-transform:uppercase;
+    padding:3px 8px; border-radius:999px; border:1px solid var(--border); color:var(--dim)}
+  .badge.local{color:var(--green); border-color:rgba(95,211,138,.4)}
+  .badge.ssh{color:var(--accent2); border-color:rgba(72,214,232,.4)}
+  .badge.win{color:var(--amber); border-color:rgba(217,189,107,.4)}
+  .badge.new{color:#042830; background:var(--accent); border-color:var(--accent)}
+
+  table{width:100%; border-collapse:collapse; font-size:14px;
+    background:var(--panel); border:1px solid var(--border); border-radius:12px; overflow:hidden}
+  th,td{text-align:left; padding:11px 14px; border-bottom:1px solid var(--border); vertical-align:top}
+  th{color:var(--dim); font-weight:600; font-size:12.5px; text-transform:uppercase; letter-spacing:.5px}
+  tr:last-child td{border-bottom:none}
+  td code{white-space:nowrap}
+
+  .callout{background:var(--raised); border:1px solid var(--border);
+    border-left:3px solid var(--accent); border-radius:10px; padding:14px 18px;
+    color:var(--dim); font-size:14.5px; margin:18px 0}
+  .callout b{color:var(--text)}
+
+  /* feature triple */
+  .feat{margin:0 0 30px}
+  .feat h3{font-size:20px; margin:0 0 4px; color:var(--accent2)}
+  .feat .d{color:var(--dim); margin:0 0 14px; font-size:15px; max-width:780px}
   .ways{display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; align-items:start}
   .way{background:var(--panel); border:1px solid var(--border);
     border-radius:12px; padding:15px 17px}
   .way .lbl{font-size:11.5px; text-transform:uppercase; letter-spacing:.7px;
     color:var(--accent); font-weight:700; margin-bottom:9px}
-  .way pre{background:transparent; border:none; padding:0; font-size:12.7px;
+  .way pre{background:transparent; border:none; padding:0; font-size:12.6px;
     line-height:1.6; margin:0}
   .way ol{margin:0; padding-left:18px; color:var(--dim); font-size:13.5px; line-height:1.6}
   .way li{margin-bottom:3px}
 
-  @media(max-width:880px){.ways{grid-template-columns:1fr}}
-  @media(max-width:760px){
-    .hero h1{font-size:40px} .two{grid-template-columns:1fr}
-    header nav{gap:14px}
+  /* terminal demo */
+  .term{background:#000; border:1px solid var(--border); border-radius:12px;
+    padding:16px 18px; font:13.5px/1.7 Consolas,monospace; overflow:auto; color:#cfd8e3}
+  .term .g{color:var(--green)} .term .r{color:var(--danger)} .term .a{color:var(--amber)}
+  .term .dim{color:#6b7480}
+
+  .split{display:grid; grid-template-columns:1.1fr .9fr; gap:24px; align-items:start}
+
+  @media(max-width:900px){.ways{grid-template-columns:1fr}}
+  @media(max-width:820px){
+    .hero h1{font-size:40px} .two,.split{grid-template-columns:1fr}
+    header nav{gap:12px}
   }
 
   footer{padding:40px 0 60px; color:var(--dim); font-size:14px; text-align:center;
     border-top:1px solid var(--border)}
   footer a{color:var(--dim)}
+  .top{position:fixed; right:18px; bottom:18px; background:var(--panel);
+    border:1px solid var(--border); border-radius:10px; padding:8px 12px;
+    font-size:13px; color:var(--dim)}
+  .top:hover{color:var(--text); border-color:var(--accent); text-decoration:none}
 </style>
 </head>
 <body>
@@ -119,7 +175,10 @@
   <span class="name">TurboSSH</span>
   <nav>
     <a href="#features">Features</a>
-    <a href="#usage">Usage</a>
+    <a href="#cli">CLI reference</a>
+    <a href="#camera">Camera</a>
+    <a href="#gui">Desktop app</a>
+    <a href="#python">Python API</a>
     <a href="https://pypi.org/project/turbossh/">PyPI</a>
     <a href="https://github.com/nvnkennedy/turbossh">GitHub</a>
   </nav>
@@ -128,9 +187,18 @@
 <div class="hero"><div class="wrap">
   <img src="logo.png" alt="TurboSSH">
   <h1>TurboSSH</h1>
-  <p class="tag">SSH, serial, and SFTP for people who live on <b>embedded and
-    automotive</b> boxes. One toolkit — a <b>Python library</b>, a <b>CLI</b>,
-    and a <b>desktop GUI</b> with a real VT100 terminal.</p>
+  <p class="tag">SSH, serial, SFTP and a remote camera for people who live on
+    <b>embedded and automotive</b> boxes. One toolkit — a <b>Python library</b>,
+    a <b>CLI</b>, and a <b>desktop GUI</b> with a real VT100 terminal.</p>
+
+  <div class="pills">
+    <span class="pill">Direct &amp; jump-host SSH</span>
+    <span class="pill">Native serial-over-RDP</span>
+    <span class="pill">Remote webcam over SSH</span>
+    <span class="pill">Offline OpenSSH install</span>
+    <span class="pill">Keyword highlighting</span>
+    <span class="pill">MIT licensed</span>
+  </div>
 
   <div class="install">
     <span><span class="dollar">$</span> pip install turbossh</span>
@@ -139,52 +207,61 @@
 
   <div class="cta">
     <a class="btn primary" href="https://github.com/nvnkennedy/turbossh/releases/latest">Download the GUI (Windows)</a>
-    <a class="btn ghost" href="https://pypi.org/project/turbossh/">View on PyPI</a>
+    <a class="btn ghost" href="#cli">See the CLI reference</a>
   </div>
 </div></div>
 
+<!-- ============ FEATURES ============ -->
 <section id="features"><div class="wrap">
   <h2>What it does</h2>
-  <p class="sub">Everything below is available from the library, the command
-    line, and the GUI.</p>
+  <p class="sub">Everything below is available three ways — from the Python
+    library, the command line, and the desktop app.</p>
   <div class="grid">
     <div class="card"><div class="ico">🔌</div><h3>SSH, jump hosts, legacy gear</h3>
       <p>Connect directly, through an RDP/Windows jump box, or to old ECUs that
         only speak deprecated crypto. Typed results — exit code, stdout, timing.</p></div>
     <div class="card"><div class="ico">📜</div><h3>Live logs</h3>
       <p><code>slog2info -w</code>, <code>journalctl -f</code>, <code>dmesg -w</code>
-        streamed line by line, with regex matching and tee-to-file.</p></div>
+        streamed line by line, with regex matching, stop-on-match and tee-to-file.</p></div>
     <div class="card"><div class="ico">📁</div><h3>SFTP &amp; SCP</h3>
       <p>A full remote-filesystem API and a graphical browser under every
         session. Transfers run on their own channel, so nothing blocks.</p></div>
     <div class="card"><div class="ico">🖥️</div><h3>Native serial over RDP</h3>
-      <p>Open a COM port that's plugged into the remote Windows box and type
-        into it like a real terminal — Tab-completion, Ctrl-C, the lot.</p></div>
+      <p>Open a COM port plugged into the remote Windows box and type into it
+        like a real terminal — Tab-completion, Ctrl-C, the lot.</p></div>
+    <div class="card"><div class="ico">📷</div><h3>Camera — local or remote</h3>
+      <p>View a webcam on this PC or on a remote machine, with snapshot, record,
+        pause and rotate. Sharp native MJPEG over a clean SSH tunnel.</p></div>
     <div class="card"><div class="ico">🔎</div><h3>Scan remote ports</h3>
       <p>Ask the machine you're about to connect to which COM ports it actually
         has, with friendly device names.</p></div>
-    <div class="card"><div class="ico">📷</div><h3>Camera (local or remote)</h3>
-      <p>View any camera — on this PC or on a remote machine — in a Camera tab,
-        with snapshot, record and pause. Local needs no connecting. Opt-in.</p></div>
     <div class="card"><div class="ico">🖧</div><h3>Offline OpenSSH install</h3>
       <p>Stand up <code>sshd</code> on a locked-down Windows box with no
-        internet — on the machine, or to a remote one over WinRM.</p></div>
+        internet — on the machine itself, or to a remote one over WinRM.</p></div>
     <div class="card"><div class="ico">🚇</div><h3>Port forwarding</h3>
-      <p><code>ssh -L</code> / <code>ssh -R</code> tunnels through the same
-        connection or jump host.</p></div>
-    <div class="card"><div class="ico">🪟</div><h3>The GUI</h3>
-      <p>Tabbed sessions, split view, SFTP browser, log viewer, 10k-line
-        scrollback, and save-the-whole-session-to-disk.</p></div>
+      <p><code>ssh -L</code> tunnels through the same connection or jump host,
+        straight from the CLI or library.</p></div>
+    <div class="card"><div class="ico">🎨</div><h3>Keyword highlighting</h3>
+      <p>MobaXterm-style colouring of <i>error</i> / <i>warning</i> /
+        <i>success</i> in the terminal — on top of the server's own ANSI colours,
+        never replacing them.</p></div>
+    <div class="card"><div class="ico">🪟</div><h3>The desktop app</h3>
+      <p>Tabbed &amp; split sessions, SFTP browser, log viewer, light/dark theme,
+        10k-line scrollback, and save-the-whole-session-to-disk.</p></div>
     <div class="card"><div class="ico">🔐</div><h3>Credentials in the vault</h3>
       <p>Passwords live in the OS keyring and are masked in logs — never in
         plaintext in your scripts or on disk.</p></div>
+    <div class="card"><div class="ico">🔁</div><h3>Auto-reconnect</h3>
+      <p>Dropped SSH sessions retry on their own for 30&nbsp;s, then wait for a
+        single <code>Ctrl&#8209;R</code> — handy across target reboots.</p></div>
   </div>
 </div></section>
 
+<!-- ============ QUICK START ============ -->
 <section id="start"><div class="wrap">
   <h2>Quick start</h2>
-  <p class="sub">The same object works as a library in a test framework or a
-    one-off script.</p>
+  <p class="sub">The same handler works as a library inside a test framework or
+    as a one-off command in a shell script.</p>
   <div class="two">
     <pre><span class="c"># Python — in a test framework</span>
 <span class="k">from</span> turbossh <span class="k">import</span> SSHHandler, SSHConfig
@@ -194,138 +271,383 @@
         username=<span class="s">"root"</span>, password=<span class="s">"…"</span>)) <span class="k">as</span> ssh:
     print(ssh.run(<span class="s">"uname -a"</span>).text)
     ssh.push(<span class="s">"build/app"</span>, <span class="s">"/tmp/app"</span>)
-    ssh.serial_stream(<span class="s">"COM4"</span>, on_line=print)</pre>
+    ssh.stream(<span class="s">"slog2info -w"</span>, on_line=print)</pre>
     <pre><span class="c"># CLI — in a shell script</span>
-$ turbossh run    --host H --user U uname -a
-$ turbossh stream --host H --user U slog2info -w
-$ turbossh serial-ssh --host H --user U \
-      --device COM4 --baud 115200 --save log.txt
-$ turbossh scan-ports --host H --user U
+$ turbossh run    <span class="o">--host</span> H <span class="o">--user</span> U uname -a
+$ turbossh stream <span class="o">--host</span> H <span class="o">--user</span> U slog2info -w
+$ turbossh serial-ssh <span class="o">--host</span> H <span class="o">--user</span> U \
+      <span class="o">--device</span> COM4 <span class="o">--baud</span> 115200 <span class="o">--save</span> log.txt
+$ turbossh camera-grab <span class="o">--camera</span> <span class="s">"C615"</span> <span class="o">--out</span> shot.jpg
 
 <span class="c"># or just launch the desktop app</span>
 $ turbossh-gui</pre>
   </div>
 </div></section>
 
-<section id="usage"><div class="wrap">
-  <h2>How to use each feature</h2>
-  <p class="sub">Every feature, three ways. The full reference is in the
-    <a href="https://github.com/nvnkennedy/turbossh#readme">README</a>.</p>
+<!-- ============ CLI REFERENCE ============ -->
+<section id="cli"><div class="wrap">
+  <h2>Complete <span class="em">CLI</span> reference</h2>
+  <p class="sub">Every command the <code>turbossh</code> tool ships with. Run any
+    of them with <code>--help</code> for the full list of options.</p>
 
-  <div class="feat">
-    <h3>Connect — direct, jump host, or legacy gear</h3>
-    <p class="d">Nest a config in <code>jump_host</code> to hop through an RDP box first.</p>
-    <div class="ways">
-      <div class="way"><div class="lbl">Script</div><pre><span class="k">from</span> turbossh <span class="k">import</span> SSHHandler, SSHConfig
-cfg = SSHConfig(host=<span class="s">"target"</span>, username=<span class="s">"root"</span>,
-   jump_host=SSHConfig(host=<span class="s">"rdpbox"</span>,
-     username=<span class="s">"EU\\me"</span>, password=<span class="s">"…"</span>))
-ssh = SSHHandler(cfg)</pre></div>
-      <div class="way"><div class="lbl">GUI</div><ol>
-        <li>New session → <b>SSH</b></li>
-        <li>Host, User, Password</li>
-        <li>Tick <b>jump host</b> if needed</li>
-        <li>OK → terminal opens</li></ol></div>
-      <div class="way"><div class="lbl">CLI</div><pre>turbossh run \
-  --host H --user U \
-  --password uname -a</pre></div>
-    </div>
+  <div class="toc">
+    <a href="#cmd-run">run</a><a href="#cmd-info">info</a>
+    <a href="#cmd-push">push</a><a href="#cmd-pull">pull</a>
+    <a href="#cmd-stream">stream</a>
+    <a href="#cmd-list-serial">list-serial</a><a href="#cmd-serial-monitor">serial-monitor</a>
+    <a href="#cmd-serial-ssh">serial-ssh</a><a href="#cmd-scan-ports">scan-ports</a>
+    <a href="#cmd-camera-list">camera-list</a><a href="#cmd-camera-grab">camera-grab</a>
+    <a href="#cmd-setup-server">setup-server</a><a href="#cmd-install-ssh-remote">install-ssh-remote</a>
+    <a href="#cmd-forward">forward</a><a href="#cmd-store-credential">store-credential</a>
+    <a href="#flags">common flags</a><a href="#entrypoints">other commands</a>
   </div>
 
-  <div class="feat">
-    <h3>Run commands</h3>
-    <p class="d">Typed result back — exit code, stdout, stderr, timing.</p>
-    <div class="ways">
-      <div class="way"><div class="lbl">Script</div><pre>res = ssh.run(<span class="s">"systemctl is-active sshd"</span>)
-res.ok        <span class="c"># exit==0</span>
-res.text      <span class="c"># stdout</span>
-ssh.sudo(<span class="s">"mount -o remount,rw /"</span>)</pre></div>
-      <div class="way"><div class="lbl">GUI</div><ol>
-        <li>Open the <b>Terminal</b> tab</li>
-        <li>Type — Tab-complete, Ctrl-C and history all work</li>
-        <li><b>Quick</b> buttons fire common commands</li></ol></div>
-      <div class="way"><div class="lbl">CLI</div><pre>turbossh run \
-  --host H --user U \
-  uname -a</pre></div>
-    </div>
+  <!-- Run & inspect -->
+  <div class="grouptitle">Run &amp; inspect</div>
+
+  <div class="cmd" id="cmd-run">
+    <div class="cmd-head"><span class="cn">turbossh run</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Execute one command on the target and print the result. Returns the
+      remote exit code; add <code>--json</code> for a machine-readable object.</p>
+    <pre>turbossh run <span class="o">--host</span> 192.168.1.50 <span class="o">--user</span> root <span class="o">--password</span> uname -a
+turbossh run <span class="o">--host</span> ecu <span class="o">--user</span> root <span class="o">--use-stored</span> <span class="o">--json</span> -- systemctl is-active sshd</pre>
+    <p class="opts"><b>Args:</b> positional <code>command…</code> &nbsp;·&nbsp; plus the
+      <a href="#flags">common connection flags</a>.</p>
   </div>
 
-  <div class="feat">
-    <h3>Follow live logs</h3>
-    <p class="d">slog2info / journalctl / dmesg, with regex match and tee-to-file.</p>
-    <div class="ways">
-      <div class="way"><div class="lbl">Script</div><pre>ssh.stream(<span class="s">"slog2info -w"</span>,
-   on_line=print,
-   match=<span class="s">r"E/.*panic"</span>,
-   save_to=<span class="s">"boot.log"</span>)</pre></div>
-      <div class="way"><div class="lbl">GUI</div><ol>
-        <li>Open the <b>Logs</b> tab</li>
-        <li>Pick a preset or type a command</li>
-        <li>Add a regex filter, hit <b>Start</b></li></ol></div>
-      <div class="way"><div class="lbl">CLI</div><pre>turbossh stream \
-  --host H --user U \
-  --match panic slog2info -w</pre></div>
-    </div>
+  <div class="cmd" id="cmd-info">
+    <div class="cmd-head"><span class="cn">turbossh info</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Connect and report what the remote box is — OS family, kernel,
+      architecture. A quick "can I reach it and who is it?" probe.</p>
+    <pre>turbossh info <span class="o">--host</span> 10.0.0.7 <span class="o">--user</span> root <span class="o">--password</span></pre>
+    <p class="opts"><b>Args:</b> the <a href="#flags">common connection flags</a>.</p>
   </div>
 
-  <div class="feat">
-    <h3>Move files (SFTP / SCP)</h3>
-    <p class="d">A full remote filesystem, plus a browser in the GUI.</p>
-    <div class="ways">
-      <div class="way"><div class="lbl">Script</div><pre>ssh.push(<span class="s">"dist/"</span>, <span class="s">"/opt/app"</span>,
-         recursive=<span class="k">True</span>)
-ssh.pull(<span class="s">"/var/log"</span>, <span class="s">"logs/"</span>)
-ssh.read_text(<span class="s">"/proc/version"</span>)</pre></div>
-      <div class="way"><div class="lbl">GUI</div><ol>
-        <li>Open the <b>SFTP</b> tab</li>
-        <li>Browse, upload, download, mkdir, rename</li>
-        <li>Runs on its own channel — never blocks</li></ol></div>
-      <div class="way"><div class="lbl">CLI</div><pre>turbossh push --host H --user U \
-  ./build /opt/app --recursive
-turbossh pull … /var/log ./logs</pre></div>
-    </div>
+  <!-- Files -->
+  <div class="grouptitle">Files — SFTP / SCP</div>
+
+  <div class="cmd" id="cmd-push">
+    <div class="cmd-head"><span class="cn">turbossh push</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Upload a file or directory to the target over SFTP.</p>
+    <pre>turbossh push <span class="o">--host</span> H <span class="o">--user</span> root <span class="o">--recursive</span> ./build /opt/app</pre>
+    <p class="opts"><b>Args:</b> positional <code>local</code> <code>remote</code> &nbsp;·&nbsp;
+      <code>--recursive</code> for directories &nbsp;·&nbsp; plus the
+      <a href="#flags">common flags</a>.</p>
   </div>
 
-  <div class="feat">
-    <h3>Serial over RDP</h3>
-    <p class="d">A COM port on the remote Windows box, as a native terminal.</p>
-    <div class="ways">
-      <div class="way"><div class="lbl">Script</div><pre>ssh.serial_stream(<span class="s">"COM4"</span>,
-   baudrate=<span class="s">115200</span>, on_line=print,
-   save_to=<span class="s">"console.log"</span>)
-ssh.serial_write(<span class="s">"COM4"</span>, <span class="s">"reboot\n"</span>)</pre></div>
-      <div class="way"><div class="lbl">GUI</div><ol>
-        <li>New session → <b>Serial</b></li>
-        <li>Tick <b>Port is on the RDP machine</b></li>
-        <li><b>Scan remote</b> → pick the port</li>
-        <li>OK → type into it natively</li></ol></div>
-      <div class="way"><div class="lbl">CLI</div><pre>turbossh serial-ssh \
-  --host H --user U \
-  --device COM4 --baud 115200</pre></div>
-    </div>
+  <div class="cmd" id="cmd-pull">
+    <div class="cmd-head"><span class="cn">turbossh pull</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Download a file or directory from the target.</p>
+    <pre>turbossh pull <span class="o">--host</span> H <span class="o">--user</span> root /var/log/messages ./messages.log
+turbossh pull <span class="o">--host</span> H <span class="o">--user</span> root <span class="o">--recursive</span> /var/log ./logs</pre>
+    <p class="opts"><b>Args:</b> positional <code>remote</code> <code>local</code> &nbsp;·&nbsp;
+      <code>--recursive</code> &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>.</p>
   </div>
 
-  <div class="feat">
-    <h3>Install an SSH server (offline)</h3>
-    <p class="d">Bundled OpenSSH, no internet. On the box, or to a remote one over WinRM.</p>
-    <div class="ways">
-      <div class="way"><div class="lbl">Script</div><pre><span class="k">from</span> turbossh <span class="k">import</span> \
-  enable_openssh_via_winrm_offline
-enable_openssh_via_winrm_offline(
-  <span class="s">"rdpbox"</span>, <span class="s">"EU\\me"</span>, <span class="s">"pw"</span>,
-  openssh_dir, log=print)</pre></div>
-      <div class="way"><div class="lbl">GUI</div><ol>
-        <li><b>SSH server</b> button</li>
-        <li><b>This PC</b> or <b>A remote machine</b></li>
-        <li>Approve the admin prompt</li></ol></div>
-      <div class="way"><div class="lbl">CLI</div><pre>turbossh-setup   <span class="c"># this PC</span>
+  <!-- Live logs -->
+  <div class="grouptitle">Live logs</div>
 
-turbossh install-ssh-remote \
-  --host H --user "DOM\\admin"</pre></div>
+  <div class="cmd" id="cmd-stream">
+    <div class="cmd-head"><span class="cn">turbossh stream</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Run a never-ending command (<code>tail -f</code>,
+      <code>slog2info -w</code>, <code>journalctl -f</code>) and print lines live.
+      Flag matches with a regex, tee to a file, and optionally stop on the first hit.</p>
+    <pre>turbossh stream <span class="o">--host</span> H <span class="o">--user</span> root \
+   <span class="o">--match</span> <span class="s">"panic|oops|segfault"</span> <span class="o">--save</span> boot.log slog2info -w</pre>
+    <p class="opts"><b>Args:</b> positional <code>command…</code> &nbsp;·&nbsp;
+      <code>--match REGEX</code> &nbsp;·&nbsp; <code>--save FILE</code> &nbsp;·&nbsp;
+      <code>--stop-on-match</code> &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>.</p>
+  </div>
+
+  <!-- Serial -->
+  <div class="grouptitle">Serial</div>
+
+  <div class="cmd" id="cmd-list-serial">
+    <div class="cmd-head"><span class="cn">turbossh list-serial</span><span class="badge local">local</span></div>
+    <p class="cmd-d">List the serial / COM ports on <b>this</b> machine.</p>
+    <pre>turbossh list-serial</pre>
+    <p class="opts"><b>Args:</b> none.</p>
+  </div>
+
+  <div class="cmd" id="cmd-serial-monitor">
+    <div class="cmd-head"><span class="cn">turbossh serial-monitor</span><span class="badge local">local</span></div>
+    <p class="cmd-d">Monitor a serial port wired to <b>this</b> machine, live, with match
+      and save. Optionally send a line before listening.</p>
+    <pre>turbossh serial-monitor <span class="o">--port</span> COM5 <span class="o">--baud</span> 115200 <span class="o">--save</span> console.log</pre>
+    <p class="opts"><b>Args:</b> <code>--port</code> (e.g. <code>COM5</code> or
+      <code>/dev/ttyUSB0</code>) &nbsp;·&nbsp; <code>--baud</code> &nbsp;·&nbsp;
+      <code>--match</code> &nbsp;·&nbsp; <code>--save</code> &nbsp;·&nbsp;
+      <code>--stop-on-match</code> &nbsp;·&nbsp; <code>--timeout</code>.</p>
+  </div>
+
+  <div class="cmd" id="cmd-serial-ssh">
+    <div class="cmd-head"><span class="cn">turbossh serial-ssh</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Monitor a serial port that is plugged into the <b>remote</b> host,
+      tunnelled over SSH — the headline trick for COM ports on an RDP jump box.</p>
+    <pre>turbossh serial-ssh <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span> \
+   <span class="o">--device</span> COM4 <span class="o">--baud</span> 115200 <span class="o">--send</span> <span class="s">"reboot"</span> <span class="o">--save</span> uart.log</pre>
+    <p class="opts"><b>Args:</b> <code>--device</code> (remote port, e.g.
+      <code>COM4</code> or <code>/dev/ser1</code>) &nbsp;·&nbsp; <code>--baud</code>
+      &nbsp;·&nbsp; <code>--send LINE</code> &nbsp;·&nbsp; <code>--match</code>
+      &nbsp;·&nbsp; <code>--save</code> &nbsp;·&nbsp; <code>--stop-on-match</code>
+      &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>.</p>
+  </div>
+
+  <div class="cmd" id="cmd-scan-ports">
+    <div class="cmd-head"><span class="cn">turbossh scan-ports</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">List the serial ports on the <b>remote</b> host over SSH, with friendly
+      device names — so you know what to pass to <code>serial-ssh --device</code>.</p>
+    <pre>turbossh scan-ports <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span></pre>
+    <p class="opts"><b>Args:</b> the <a href="#flags">common connection flags</a>.</p>
+  </div>
+
+  <!-- Camera -->
+  <div class="grouptitle">Camera</div>
+
+  <div class="cmd" id="cmd-camera-list">
+    <div class="cmd-head"><span class="cn">turbossh camera-list</span><span class="badge local">local</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">List the cameras on this machine, or — with <code>--host</code> — on a
+      remote one over SSH.</p>
+    <pre><span class="c"># this PC</span>
+turbossh camera-list
+<span class="c"># a remote RDP box</span>
+turbossh camera-list <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span></pre>
+    <p class="opts"><b>Args:</b> <code>--ffmpeg</code> (local ffmpeg path) &nbsp;·&nbsp;
+      <code>--remote-ffmpeg</code> &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>
+      when using <code>--host</code>.</p>
+  </div>
+
+  <div class="cmd" id="cmd-camera-grab">
+    <div class="cmd-head"><span class="cn">turbossh camera-grab</span><span class="badge local">local</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Save a snapshot (<code>.jpg</code>) or a short clip
+      (<code>.mp4</code> with <code>--seconds</code>) from a camera, local or remote.</p>
+    <pre><span class="c"># single snapshot from a local camera</span>
+turbossh camera-grab <span class="o">--camera</span> <span class="s">"Logitech C615"</span> <span class="o">--out</span> shot.jpg
+<span class="c"># 10-second 720p clip from a remote camera</span>
+turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span> \
+   <span class="o">--camera</span> <span class="s">"USB Camera"</span> <span class="o">--out</span> clip.mp4 <span class="o">--seconds</span> 10 <span class="o">--width</span> 1280 <span class="o">--fps</span> 30</pre>
+    <p class="opts"><b>Args:</b> <code>--camera NAME</code> (from
+      <code>camera-list</code>) &nbsp;·&nbsp; <code>--out FILE</code> &nbsp;·&nbsp;
+      <code>--seconds</code> (0 = snapshot) &nbsp;·&nbsp; <code>--width</code>
+      &nbsp;·&nbsp; <code>--fps</code> &nbsp;·&nbsp; <code>--ffmpeg</code> /
+      <code>--remote-ffmpeg</code> &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>.</p>
+  </div>
+
+  <!-- Server, tunnels & credentials -->
+  <div class="grouptitle">Server, tunnels &amp; credentials</div>
+
+  <div class="cmd" id="cmd-setup-server">
+    <div class="cmd-head"><span class="cn">turbossh setup-server</span><span class="badge win">Windows</span></div>
+    <p class="cmd-d">Install and start OpenSSH Server on <b>this</b> Windows machine, fully
+      offline from the bundled package. Self-elevates to Administrator. Also available
+      as the standalone command <code>turbossh-setup</code>.</p>
+    <pre>turbossh setup-server     <span class="c"># or:  turbossh-setup</span></pre>
+    <p class="opts"><b>Args:</b> none — it prompts for the UAC elevation and reports back.</p>
+  </div>
+
+  <div class="cmd" id="cmd-install-ssh-remote">
+    <div class="cmd-head"><span class="cn">turbossh install-ssh-remote</span><span class="badge win">WinRM</span></div>
+    <p class="cmd-d">Push the bundled OpenSSH to a <b>remote</b> Windows host over WinRM and
+      install it there — no downloads on the target.</p>
+    <pre>turbossh install-ssh-remote <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> Administrator</pre>
+    <p class="opts"><b>Args:</b> <code>--host</code> &nbsp;·&nbsp; <code>--user</code>
+      (a local admin on the target) &nbsp;·&nbsp; <code>--domain</code> &nbsp;·&nbsp;
+      <code>--ssh-port</code> &nbsp;·&nbsp; <code>--winrm-port</code>.</p>
+  </div>
+
+  <div class="cmd" id="cmd-forward">
+    <div class="cmd-head"><span class="cn">turbossh forward</span><span class="badge ssh">SSH</span></div>
+    <p class="cmd-d">Open a local port-forward (<code>ssh -L</code>) through the connection
+      or jump host — reach a service that's only visible from the SSH server.</p>
+    <pre>turbossh forward <span class="o">--host</span> jump <span class="o">--user</span> me <span class="o">--password</span> \
+   <span class="o">--local-port</span> 8080 <span class="o">--to-host</span> 10.0.0.9 <span class="o">--to-port</span> 80</pre>
+    <p class="opts"><b>Args:</b> <code>--local-port</code> &nbsp;·&nbsp;
+      <code>--to-host</code> (reachable from the SSH server) &nbsp;·&nbsp;
+      <code>--to-port</code> &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>.</p>
+  </div>
+
+  <div class="cmd" id="cmd-store-credential">
+    <div class="cmd-head"><span class="cn">turbossh store-credential</span><span class="badge local">vault</span></div>
+    <p class="cmd-d">Save a password into the OS credential vault once, then use
+      <code>--use-stored</code> on any command instead of typing it.</p>
+    <pre>turbossh store-credential <span class="o">--user</span> root <span class="o">--service</span> turbossh-sessions</pre>
+    <p class="opts"><b>Args:</b> <code>--user</code> &nbsp;·&nbsp; <code>--domain</code>
+      &nbsp;·&nbsp; <code>--service</code> (vault namespace).</p>
+  </div>
+
+  <!-- Common flags -->
+  <div class="grouptitle" id="flags">Common connection flags</div>
+  <p class="sub" style="margin-bottom:18px">Shared by every SSH command above
+    (<code>run</code>, <code>info</code>, <code>push</code>, <code>pull</code>,
+    <code>stream</code>, <code>serial-ssh</code>, <code>scan-ports</code>,
+    <code>forward</code>, and the camera commands when remote).</p>
+  <table>
+    <tr><th>Flag</th><th>Meaning</th></tr>
+    <tr><td><code>--host</code></td><td>Target host or IP (required).</td></tr>
+    <tr><td><code>--port</code></td><td>SSH port (default 22).</td></tr>
+    <tr><td><code>--user</code></td><td>Username (required).</td></tr>
+    <tr><td><code>--domain</code></td><td>Windows domain, e.g. <code>EU</code> for an <code>EU\me</code> login.</td></tr>
+    <tr><td><code>--key</code></td><td>Path to a private-key file.</td></tr>
+    <tr><td><code>--password</code></td><td>Prompt for the password (hidden input).</td></tr>
+    <tr><td><code>--use-stored</code></td><td>Read the password from the OS vault instead of prompting.</td></tr>
+    <tr><td><code>--service</code></td><td>Vault namespace for <code>--use-stored</code> / <code>store-credential</code>.</td></tr>
+    <tr><td><code>--timeout</code></td><td>Connect timeout in seconds.</td></tr>
+    <tr><td><code>--no-fast-auth</code></td><td>Disable the fast single-attempt auth path (for fussy servers).</td></tr>
+    <tr><td><code>--json</code></td><td>Emit machine-readable JSON instead of text.</td></tr>
+  </table>
+
+  <!-- Entry points -->
+  <div class="grouptitle" id="entrypoints">Other installed commands</div>
+  <table>
+    <tr><th>Command</th><th>What it does</th></tr>
+    <tr><td><code>turbossh-gui</code></td><td>Launch the desktop app.</td></tr>
+    <tr><td><code>turbossh-setup</code></td><td>Install OpenSSH Server on this Windows machine (same as <code>setup-server</code>).</td></tr>
+    <tr><td><code>turbossh-shortcut</code></td><td>Create a Desktop / Start-Menu shortcut for the GUI.</td></tr>
+    <tr><td><code>turbossh-docs</code></td><td>Open this documentation in your browser.</td></tr>
+  </table>
+</div></section>
+
+<!-- ============ CAMERA ============ -->
+<section id="camera"><div class="wrap">
+  <h2><span class="em">Camera</span> — local or remote, over SSH</h2>
+  <p class="sub">View a webcam on this PC or on a remote RDP/Windows box, right
+    inside TurboSSH — to eyeball a bench rig, a dashboard cluster, or a board's
+    status LEDs without walking to the lab.</p>
+
+  <div class="split">
+    <div>
+      <div class="feat" style="margin-bottom:22px">
+        <h3>In the desktop app</h3>
+        <p class="d">Open the Camera panel from the ribbon <b>📷</b> button or the
+          File menu, then:</p>
+        <ol style="color:var(--dim); font-size:15px; line-height:1.8; padding-left:20px">
+          <li>Pick a <b>source</b> — <i>Local</i> (this PC) or <i>Remote</i>
+            (choose a saved RDP machine; host/user prefill from your jump host).</li>
+          <li>Choose the camera, <b>resolution</b> and <b>fps</b>.</li>
+          <li>Set the <b>View</b> mode — Fill, Fit or Stretch — and
+            <b>Rotate</b> 0/90/180/270° if the camera is mounted sideways.</li>
+          <li><b>Snapshot</b>, <b>Record</b> to MP4, or <b>Pause</b>. Right-click
+            the image to copy the current frame to the clipboard.</li>
+        </ol>
+      </div>
+      <div class="feat" style="margin-bottom:0">
+        <h3>From the command line</h3>
+        <p class="d">No GUI needed — list and grab from scripts:</p>
+        <pre style="font-size:13px">turbossh camera-list
+turbossh camera-grab <span class="o">--camera</span> <span class="s">"C615"</span> <span class="o">--out</span> shot.jpg
+turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--user</span> me <span class="o">--password</span> \
+   <span class="o">--camera</span> <span class="s">"USB Camera"</span> <span class="o">--out</span> clip.mp4 <span class="o">--seconds</span> 8</pre>
+      </div>
+    </div>
+    <div>
+      <table>
+        <tr><th colspan="2">How it works</th></tr>
+        <tr><td><b>Remote stream</b></td><td>MJPEG frames travel over a binary-clean
+          SSH tunnel, so Windows' shell can't corrupt the video.</td></tr>
+        <tr><td><b>Sharpness</b></td><td>Captures the camera's largest native MJPEG mode
+          and passes it through — no blurry upscaling.</td></tr>
+        <tr><td><b>ffmpeg</b></td><td>Fetched once (~160&nbsp;MB) and cached under
+          <code>~/.turbossh</code>; or point at your own with <code>--ffmpeg</code>
+          / the Camera settings page.</td></tr>
+        <tr><td><b>Recording</b></td><td>Whole JPEG frames are muxed to a clean H.264
+          MP4 with wall-clock timing.</td></tr>
+      </table>
+      <div class="callout"><b>Tip:</b> on a remote box, run
+        <code>turbossh camera-list --host …</code> first to get the exact camera
+        name to pass to <code>--camera</code>.</div>
     </div>
   </div>
 </div></section>
 
+<!-- ============ GUI TOUR ============ -->
+<section id="gui"><div class="wrap">
+  <h2>The <span class="em">desktop app</span></h2>
+  <p class="sub">A real terminal, not a text box. Launch it with
+    <code>turbossh-gui</code>, or grab the single-file Windows&nbsp;<code>.exe</code>
+    from the releases page — no Python required.</p>
+
+  <div class="split">
+    <div>
+      <div class="grid" style="grid-template-columns:1fr">
+        <div class="card"><h3>🖥️ Real VT100 terminal</h3><p>Full-screen apps —
+          <code>vim</code>, <code>htop</code>, <code>less</code>, <code>nano</code> —
+          render correctly, with 10k-line scrollback and "save the whole session to disk".</p></div>
+        <div class="card"><h3>🪟 Tabbed &amp; split sessions</h3><p>Drag the dividers
+          to resize a 2-, 3- or 4-way split; per-pane close buttons; a Home tab with
+          quick actions and your saved sessions.</p></div>
+        <div class="card"><h3>🎨 One-click theming &amp; highlighting</h3><p>Flip
+          light/dark from the ribbon (the app and taskbar icon follow). Keyword
+          highlighting tints <i>error/warning/success</i> on top of the server's
+          colours — toggle under <b>Settings → Appearance</b>.</p></div>
+        <div class="card"><h3>📁 SFTP browser &amp; 📜 log viewer</h3><p>Browse, upload
+          and download in a panel under each session; a log dock with
+          debug/info/warn/error/success levels and a filter.</p></div>
+        <div class="card"><h3>⚡ Quick commands &amp; 🔁 auto-reconnect</h3><p>Per-session
+          buttons for the commands you run constantly (mount, reset, …); dropped
+          SSH sessions reconnect on their own, then on <code>Ctrl-R</code>.</p></div>
+      </div>
+    </div>
+    <div>
+      <p style="color:var(--dim); font-size:14px; margin:0 0 10px">Keyword
+        highlighting in action — the server's own colours are kept, these plain
+        words get tinted:</p>
+      <div class="term">
+<span class="dim">[</span><span class="g">  OK  </span><span class="dim">]</span> <span class="g">Started</span> OpenSSH server daemon.<br>
+<span class="dim">[</span><span class="g">  OK  </span><span class="dim">]</span> Reached target Multi-User System.<br>
+br0: link <span class="g">ready</span>, 1000 Mbps full duplex<br>
+nvme0: I/O <span class="r">error</span>, dev nvme0n1, sector 0<br>
+kernel: <span class="a">warning</span>: CPU3 thermal throttle<br>
+sshd: <span class="r">authentication failure</span> for root<br>
+app: self-test <span class="g">passed</span> — system <span class="g">ready</span><br>
+      </div>
+      <div class="callout" style="margin-top:18px"><b>On Windows ARM64</b>, where
+        PyQt5 has no pip wheel, download the prebuilt <code>turbossh-gui.exe</code>
+        from the latest release and run it directly.</div>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ PYTHON API ============ -->
+<section id="python"><div class="wrap">
+  <h2>The <span class="em">Python</span> API</h2>
+  <p class="sub">Everything the CLI and GUI do is the same handler underneath —
+    drop it straight into a pytest suite or an automation script.</p>
+  <div class="two">
+    <pre><span class="c"># connect — direct or through a jump host</span>
+<span class="k">from</span> turbossh <span class="k">import</span> SSHHandler, SSHConfig
+
+cfg = SSHConfig(
+    host=<span class="s">"target"</span>, username=<span class="s">"root"</span>,
+    jump_host=SSHConfig(host=<span class="s">"rdpbox"</span>,
+        username=<span class="s">"EU\\me"</span>, password=<span class="s">"…"</span>))
+
+<span class="k">with</span> SSHHandler(cfg) <span class="k">as</span> ssh:
+    r = ssh.run(<span class="s">"systemctl is-active sshd"</span>)
+    <span class="k">assert</span> r.ok, r.text          <span class="c"># exit==0</span>
+    ssh.sudo(<span class="s">"mount -o remount,rw /"</span>)</pre>
+    <pre><span class="c"># files, logs, serial, tunnels</span>
+ssh.push(<span class="s">"dist/"</span>, <span class="s">"/opt/app"</span>, recursive=<span class="k">True</span>)
+ssh.pull(<span class="s">"/var/log"</span>, <span class="s">"logs/"</span>)
+text = ssh.read_text(<span class="s">"/proc/version"</span>)
+
+ssh.stream(<span class="s">"slog2info -w"</span>, on_line=print,
+           match=<span class="s">r"E/.*panic"</span>, save_to=<span class="s">"boot.log"</span>)
+
+<span class="c"># a COM port on the remote Windows box</span>
+ports = ssh.remote_serial_ports()
+ssh.serial_stream(<span class="s">"COM4"</span>, baudrate=115200,
+                  on_line=print, save_to=<span class="s">"uart.log"</span>)
+
+<span class="c"># local port-forward (ssh -L)</span>
+ssh.forward(local_port=8080,
+            to_host=<span class="s">"10.0.0.9"</span>, to_port=80)</pre>
+  </div>
+  <div class="callout"><b>Credentials stay safe:</b> passwords are wrapped so they
+    never appear in <code>repr()</code>, logs or tracebacks, and can live in the OS
+    keyring instead of your source.</div>
+</div></section>
+
+<!-- ============ GET IT ============ -->
 <section id="download"><div class="wrap">
   <h2>Get it</h2>
   <p class="sub">Pick whichever fits how you work.</p>
@@ -333,9 +655,13 @@ turbossh install-ssh-remote \
     <div class="card"><h3>pip</h3><p>Library + CLI + the GUI launcher.<br>
       <code>pip install turbossh</code> then <code>turbossh-gui</code>.</p></div>
     <div class="card"><h3>Windows .exe</h3><p>The GUI as a single self-contained
-      executable — <a href="https://github.com/nvnkennedy/turbossh/releases/latest">download the latest release</a>, no Python needed.</p></div>
-    <div class="card"><h3>Docs</h3><p>Read the
-      <a href="https://github.com/nvnkennedy/turbossh#readme">full README</a> and the
+      executable —
+      <a href="https://github.com/nvnkennedy/turbossh/releases/latest">download the latest release</a>,
+      no Python needed.</p></div>
+    <div class="card"><h3>Docs &amp; source</h3><p>Read the
+      <a href="https://github.com/nvnkennedy/turbossh#readme">full README</a>, the
+      <a href="https://github.com/nvnkennedy/turbossh/blob/main/CHANGELOG.md">changelog</a>,
+      and the
       <a href="https://github.com/nvnkennedy/turbossh/blob/main/ARCHITECTURE.md">architecture notes</a>.</p></div>
   </div>
 </div></section>
@@ -343,8 +669,11 @@ turbossh install-ssh-remote \
 <footer><div class="wrap">
   TurboSSH · MIT licensed ·
   <a href="https://pypi.org/project/turbossh/">PyPI</a> ·
-  <a href="https://github.com/nvnkennedy/turbossh">GitHub</a>
+  <a href="https://github.com/nvnkennedy/turbossh">GitHub</a> ·
+  <a href="https://github.com/nvnkennedy/turbossh/releases/latest">Releases</a>
 </div></footer>
+
+<a class="top" href="#">↑ Top</a>
 
 </body>
 </html>
