@@ -74,6 +74,29 @@ def parse_dshow_devices(text: str) -> list:
     return out
 
 
+def parse_dshow_modes(text: str) -> list:
+    """Parse a DirectShow camera's ``-list_options`` output into capture modes.
+    Each line looks like ``vcodec=mjpeg  min s=1280x720 fps=30 max s=1280x720
+    fps=30`` (or ``pixel_format=yuyv422 …``). Returns dicts
+    ``{codec, w, h, fps}`` using the largest size / highest fps on the line. Used
+    to pick a sharp MJPEG capture mode instead of the low-res raw default."""
+    import re
+    modes = []
+    for line in (text or "").splitlines():
+        low = line.lower()
+        cm = re.search(r'(?:vcodec|pixel_format)=(\S+)', low)
+        if not cm:
+            continue
+        sizes = [(int(a), int(b)) for a, b in re.findall(r's=(\d+)x(\d+)', low)]
+        fpss = [float(f) for f in re.findall(r'fps=([\d.]+)', low)]
+        if not sizes:
+            continue
+        w, h = max(sizes, key=lambda s: s[0] * s[1])
+        modes.append({"codec": cm.group(1), "w": w, "h": h,
+                      "fps": int(max(fpss)) if fpss else 30})
+    return modes
+
+
 # --------------------------------------------------------------------------- #
 # Interactive shell session
 # --------------------------------------------------------------------------- #
@@ -472,7 +495,7 @@ class SSHHandler:
                 time.sleep(1.0)
             return self._connect_with_retries()  # one more pass now that sshd is up
 
-        hint = self._connection_hint() if cfg.diagnose_on_failure else ""
+        hint = self._connection_hint(last_exc) if cfg.diagnose_on_failure else ""
         if isinstance(last_exc, socket.timeout):
             raise SSHTimeoutError(
                 f"Timed out connecting to {cfg.host}:{cfg.port}.{hint}") from last_exc
@@ -492,11 +515,28 @@ class SSHHandler:
         except OSError:
             return False
 
-    def _connection_hint(self) -> str:
+    def _connection_hint(self, last_exc=None) -> str:
         """A short, actionable explanation appended to connect failures."""
         host, port = self.config.host, self.config.port
         probe_to = min(self.config.connect_timeout, 3.0)
         if self._port_open(host, port, probe_to):
+            # Port is open but the connection still failed. If it was a banner /
+            # protocol error, the thing on that port isn't speaking SSH — that's
+            # the single most common cause of "Error reading SSH protocol banner".
+            msg = str(last_exc or "").lower()
+            if "banner" in msg or "protocol" in msg or "eof" in msg:
+                user = self.config.auth_username or "user"
+                return (f" TurboSSH reached {host}:{port} but it never sent an SSH "
+                        f"banner — so that port is open but is NOT an SSH server. "
+                        f"Most likely OpenSSH Server is not installed or not running "
+                        f"on {host} (Windows has no SSH server by default). On that "
+                        f"machine: install + start it — TurboSSH can do it for you via "
+                        f"the 'Set up SSH server' button or `turbossh-setup`; or "
+                        f"manually: Add-WindowsCapability -Online -Name "
+                        f"OpenSSH.Server~~~~0.0.1.0 ; Start-Service sshd ; "
+                        f"Set-Service sshd -StartupType Automatic. Otherwise {port} is "
+                        f"the wrong port or a firewall is intercepting it. Confirm "
+                        f"with:  ssh -p {port} {user}@{host}")
             return ""  # SSH port is actually open; failure was something else
         rdp_open = self._port_open(host, 3389, 2.0)
         if rdp_open:
@@ -1137,34 +1177,152 @@ class SSHHandler:
             return parse_dshow_devices((r.stdout or "") + "\n" + (r.stderr or ""))
         return self._guard("list_cameras", _do, safe=safe)
 
+    @staticmethod
+    def _wait_for_jpeg(chan, timeout):
+        """Read from *chan* until a JPEG SOI (FFD8) appears; return the bytes read
+        so far (to be replayed into the decoder), or None if no JPEG marker shows
+        up within *timeout*. This PROVES the transport actually delivers decodable
+        video — so we never hand back a 'connected but silent' channel."""
+        try:
+            chan.settimeout(0.3)
+        except Exception:
+            pass
+        buf = b""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                d = chan.recv(65536)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            if not d:
+                if getattr(chan, "eof_received", False) or chan.closed:
+                    break
+                continue
+            buf += d
+            if b"\xff\xd8" in buf:
+                return buf
+            if len(buf) > 4 * 1024 * 1024:    # bytes flowing but no JPEG -> mangled
+                break
+        return None
+
     def webcam_channel(self, camera: str, *, ffmpeg: str = "ffmpeg",
                        width: int = 640, height: int = 480, fps: int = 15,
                        quality: int = 6, force: bool = False):
-        """Open a raw SSH channel streaming the remote webcam as MJPEG (a series
-        of JPEG frames) on stdout. Read frames with ``.recv()``; close the channel
-        to stop. NO PTY (binary stream). ``force`` first clears a stale turbossh
-        ffmpeg holding the camera. Returns the paramiko channel."""
+        """Stream the remote webcam as MJPEG and return a paramiko channel to read
+        JPEG frames from with ``.recv()``; close it to stop. The returned channel
+        carries a ``_prebuf`` (bytes already read while verifying) that the reader
+        must replay first, and ``_ffmpeg_exec`` (the ffmpeg process channel, for
+        stderr/teardown).
+
+        Transport is **self-selecting and verified**: we try a binary-clean SSH
+        direct-tcpip TUNNEL first (ffmpeg serves MJPEG on a loopback TCP port), and
+        only keep it if real JPEG frames actually arrive. If the tunnel stays
+        silent we fall back to reading ffmpeg's STDOUT over the exec channel. Either
+        way we return only a channel that is provably delivering video.
+
+        Capture is in the camera's DEFAULT mode (raw — reliably opens over SSH; a
+        specific `-vcodec` gave "Could not set video options" on some cams) and is
+        only ever scaled DOWN (`min(iw,W)`, never up; upscaling + full-fps encoding
+        overran the capture buffer). The ffmpeg path carries the ``turbossh_cam``
+        marker so :meth:`webcam_release` / ``force`` can target only our process.
+        """
+        import random
         self._ensure_connected()
         marker = "turbossh_cam"
-        # Run ffmpeg directly so the channel's process IS ffmpeg; its command line
-        # carries the marker (the pushed-ffmpeg path), so webcam_release can find
-        # and kill only our process. dshow capture -> rescale -> MJPEG to stdout.
-        cap = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow '
-               f'-rtbufsize 64M -i video="{camera}" '
-               f'-vf scale={int(width)}:{int(height)} -r {int(fps)} '
-               f'-f mjpeg -q:v {int(quality)} -')
-        if force:
-            kill = (
-                "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | "
-                "Where-Object { $_.Name -eq 'ffmpeg.exe' -and $_.CommandLine -like "
-                f"'*{marker}*' }} | ForEach-Object {{ try{{ Stop-Process -Id "
-                "$_.ProcessId -Force }catch{} }; Start-Sleep -Milliseconds 400\" & ")
-            cmd = kill + cap
+        transport = self._client.get_transport()
+        # ALWAYS clear a stale ffmpeg first. Closing an SSH exec channel doesn't
+        # kill the (no-PTY) child on Windows, so a previous attempt can leave an
+        # ffmpeg holding the camera -> next open fails "device in use / I/O error".
+        # force=True clears ALL ffmpeg; otherwise only our own (turbossh_cam path).
+        filt = "$_.Name -eq 'ffmpeg.exe'"
+        if not force:
+            filt += (f" -and ($_.CommandLine -like '*{marker}*' "
+                     f"-or $_.ExecutablePath -like '*{marker}*')")
+        forcekill = (
+            'powershell -NoProfile -Command "Get-CimInstance Win32_Process | '
+            f'Where-Object {{ {filt} }} | ForEach-Object {{ try {{ Stop-Process '
+            '-Id $_.ProcessId -Force } catch {} }; '
+            'Start-Sleep -Milliseconds 700" & ')
+        # Pick a SHARP capture mode. The raw default is only 640x480 -> blurry when
+        # shown larger. Most webcams expose higher-res MJPEG modes; enumerate them
+        # and take the largest MJPEG at/below the requested width, then stream it
+        # through UNCHANGED (`-c:v copy`): native resolution, no re-encode (so no
+        # quality loss) and tiny CPU/bandwidth. Fall back to the raw default +
+        # downscale + light re-encode if the camera has no MJPEG mode.
+        chosen = None
+        try:
+            lst = self._run(f'"{ffmpeg}" -hide_banner -list_options true -f dshow '
+                            f'-i video="{camera}"', timeout=20, check=False,
+                            get_pty=False, environment=None, encoding="utf-8")
+            mj = [m for m in parse_dshow_modes((lst.stdout or "") + "\n" +
+                                               (lst.stderr or "")) if "jpeg" in m["codec"]]
+            if mj:
+                le = [m for m in mj if m["w"] <= int(width)]
+                chosen = (max(le, key=lambda m: m["w"] * m["h"]) if le
+                          else min(mj, key=lambda m: m["w"] * m["h"]))
+        except Exception:
+            chosen = None
+        if chosen:
+            # use the mode's OWN framerate — dshow needs an exact (size, fps) match,
+            # so a reduced -framerate on a 30-only mode fails "could not set options".
+            cfps = chosen["fps"] or 30
+            cap_base = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow '
+                        f'-rtbufsize 100M -vcodec mjpeg '
+                        f'-video_size {chosen["w"]}x{chosen["h"]} -framerate {cfps} '
+                        f'-i video="{camera}" -an -c:v copy -f mjpeg ')
         else:
-            cmd = cap
-        chan = self._client.get_transport().open_session()
-        chan.exec_command(cmd)
-        return chan
+            cap_base = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow -rtbufsize 200M '
+                        f'-i video="{camera}" -an '
+                        f"-vf \"scale='min(iw,{int(width)})':-2\" "
+                        f'-r {int(fps)} -f mjpeg -q:v 3 ')
+
+        # --- Transport A: binary-clean direct-tcpip tunnel (verified) ---
+        for _ in range(2):
+            port = random.randint(20001, 60000)
+            cmd = (forcekill + cap_base +
+                   f'"tcp://127.0.0.1:{port}?listen=1&listen_timeout=30000"')
+            exec_chan = transport.open_session()
+            exec_chan.exec_command(cmd)
+            data_chan = None
+            for _ in range(75):                         # ~15s for ffmpeg to bind
+                if exec_chan.exit_status_ready():
+                    break
+                try:
+                    data_chan = transport.open_channel(
+                        "direct-tcpip", ("127.0.0.1", port), ("127.0.0.1", 0))
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            if data_chan is not None:
+                prebuf = self._wait_for_jpeg(data_chan, 7.0)
+                if prebuf is not None:                  # tunnel really delivers
+                    data_chan._ffmpeg_exec = exec_chan
+                    data_chan._prebuf = prebuf
+                    return data_chan
+                try: data_chan.close()
+                except Exception: pass
+            try: exec_chan.close()
+            except Exception: pass
+
+        # --- Transport B: ffmpeg stdout over the exec channel (verified fallback) ---
+        for _ in range(2):
+            chan = transport.open_session()
+            chan.exec_command(forcekill + cap_base + '-')   # MJPEG -> stdout
+            prebuf = self._wait_for_jpeg(chan, 7.0)
+            if prebuf is not None:
+                chan._prebuf = prebuf                       # exec chan IS the data chan
+                return chan
+            try: chan.close()
+            except Exception: pass
+
+        raise SSHConnectionError(
+            "The remote camera opens, but no video frames came through over SSH "
+            "(tried both a forwarded tunnel and stdout). That usually means another "
+            "app on that machine holds the camera, or Windows camera privacy is "
+            "blocking it. Close other camera apps and check Settings -> Privacy -> "
+            "Camera -> 'Let desktop apps access your camera'.")
 
     def webcam_release(self, *, ffmpeg_marker: str = "turbossh_cam",
                        safe: Optional[bool] = None):
@@ -1172,9 +1330,10 @@ class SSHHandler:
         the pushed-ffmpeg path marker) so the camera is released cleanly."""
         ps = (
             "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "
-            f"'ffmpeg.exe' -and $_.CommandLine -like '*{ffmpeg_marker}*' }} | "
+            f"'ffmpeg.exe' -and ($_.CommandLine -like '*{ffmpeg_marker}*' "
+            f"-or $_.ExecutablePath -like '*{ffmpeg_marker}*') }} | "
             "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} };"
-            "'released'")
+            "Start-Sleep -Milliseconds 300;'released'")
         cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
         return self.run(cmd, timeout=15, safe=safe)
 

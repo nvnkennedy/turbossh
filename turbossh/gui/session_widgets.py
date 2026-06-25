@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTabWidget, QLineEdit)
 
@@ -84,8 +85,11 @@ class SshSessionWidget(QWidget):
         tlay = QVBoxLayout(term_page); tlay.setContentsMargins(0, 0, 0, 0)
         quick = QHBoxLayout()
         quick.addWidget(QLabel("Quick:"))
-        for cmd in ("slog2info", "journalctl", "dmesg", "ls", "ps"):
+        cmds = [c.strip() for c in (session.get("quick_cmds") or "").split(",")
+                if c.strip()] or ["slog2info", "journalctl", "dmesg", "ls", "ps"]
+        for cmd in cmds:
             b = QPushButton(cmd); b.setProperty("role", "ghost")
+            b.setToolTip(f"Send: {cmd}")
             b.clicked.connect(lambda _=False, c=cmd: self._send_cmd(c))
             quick.addWidget(b)
         ctrlc = QPushButton("Ctrl-C"); ctrlc.setProperty("role", "danger")
@@ -116,16 +120,37 @@ class SshSessionWidget(QWidget):
 
         lay.addWidget(self.inner, 1)
 
-        cfg = config_from_session(session, password, jump_password)
-        self._connect(cfg)
+        self._cfg = config_from_session(session, password, jump_password)
+        self._user_closed = False          # set in close_session -> no auto-reconnect
+        self._reconnecting = False
+        self._reconnect_until = 0.0
+        self.term.on_reconnect = self._manual_reconnect   # Ctrl-R when disconnected
+        self._connect()
 
-    def _connect(self, cfg):
-        self._ct = _SshConnectThread(cfg)
+    def _connect(self):
+        self._ct = _SshConnectThread(self._cfg)
         self._ct.ok.connect(self._on_connected)
-        self._ct.fail.connect(self._on_fail)
+        self._ct.fail.connect(self._on_reconnect_fail if self._reconnecting
+                              else self._on_fail)
         self._ct.start()
 
     def _on_connected(self, handler, shell):
+        # re-entrant: this also runs on a successful auto/Ctrl-R reconnect, so
+        # tear down any previous reader first and clear the reconnect state.
+        was_reconnect = self._reconnecting
+        self._reconnecting = False
+        self._reconnect_until = 0.0
+        self.term.reconnect_armed = False
+        if self.reader:
+            try:
+                self.reader.closed.disconnect()   # don't let the old one re-trigger
+            except Exception:
+                pass
+            try:
+                self.reader.stop(); self.reader.wait(1000)
+            except Exception:
+                pass
+            self.reader = None
         self.handler = handler
         self.shell = shell
         if shell is None:
@@ -133,8 +158,13 @@ class SshSessionWidget(QWidget):
             return
         host = self.session.get("host")
         self.status.setText(f"Connected — {host}")
-        self.log.emit(f"[OK] {self.session['name']}: connected")
-        self.connected.emit(True, f"Connected to {host}")
+        self.log.emit(f"[OK] {self.session['name']}: "
+                      f"{'reconnected' if was_reconnect else 'connected'}")
+        self.connected.emit(True, f"{'Reconnected' if was_reconnect else 'Connected'} to {host}")
+        if was_reconnect:
+            self.term.feed(b"\r\n\x1b[32m[reconnected]\x1b[0m\r\n")
+        else:
+            self._welcome_banner()
         chan = shell.channel
         chan.settimeout(0.1)
 
@@ -177,8 +207,48 @@ class SshSessionWidget(QWidget):
             self.log.emit(f"[ERROR] SFTP browser unavailable: {exc}")
 
     def _on_disconnected(self):
-        self.status.setText("Disconnected")
+        # reader signals this when the channel drops. Unless the user is closing
+        # the session, try to reconnect automatically for ~30s.
+        if self._user_closed or self._reconnecting:
+            return
         self.connected.emit(False, f"Disconnected from {self.session.get('host')}")
+        self._start_reconnect()
+
+    def _start_reconnect(self, window: float = 30.0):
+        self._reconnecting = True
+        self.term.reconnect_armed = False
+        self._reconnect_until = time.time() + window
+        self.status.setText("Connection lost — reconnecting…")
+        self.term.feed("\r\n\x1b[33m[connection lost — reconnecting for 30s…]"
+                       "\x1b[0m\r\n".encode("utf-8"))
+        self._try_reconnect()
+
+    def _try_reconnect(self):
+        if self._reconnecting and not self._user_closed:
+            self._connect()      # fail routes to _on_reconnect_fail while reconnecting
+
+    def _on_reconnect_fail(self, msg):
+        if self._user_closed:
+            return
+        if time.time() < self._reconnect_until:
+            self.term.feed(b".")                       # progress dots
+            QTimer.singleShot(3000, self._try_reconnect)
+            return
+        # window elapsed -> stop and let the user retry with Ctrl+R
+        self._reconnecting = False
+        self.status.setText("SSH connection closed")
+        self.term.feed("\r\n\x1b[31m[SSH connection closed]\x1b[0m  press "
+                       "\x1b[1mCtrl+R\x1b[0m to reconnect\r\n".encode("utf-8"))
+        self.term.reconnect_armed = True
+        self.term.setFocus()
+        self.connected.emit(False, f"SSH connection closed: {self.session.get('host')}")
+
+    def _manual_reconnect(self):
+        if self._user_closed or self._reconnecting:
+            return
+        self.term.reconnect_armed = False
+        self.term.feed("\r\n\x1b[33m[reconnecting…]\x1b[0m\r\n".encode("utf-8"))
+        self._start_reconnect()
 
     def _on_fail(self, msg):
         self.status.setText("Connect failed")
@@ -197,6 +267,33 @@ class SshSessionWidget(QWidget):
         """Used by the one-click Quick buttons (slog2info/journalctl/…)."""
         self._send((command + "\n").encode("utf-8"))
         self.term.setFocus()
+
+    def _welcome_banner(self):
+        """A MobaXterm-style welcome banner shown in the terminal on first connect:
+        session name, who/where, jump host and time."""
+        s = self.session
+        name = s.get("name") or s.get("host") or "session"
+        user = s.get("user") or "—"
+        host = s.get("host"); port = s.get("port", 22)
+        C, R, G, Y, B = "\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[33m", "\x1b[1m"
+        rule = "─" * 54
+        lines = [
+            "",
+            f"{C}┌{rule}{R}",
+            f"{C}│{R}  {B}Welcome to {name}{R}",
+            f"{C}│{R}  SSH session to {G}{user}@{host}:{port}{R}",
+        ]
+        if s.get("use_jump") and s.get("jhost"):
+            lines.append(f"{C}│{R}  via jump host {Y}{s.get('jhost')}{R}")
+        try:
+            osname = self.handler.detect_os()
+            lines.append(f"{C}│{R}  remote OS: {osname}")
+        except Exception:
+            pass
+        lines.append(f"{C}│{R}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"{C}└{rule}{R}")
+        lines.append("")
+        self.term.feed(("\r\n".join(lines) + "\r\n").encode("utf-8"))
 
     def _interrupt(self):
         """Send Ctrl-C to the shell and immediately drop the buffered backlog, so
@@ -223,18 +320,27 @@ class SshSessionWidget(QWidget):
             self.term.setFocus()
 
     def close_session(self):
+        self._user_closed = True          # stop any auto-reconnect
+        self._reconnecting = False
         try:
             self.logs_tab.close_tab()
         except Exception:
             pass
         if self.reader:
+            try:
+                self.reader.closed.disconnect()
+            except Exception:
+                pass
             self.reader.stop(); self.reader.wait(1000)
         try:
             self.term.cleanup()
         except Exception:
             pass
         if self.handler:
-            self.handler.disconnect()
+            try:
+                self.handler.disconnect()
+            except Exception:
+                pass
 
 
 class _SerialConnectThread(QThread):
@@ -360,12 +466,17 @@ class SerialSessionWidget(QWidget):
         clr = QPushButton("Clear"); clr.setProperty("role", "ghost")
         clr.clicked.connect(lambda: (self.term.clear(), self.term.setFocus()))
         crow.addWidget(ctrlc); crow.addWidget(paste); crow.addWidget(clr)
+        for cmd in [c.strip() for c in (session.get("quick_cmds") or "").split(",")
+                    if c.strip()]:
+            b = QPushButton(cmd); b.setProperty("role", "ghost")
+            b.setToolTip(f"Send to the port: {cmd}")
+            b.clicked.connect(lambda _=False, c=cmd: self._send_quick(c))
+            crow.addWidget(b)
         crow.addStretch(1)
-        lay.addLayout(crow)
         self.term = Vt100Terminal(send_fn=self._send)
         self.term.resized.connect(self._on_term_resize)
-        lay.addWidget(self.term, 1)
         lay.addLayout(crow)
+        lay.addWidget(self.term, 1)
 
         if self.via_ssh:
             cfg = config_from_session(session, password, jump_password)
@@ -387,6 +498,7 @@ class SerialSessionWidget(QWidget):
         self.status.setText(f"Open — {dev} @ {self.session.get('baud')}")
         self.log.emit(f"[OK] serial {dev} open")
         self.connected.emit(True, f"Serial {dev} open")
+        self._serial_banner(dev, self.session.get("baud"), False)
         ser = handler._require()
 
         def read_fn():
@@ -433,7 +545,7 @@ class SerialSessionWidget(QWidget):
         self.status.setText(f"Serial over SSH — {dev} @ {baud} (native)")
         self.log.emit(f"[OK] serial-over-SSH {dev} (native bridge)")
         self.connected.emit(True, f"Serial over SSH: {dev}")
-        self.term.feed(f"--- connected to {dev} @ {baud} (via SSH) ---\r\n".encode())
+        self._serial_banner(dev, baud, True)
 
         def read_fn():
             if chan.closed or chan.eof_received:
@@ -449,13 +561,52 @@ class SerialSessionWidget(QWidget):
         self.reader = ReaderThread(read_fn)
         self.reader.start()
         self.term.set_source(self.reader.pull)
+        # match the remote PTY to our terminal so the conpty doesn't pad the
+        # output with stray blank lines.
+        self._on_term_resize(self.term.cols, self.term.rows)
         self.term.setFocus()
 
     def _on_term_resize(self, cols, rows):
-        pass
+        # keep the remote bridge's PTY the SAME size as our terminal — an oversized
+        # (250x50) conpty was repositioning output across a taller screen, which is
+        # what produced the stray blank lines in serial-over-SSH.
+        try:
+            if self.bridge_chan is not None and not self.bridge_chan.closed:
+                self.bridge_chan.resize_pty(width=int(cols), height=int(rows))
+        except Exception:
+            pass
+
+    def _retry_open(self):
+        self.status.setText("Retrying…")
+        dev = self.session.get("device", "COM5")
+        self._ct = _SerialConnectThread(dev, self.session.get("baud", 115200))
+        self._ct.ok.connect(self._on_open_local)
+        self._ct.fail.connect(self._on_fail)
+        self._ct.start()
 
     def _on_fail(self, msg):
+        from PyQt5.QtWidgets import QMessageBox
         self.status.setText("Open failed")
+        dev = self.session.get("device", "the port")
+        low = (msg or "").lower()
+        busy = any(k in low for k in ("access is denied", "permission", "in use",
+                                      "denied", "being used", "cannot open",
+                                      "could not open"))
+        if busy and not self.via_ssh:
+            self.term.feed(f"\r\n\x1b[31m[{dev} is in use by another "
+                           f"application]\x1b[0m\r\n".encode())
+            r = QMessageBox.question(
+                self, "Serial port in use",
+                f"{dev} is held by another application (MobaXterm, PuTTY, another "
+                f"TurboSSH window, …).\n\nWindows does not let one app take a COM "
+                f"port away from another, so close it in that app first.\n\n"
+                f"Retry now?", QMessageBox.Retry | QMessageBox.Cancel,
+                QMessageBox.Retry)
+            if r == QMessageBox.Retry:
+                self._retry_open(); return
+            self.failed.emit(f"{self.session.get('name')}: {dev} in use")
+            self.log.emit(f"[ERROR] serial: {dev} in use (held by another app)")
+            return
         self.term.feed(f"\n[serial open failed] {msg}\n".encode())
         self.log.emit(f"[ERROR] serial: {msg}")
         self.failed.emit(f"{self.session.get('name')}: {msg}")
@@ -481,6 +632,25 @@ class SerialSessionWidget(QWidget):
         """Send Ctrl-C (0x03) to the port to interrupt a running command."""
         self._send(b"\x03")
         self.term.setFocus()
+
+    def _send_quick(self, cmd: str):
+        """One-click Quick command -> send to the port with a carriage return."""
+        self._send((cmd + "\r").encode("utf-8"))
+        self.term.setFocus()
+
+    def _serial_banner(self, dev, baud, via_ssh):
+        name = self.session.get("name") or dev
+        C, R, G, B = "\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[1m"
+        rule = "─" * 50
+        where = f"on {self.session.get('host')} (via SSH)" if via_ssh else "(local)"
+        self.term.feed(("\r\n".join([
+            "",
+            f"{C}┌{rule}{R}",
+            f"{C}│{R}  {B}Welcome to {name}{R}",
+            f"{C}│{R}  Serial {G}{dev} @ {baud}{R} {where}",
+            f"{C}│{R}  {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"{C}└{rule}{R}", "",
+        ]) + "\r\n").encode("utf-8"))
 
     def close_session(self):
         if self.stream_thread:

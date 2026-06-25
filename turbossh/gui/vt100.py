@@ -5,6 +5,7 @@ cell-by-cell with colors, bold, reverse video, and a block cursor."""
 from __future__ import annotations
 
 import os
+import re
 import pyte
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QFontMetrics, QPainter, QColor
@@ -24,18 +25,34 @@ _BRIGHT = {
     "default": "#ffffff",
 }
 _BG_DEFAULT = "#000000"
+# light-mode terminal: dark text on near-white, ANSI colours darkened to stay
+# readable on a light background (the dark palette is invisible on white).
+_PALETTE_LIGHT = {
+    "black": "#2b2b2b", "red": "#c0392b", "green": "#1e8449",
+    "brown": "#9a7d0a", "yellow": "#9a7d0a", "blue": "#1f6feb",
+    "magenta": "#8e44ad", "cyan": "#0e7c86", "white": "#1d2329",
+    "default": "#1d2329",
+}
+_BRIGHT_LIGHT = {
+    "black": "#555555", "red": "#e74c3c", "green": "#229954",
+    "brown": "#b9770e", "yellow": "#b9770e", "blue": "#2e86de",
+    "magenta": "#9b59b6", "cyan": "#1391a0", "white": "#000000",
+    "default": "#101418",
+}
+_BG_LIGHT = "#fbfbfb"
 
-
-def _color(name, bright=False):
-    table = _BRIGHT if bright else _PALETTE
-    if name in table:
-        return QColor(table[name])
-    if isinstance(name, str) and len(name) == 6:        # pyte gives hex sometimes
-        try:
-            return QColor("#" + name)
-        except Exception:
-            pass
-    return QColor(_PALETTE["default"])
+# MobaXterm-style keyword highlighting: colour these words in OTHERWISE-plain
+# output. We only ever recolour cells the server left at the default colour, so
+# real ANSI colours are never overridden. Conservative word lists to avoid noise.
+_HIGHLIGHTS = [
+    (re.compile(r"\b(error|errors|fail|failed|failure|fatal|denied|refused|"
+                r"unable|exception|panic|critical|segfault|traceback|timeout|"
+                r"timed out)\b", re.I), "red"),
+    (re.compile(r"\b(warning|warn|deprecated|caution)\b", re.I), "brown"),
+    (re.compile(r"\b(success|successful|succeeded|passed|connected|enabled|"
+                r"completed|online|active|listening|started|running|ready)\b",
+                re.I), "green"),
+]
 
 
 class Vt100Terminal(QWidget):
@@ -61,6 +78,8 @@ class Vt100Terminal(QWidget):
         super().__init__(parent)
         self._send = send_fn
         self.on_interrupt = None        # optional hook called on Ctrl-C (flush)
+        self.on_reconnect = None        # optional hook for Ctrl-R when disconnected
+        self.reconnect_armed = False    # when True, Ctrl-R reconnects (not shell search)
         self.cols, self.rows = cols, rows
         try:
             from . import settings as _s
@@ -83,17 +102,36 @@ class Vt100Terminal(QWidget):
         self.setCursor(Qt.IBeamCursor)
         try:
             from . import settings as _settings
-            fam = _settings.get("term_font") or "Consolas"
-            size = int(_settings.get("term_font_size") or 10)
+            fam = _settings.get("term_font") or "Cascadia Mono"
+            size = int(_settings.get("term_font_size") or 11)
         except Exception:
-            fam, size = "Consolas", 10
+            fam, size = "Cascadia Mono", 11
         self.font = QFont(fam, size)
-        self.font.setStyleHint(QFont.Monospace)
+        # crisp, MobaXterm-like rendering: monospace hint, antialiasing, and a
+        # fallback chain so it stays a clean mono even if the chosen font is absent.
+        self.font.setStyleHint(QFont.Monospace, QFont.PreferAntialias)
+        try:
+            self.font.setFamilies([fam, "Cascadia Mono", "Consolas",
+                                   "DejaVu Sans Mono", "Courier New"])
+        except Exception:
+            pass
+        self.font.setFixedPitch(True)
+        self.font.setHintingPreference(QFont.PreferFullHinting)
         fm = QFontMetrics(self.font)
         self.cw = max(1, fm.horizontalAdvance("M"))
         self.ch = fm.height()
         self._ascent = fm.ascent()
-        self.setStyleSheet(f"background:{_BG_DEFAULT};")
+        # the terminal is ALWAYS dark (black bg, light text) regardless of app
+        # theme — like MobaXterm/most terminals; a white terminal looked bad.
+        self._bg, self._pal, self._bright = _BG_DEFAULT, _PALETTE, _BRIGHT
+        try:
+            from . import settings as _settings
+            self._highlight = _settings.get("highlight_keywords")
+            if self._highlight is None:
+                self._highlight = True
+        except Exception:
+            self._highlight = True
+        self.setStyleSheet(f"background:{self._bg};")
 
         # drain the reader buffer + repaint at ~30fps, with a bounded amount of
         # work per tick so a flood of output (journalctl/slog2info) never freezes
@@ -189,6 +227,14 @@ class Vt100Terminal(QWidget):
         except Exception:
             pass
 
+    def showEvent(self, event):
+        # When the widget is re-shown (tab switch, or split<->tabs reparenting),
+        # nothing has marked us dirty, so the existing pyte screen wouldn't be
+        # repainted -> a blank terminal with no prompt. Force a re-render.
+        super().showEvent(event)
+        self._dirty = True
+        self.update()
+
     # ---- sizing ----
     def resizeEvent(self, event):
         cols = max(20, self.width() // self.cw)
@@ -203,32 +249,67 @@ class Vt100Terminal(QWidget):
         super().resizeEvent(event)
 
     # ---- rendering ----
+    def _col(self, name, bright=False):
+        table = self._bright if bright else self._pal
+        if name in table:
+            return QColor(table[name])
+        if isinstance(name, str) and len(name) == 6:       # pyte gives hex sometimes
+            try:
+                return QColor("#" + name)
+            except Exception:
+                pass
+        return QColor(self._pal["default"])
+
+    def _row_highlights(self, line):
+        """Per-column keyword colour for a row (None where no keyword) — used to
+        tint plain words like 'error'/'warning'/'success'. Returns None when off."""
+        if not self._highlight:
+            return None
+        cols = self.cols
+        text = "".join((line[x].data or " ") for x in range(cols))
+        if not text.strip():
+            return None
+        hl = None
+        for rx, color in _HIGHLIGHTS:
+            for m in rx.finditer(text):
+                if hl is None:
+                    hl = [None] * cols
+                for i in range(m.start(), min(m.end(), cols)):
+                    hl[i] = color
+        return hl
+
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(_BG_DEFAULT))
+        bg_default = self._bg
+        p.fillRect(self.rect(), QColor(bg_default))
         p.setFont(self.font)
         buf = self.screen.buffer
         for y in range(self.rows):
             line = buf[y]
+            hl = self._row_highlights(line)
             for x in range(self.cols):
                 cell = line[x]
                 ch = cell.data or " "
                 reverse = cell.reverse
-                fg = _color(cell.fg, cell.bold)
-                bg = QColor(_BG_DEFAULT) if cell.bg == "default" else _color(cell.bg)
+                fg = self._col(cell.fg, cell.bold)
+                # keyword highlight: ONLY when the server left this cell at the
+                # default colour (never override real ANSI colours or reverse).
+                if hl is not None and not reverse and cell.fg == "default" and hl[x]:
+                    fg = self._col(hl[x])
+                bg = QColor(bg_default) if cell.bg == "default" else self._col(cell.bg)
                 if reverse:
                     fg, bg = bg, fg
                 px, py = x * self.cw, y * self.ch
-                if bg.name() != _BG_DEFAULT:
+                if bg.name().lower() != bg_default.lower():
                     p.fillRect(px, py, self.cw, self.ch, bg)
                 if ch != " ":
                     p.setPen(fg)
                     p.drawText(px, py + self._ascent, ch)
-        # block cursor
+        # block cursor — theme-aware so it shows on both backgrounds
         if not self.screen.cursor.hidden:
             cx, cy = self.screen.cursor.x, self.screen.cursor.y
             if cy < self.rows and cx < self.cols:
-                cur = QColor("#8fe39a"); cur.setAlpha(150)
+                cur = self._col("green"); cur.setAlpha(150)
                 p.fillRect(cx * self.cw, cy * self.ch, self.cw, self.ch, cur)
         p.end()
 
@@ -253,6 +334,15 @@ class Vt100Terminal(QWidget):
                     self._copy(); return
                 if key == Qt.Key_V:
                     self._paste(); return
+            # Ctrl-R reconnects when the session is down (otherwise it's the shell's
+            # reverse-search as usual).
+            if (self.reconnect_armed and (mods & Qt.ControlModifier)
+                    and key == Qt.Key_R and self.on_reconnect):
+                try:
+                    self.on_reconnect()
+                except Exception:
+                    pass
+                return
             if (mods & Qt.ControlModifier) and key in self._CTRL:
                 self._send(self._CTRL[key])
                 if key == Qt.Key_C and self.on_interrupt:

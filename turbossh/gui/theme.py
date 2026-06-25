@@ -21,9 +21,19 @@ def accent_text(name: str = "dark") -> str:
 
 
 LOG_COLORS = {
-    "ERROR": "#ff7a6e", "WARNING": "#ffc34d", "stderr": "#ffb37a",
-    "OK": "#5be39a", "INFO": "#cfe3f7",
+    "ERROR": "#ff7a6e", "WARNING": "#ffc34d", "WARN": "#ffc34d", "stderr": "#ffb37a",
+    "OK": "#5be39a", "SUCCESS": "#5be39a", "INFO": "#cfe3f7", "DEBUG": "#8a8a8a",
 }
+# darker, saturated variants that stay readable on the LIGHT theme's pale bg
+LOG_COLORS_LIGHT = {
+    "ERROR": "#c0392b", "WARNING": "#9a6700", "WARN": "#9a6700", "stderr": "#9a6700",
+    "OK": "#1e7e45", "SUCCESS": "#1e7e45", "INFO": "#1f2937", "DEBUG": "#6b7280",
+}
+
+
+def log_colors(name: str = "dark") -> dict:
+    """Log-level colours for the current theme (light needs darker hues)."""
+    return LOG_COLORS_LIGHT if name == "light" else LOG_COLORS
 
 # dark = near-black, neutral grays (no blue tint), cyan accent
 _DARK = {
@@ -40,9 +50,85 @@ _LIGHT = {
 THEMES = {"dark": _DARK, "light": _LIGHT}
 
 
+def _assets_dir():
+    import os
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+
+
+def _light_icon_path() -> str:
+    """Generate (cached) a LIGHT-theme variant of the app icon: recolour the dark
+    navy tile background to light while keeping the teal gauge / green prompt."""
+    import os
+    from PyQt5.QtGui import QImage, QColor
+    src = os.path.join(_assets_dir(), "icon.png")
+    cache = os.path.join(os.path.expanduser("~"), ".turbossh", "cache", "icon-light.png")
+    try:
+        if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(src):
+            return cache
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        img = QImage(src)
+        if img.isNull():
+            return ""
+        img = img.convertToFormat(QImage.Format_ARGB32)
+        for y in range(img.height()):
+            for x in range(img.width()):
+                px = img.pixelColor(x, y)
+                a = px.alpha()
+                if a < 8:
+                    continue
+                lum = 0.3 * px.red() + 0.59 * px.green() + 0.11 * px.blue()
+                if lum < 92:                      # dark navy tile -> light
+                    img.setPixelColor(x, y, QColor(238, 241, 245, a))
+        img.save(cache, "PNG")
+        return cache
+    except Exception:
+        return ""
+
+
+def app_icon(name: str = "dark"):
+    """QIcon for the app/taskbar in the given theme — dark uses the original
+    artwork, light uses the generated light-background variant."""
+    import os
+    from PyQt5.QtGui import QIcon
+    assets = _assets_dir()
+    if name == "light":
+        lp = _light_icon_path()
+        if lp:
+            return QIcon(lp)
+    ic = QIcon()
+    for p in (os.path.join(assets, "icon.ico"), os.path.join(assets, "icon.png")):
+        if os.path.exists(p):
+            ic.addFile(p)
+    return ic
+
+
+def _arrow_image(name: str) -> str:
+    """Generate (cached) a filled down-arrow PNG in the theme's text colour and
+    return a Qt-stylesheet url() path. CSS border-triangles were rendering as a
+    tiny dot; a real image always shows, clearly, in both themes."""
+    import os
+    from PyQt5.QtCore import Qt, QPointF
+    from PyQt5.QtGui import QPixmap, QPainter, QColor, QPolygonF
+    c = THEMES.get(name, _DARK)
+    try:
+        cache = os.path.join(os.path.expanduser("~"), ".turbossh", "cache")
+        os.makedirs(cache, exist_ok=True)
+        path = os.path.join(cache, f"arrow-{name}.png")
+        pm = QPixmap(16, 16); pm.fill(Qt.transparent)
+        p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(c["text"]))
+        p.drawPolygon(QPolygonF([QPointF(3, 5.5), QPointF(13, 5.5), QPointF(8, 11.5)]))
+        p.end()
+        pm.save(path, "PNG")
+        return path.replace("\\", "/")
+    except Exception:
+        return ""
+
+
 def stylesheet(name: str = "dark") -> str:
     c = THEMES.get(name, _DARK)
     atext = accent_text(name)        # accent that's readable as text on this bg
+    arrow = _arrow_image(name)
     return f"""
     QWidget {{ background: {c['win']}; color: {c['text']}; font-size: 9.5pt; }}
     QMainWindow::separator {{ background: {c['border']}; width: 1px; height: 1px; }}
@@ -101,11 +187,11 @@ def stylesheet(name: str = "dark") -> str:
     QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
         background: {c['panel']}; color: {c['dim']}; border-color: {c['border']};
     }}
-    QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right;
-        border: none; width: 20px; }}
-    QComboBox::down-arrow {{ width: 0; height: 0; margin-right: 7px;
-        border-left: 5px solid transparent; border-right: 5px solid transparent;
-        border-top: 6px solid {atext}; }}
+    QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right;
+        width: 24px; border-left: 1px solid {c['border']};
+        border-top-right-radius: 7px; border-bottom-right-radius: 7px; }}
+    QComboBox::drop-down:hover {{ background: {c['raised']}; }}
+    QComboBox::down-arrow {{ image: url('{arrow}'); width: 13px; height: 13px; }}
     QComboBox QAbstractItemView, QListView {{
         background: {c['raised']}; color: {c['text']}; border: 1px solid {c['border']};
         selection-background-color: {ACCENT}; selection-color: #042830; outline: 0;
@@ -133,12 +219,18 @@ def stylesheet(name: str = "dark") -> str:
     QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; color: {atext}; }}
     QTabWidget::pane {{ border: 1px solid {c['border']}; background: {c['panel']}; border-radius: 6px; }}
     QTabBar::tab {{
-        background: {c['tab']}; color: {c['dim']}; padding: 7px 16px;
+        background: {c['tab']}; color: {c['dim']}; padding: 3px 12px; min-width: 90px;
         border: 1px solid {c['border']}; border-bottom: none;
-        border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 3px;
+        border-top-left-radius: 7px; border-top-right-radius: 7px; margin-right: 2px;
     }}
     QTabBar::tab:selected {{ background: {c['panel']}; color: {atext}; font-weight: 700; }}
     QTabBar::tab:hover {{ color: {c['text']}; }}
+    QTabBar::close-button {{ subcontrol-position: right; }}
+    QTabBar::scroller {{ width: 28px; }}
+    QSplitter::handle {{ background: {c['border']}; }}
+    QSplitter::handle:hover {{ background: {ACCENT}; }}
+    QSplitter::handle:horizontal {{ width: 6px; }}
+    QSplitter::handle:vertical {{ height: 6px; }}
     QCheckBox, QRadioButton {{ background: transparent; color: {c['text']}; spacing: 7px; }}
     QRadioButton {{ padding-right: 14px; }}
     QCheckBox::indicator, QRadioButton::indicator {{ width: 17px; height: 17px;
@@ -187,18 +279,61 @@ def attach_eye(line_edit):
     return act
 
 
+def _icon_pen_color(color):
+    """Default tint for monochrome glyphs: an accent that's readable on the CURRENT
+    theme's background (cyan-on-light was nearly invisible)."""
+    if color:
+        return color
+    try:
+        from . import settings as _s
+        return accent_text(_s.get("theme") or "dark")
+    except Exception:
+        return ACCENT
+
+
 def emoji_icon(ch: str, color: str = None):
-    """Render an emoji/symbol to a QIcon. Color emojis paint themselves; plain
-    symbol glyphs (⚙ ⟳ ⏻ …) would otherwise draw in black and vanish on the dark
-    ribbon. Pass color (hex) to tint monochrome glyphs (e.g. a red power symbol
-    for Exit); otherwise they default to the accent colour."""
+    """Render an emoji/symbol to a QIcon. Colour emojis paint themselves; plain
+    symbol glyphs (⚙ ⬆ ⏻ …) draw in the pen colour, which now follows the theme so
+    they stay visible in light mode too."""
     from PyQt5.QtCore import Qt
     from PyQt5.QtGui import QPixmap, QPainter, QFont, QIcon, QColor
     pm = QPixmap(28, 28)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
-    p.setPen(QColor(color or ACCENT))
+    p.setPen(QColor(_icon_pen_color(color)))
     p.setFont(QFont("Segoe UI Emoji", 14))
     p.drawText(pm.rect(), Qt.AlignCenter, ch)
+    p.end()
+    return QIcon(pm)
+
+
+def split_icon(color: str = None):
+    """A clear 'split view' icon: two side-by-side panes (the 🔲 emoji looked like
+    a blank patch)."""
+    from PyQt5.QtCore import Qt, QRectF
+    from PyQt5.QtGui import QPixmap, QPainter, QIcon, QColor, QPen
+    pm = QPixmap(28, 28); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(_icon_pen_color(color))); pen.setWidth(2); p.setPen(pen)
+    p.drawRoundedRect(QRectF(4.5, 6.5, 7.5, 15), 2, 2)
+    p.drawRoundedRect(QRectF(16, 6.5, 7.5, 15), 2, 2)
+    p.end()
+    return QIcon(pm)
+
+
+def server_icon(color: str = None):
+    """A clear 'SSH server' icon — a small rack with status LEDs (the globe emoji
+    looked wrong)."""
+    from PyQt5.QtCore import Qt, QRectF
+    from PyQt5.QtGui import QPixmap, QPainter, QIcon, QColor, QPen
+    pm = QPixmap(28, 28); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+    col = QColor(_icon_pen_color(color))
+    pen = QPen(col); pen.setWidth(2); p.setPen(pen)
+    p.drawRoundedRect(QRectF(6, 5, 16, 7.5), 2, 2)        # upper rack unit
+    p.drawRoundedRect(QRectF(6, 15.5, 16, 7.5), 2, 2)     # lower rack unit
+    p.setPen(Qt.NoPen); p.setBrush(col)
+    p.drawEllipse(QRectF(9, 7.7, 2.2, 2.2))               # LEDs
+    p.drawEllipse(QRectF(9, 18.2, 2.2, 2.2))
     p.end()
     return QIcon(pm)

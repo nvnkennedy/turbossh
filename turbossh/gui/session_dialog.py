@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QMessageBox)
 
 from .sessions import SessionStore
+from .widgets import HostCombo
 
 
 class _PortScanThread(QThread):
@@ -80,13 +81,25 @@ class SessionDialog(QDialog):
 
         from . import theme
 
-        # --- name ---
+        # --- name + icon ---
         form = QFormLayout()
         self.name = QLineEdit()
         self.name.setPlaceholderText("optional — defaults to the host / device")
         self.name.setToolTip("A label for this saved session — shown in the sidebar list. "
                              "Leave blank and it's named after the host (or COM port).")
         form.addRow("Name", self.name)
+        self.icon = QComboBox()
+        self.icon.setToolTip("Pick an icon for this session (shown in the sidebar and tab).")
+        for emo in ("🖥", "🐧", "🪟", "🖧", "🔌", "📟", "🤖", "🚗", "🛰", "📡",
+                    "⚙", "🔧", "🧪", "🟢", "🔵", "🟣", "🟠", "🔴"):
+            self.icon.addItem(emo, emo)
+        form.addRow("Icon", self.icon)
+        self.quick_cmds = QLineEdit()
+        self.quick_cmds.setPlaceholderText("comma-separated, e.g.  mount -uw /mnt, reset, ls -l")
+        self.quick_cmds.setToolTip("One-click command buttons shown above the terminal "
+                                   "(SSH and serial). Comma-separated. Leave blank for "
+                                   "the SSH defaults (slog2info, journalctl, dmesg, ls, ps).")
+        form.addRow("Quick commands", self.quick_cmds)
         lay.addLayout(form)
 
         # --- connection-type radio buttons ---
@@ -120,8 +133,8 @@ class SessionDialog(QDialog):
         sf = QFormLayout()
         self._ssh_form = sf
         sv.addLayout(sf)
-        self.host = QLineEdit(); self.host.setPlaceholderText("IP address, e.g. 192.168.1.50")
-        self.host.setToolTip("IP address of the target machine.")
+        self.host = HostCombo(); self.host.setPlaceholderText("IP address, e.g. 192.168.1.50")
+        self.host.setToolTip("IP address of the target machine — or pick a saved machine.")
         self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(22)
         self.port.setToolTip("SSH port (22 unless changed).")
         self.user = QLineEdit(); self.user.setPlaceholderText("login user, e.g. root")
@@ -159,7 +172,7 @@ class SessionDialog(QDialog):
                            "hops to the target from there. Pre-filled from "
                            "Settings → Jump host."))
         jf = QFormLayout(); jv.addLayout(jf)
-        self.jhost = QLineEdit(); self.jhost.setPlaceholderText("jump host / RDP machine name or IP")
+        self.jhost = HostCombo(); self.jhost.setPlaceholderText("jump host / RDP machine name or IP")
         self.juser = QLineEdit(); self.juser.setPlaceholderText("jump user (e.g. your Windows login)")
         self.jdomain = QLineEdit(); self.jdomain.setPlaceholderText("Windows domain (optional)")
         self.jpass = QLineEdit(); self.jpass.setEchoMode(QLineEdit.Password)
@@ -279,10 +292,12 @@ class SessionDialog(QDialog):
             hosts = sorted({s.get("host", "") for s in store.sessions if s.get("host")})
             users = sorted({s.get("user", "") for s in store.sessions if s.get("user")})
             jhosts = sorted({s.get("jhost", "") for s in store.sessions if s.get("jhost")})
-            self.host.setCompleter(QCompleter(hosts, self))
+            # host/jhost are HostCombos already listing saved machines — also offer
+            # hosts seen in previously-saved sessions.
+            self.host.add_extra(hosts)
+            self.jhost.add_extra(jhosts)
             self.user.setCompleter(QCompleter(users, self))
             self.juser.setCompleter(QCompleter(users, self))
-            self.jhost.setCompleter(QCompleter(jhosts, self))
         except Exception:
             pass
 
@@ -466,6 +481,9 @@ class SessionDialog(QDialog):
 
     def _load(self, s):
         self.name.setText(s.get("name", ""))
+        if s.get("icon"):
+            self.icon.setCurrentText(s["icon"])
+        self.quick_cmds.setText(s.get("quick_cmds", "") or "")
         self.rb.get(s.get("type", "ssh"), self.rb["ssh"]).setChecked(True)
         self.host.setText(s.get("host", "")); self.port.setValue(s.get("port", 22))
         self.user.setText(s.get("user", "")); self.domain.setText(s.get("domain", ""))
@@ -507,6 +525,8 @@ class SessionDialog(QDialog):
         out = {
             "name": name,
             "type": kind,
+            "icon": self.icon.currentText(),
+            "quick_cmds": self.quick_cmds.text().strip(),
             "host": self.host.text().strip(), "port": self.port.value(),
             "user": self.user.text().strip(), "domain": self.domain.text().strip(),
             "ignore_hostkey": self.ignore.isChecked(),

@@ -10,8 +10,13 @@ _FILE = os.path.join(_DIR, "settings.json")
 
 DEFAULTS = {
     "theme": "dark",            # "dark" | "light"
-    "term_font_size": 10,
-    "term_font": "Consolas",
+    "term_font_size": 11,
+    # crisp modern monospace (ships with Win10/11); falls back to Consolas/Courier
+    "term_font": "Cascadia Mono",
+    "compact_ribbon": False,    # icons-only ribbon (no text) when True
+    # MobaXterm-style keyword colouring in the terminal: tints plain words like
+    # error/warning/success. Never overrides the server's own ANSI colours.
+    "highlight_keywords": True,
     # in-widget scrollback (lines kept in memory for wheel-scrolling). pyte costs
     # ~16 KB/line, so this is deliberately modest; the FULL session is always
     # teed to disk, so "Save all output" is unlimited regardless of this value.
@@ -29,6 +34,10 @@ DEFAULTS = {
     "jump_host": "",
     "jump_user": "",
     "jump_domain": "",
+    # saved machines (RDP / Windows boxes you use often). Each is
+    # {name, host, user, domain}. They populate the host dropdowns everywhere:
+    # the SSH/serial session dialog and the Camera panel's Remote source.
+    "machines": [],
 }
 
 _KR_JUMP = ("turbossh-sessions", "::jump-default")
@@ -79,3 +88,19 @@ def save(data: dict) -> None:
 
 def get(key):
     return load().get(key, DEFAULTS.get(key))
+
+
+def machines() -> list:
+    """Saved machines, cleaned: each {name, host, user, domain} with a non-empty
+    host. Used to fill the host dropdowns in the session dialog and Camera panel."""
+    out = []
+    for m in (load().get("machines") or []):
+        if not isinstance(m, dict):
+            continue
+        host = (m.get("host") or "").strip()
+        if not host:
+            continue
+        out.append({"name": (m.get("name") or "").strip(), "host": host,
+                    "user": (m.get("user") or "").strip(),
+                    "domain": (m.get("domain") or "").strip()})
+    return out

@@ -24,7 +24,8 @@ REMOTE_MARKER = "turbossh_cam"        # the dir/marker webcam_release matches on
 
 
 def cached_ffmpeg() -> str | None:
-    """Return the cached/local ffmpeg.exe path if we already have one."""
+    """Return an ffmpeg we can use without downloading: an explicit Settings
+    path, our cache, or an ffmpeg already on PATH."""
     try:
         from . import settings as _s
         manual = (_s.get("ffmpeg_path") or "").strip()
@@ -33,7 +34,11 @@ def cached_ffmpeg() -> str | None:
     except Exception:
         pass
     p = os.path.join(_CACHE, "ffmpeg.exe")
-    return p if os.path.exists(p) else None
+    if os.path.exists(p):
+        return p
+    import shutil
+    on_path = shutil.which("ffmpeg")        # already installed system-wide?
+    return on_path or None
 
 
 def ensure_local_ffmpeg(log=lambda m: None) -> str:
@@ -44,19 +49,28 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
         return have
     os.makedirs(_CACHE, exist_ok=True)
     zip_path = os.path.join(_CACHE, "ffmpeg.zip")
-    log("Downloading ffmpeg (one-time, ~80 MB)…")
+    log("Downloading ffmpeg (one-time, ~160 MB — please wait)…")
     try:
         req = urllib.request.Request(_FFMPEG_URL, headers={"User-Agent": "turbossh"})
         with urllib.request.urlopen(req, timeout=60) as r, open(zip_path, "wb") as fh:
+            total = int(r.headers.get("Content-Length") or 0)
+            got = 0
+            last = 0
             while True:
                 chunk = r.read(1024 * 256)
                 if not chunk:
                     break
                 fh.write(chunk)
+                got += len(chunk)
+                mb = got // (1024 * 1024)
+                if mb >= last + 5:          # report every ~5 MB
+                    last = mb
+                    pct = f" ({got * 100 // total}%)" if total else ""
+                    log(f"Downloading ffmpeg… {mb} MB{pct}")
     except Exception as exc:
         raise RuntimeError(
-            f"Couldn't download ffmpeg ({exc}). On a blocked network, set a local "
-            f"ffmpeg.exe path in Settings → Camera.")
+            f"Couldn't download ffmpeg ({exc}). Install ffmpeg (so it's on PATH) "
+            f"or set its path in Settings → Camera → ffmpeg path.")
     log("Extracting ffmpeg…")
     try:
         with zipfile.ZipFile(zip_path) as z:
@@ -79,23 +93,33 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
 def ensure_remote_ffmpeg(ssh, local_ffmpeg: str, log=lambda m: None) -> str:
     """Make sure ffmpeg is on the remote host (push it via SFTP if missing) and
     return the remote path. Pushed under a dir containing REMOTE_MARKER so
-    webcam_release can find/kill only our process."""
-    res = ssh.run('powershell -NoProfile -Command "$env:TEMP"')
-    temp = (getattr(res, "text", "") or "").strip().splitlines()
-    temp = temp[-1].strip() if temp else r"C:\Windows\Temp"
+    webcam_release can find/kill only our process.
+
+    NOTE: every SSH call here passes ``safe=False`` so we get RAW results (a real
+    bool from ``exists``, a CommandResult with ``.text`` from ``run``). The handler
+    is created in safe mode, where those calls would otherwise return an
+    OperationResult that is *truthy on success regardless of the value* — which
+    made ``if ssh.exists(...)`` always true, so ffmpeg was never actually uploaded
+    and the remote camera could never be listed."""
+    res = ssh.run('powershell -NoProfile -Command "$env:TEMP"', safe=False, timeout=20)
+    lines = (getattr(res, "text", "") or "").strip().splitlines()
+    temp = (lines[-1].strip() if lines else "") or r"C:\Windows\Temp"
     remote_dir = temp.rstrip("\\") + "\\" + REMOTE_MARKER
     remote_exe = remote_dir + "\\ffmpeg.exe"
     try:
-        if ssh.exists(remote_exe):
+        if ssh.exists(remote_exe, safe=False):
             return remote_exe
     except Exception:
         pass
-    log("Uploading ffmpeg to the remote machine (one-time)…")
+    log("Uploading ffmpeg to the remote machine (one-time, ~160 MB)…")
     try:
-        ssh.makedirs(remote_dir)
+        ssh.makedirs(remote_dir, safe=False)
     except Exception:
         pass
-    ssh.push(local_ffmpeg, remote_exe)
+    ssh.push(local_ffmpeg, remote_exe, safe=False)
+    if not ssh.exists(remote_exe, safe=False):
+        raise RuntimeError("ffmpeg failed to upload to the remote machine "
+                           f"({remote_exe}).")
     return remote_exe
 
 
@@ -114,10 +138,11 @@ def list_local_cameras(ffmpeg: str) -> list:
         return []
 
 
-def local_capture_args(ffmpeg: str, camera: str, *, width: int = 640,
-                       height: int = 480, fps: int = 15, quality: int = 6) -> list:
-    """ffmpeg argv to capture a LOCAL camera and emit MJPEG on stdout."""
-    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "dshow",
-            "-rtbufsize", "64M", "-i", f"video={camera}",
-            "-vf", f"scale={int(width)}:{int(height)}", "-r", str(int(fps)),
+def local_capture_args(ffmpeg: str, camera: str, *, width: int = 1280,
+                       height: int = 720, fps: int = 25, quality: int = 6) -> list:
+    """ffmpeg argv to capture a LOCAL camera and emit MJPEG on stdout, low-delay."""
+    return [ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-f", "dshow", "-rtbufsize", "16M", "-i", f"video={camera}",
+            "-an", "-vf", f"scale={int(width)}:{int(height)}", "-r", str(int(fps)),
             "-f", "mjpeg", "-q:v", str(int(quality)), "-"]

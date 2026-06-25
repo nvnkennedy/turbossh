@@ -183,7 +183,9 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("TurboSSH ready — create or open a session")
         self._install_shortcuts()
+        self._home = None
         self.refresh_sessions()
+        self.open_home()        # MobaXterm-style welcome screen at startup
 
     # ---- menu bar ----
     def _build_menubar(self):
@@ -191,11 +193,10 @@ class MainWindow(QMainWindow):
         ic = theme.emoji_icon
 
         m_file = mb.addMenu("&File")
+        m_file.addAction(ic("🏠"), "Home", self.open_home)
         m_file.addAction(ic("🖥"), "New session…", self.new_session,
                          QKeySequence("Ctrl+N"))
-        from . import settings as _s
-        if _s.get("camera_enabled"):
-            m_file.addAction(ic("📷"), "Camera…", self.open_camera_panel)
+        m_file.addAction(ic("📷"), "Camera…", self.open_camera_panel)
         m_file.addAction(ic("💾"), "Save terminal output…", self._save_current_output,
                          QKeySequence("Ctrl+S"))
         m_file.addSeparator()
@@ -410,42 +411,118 @@ class MainWindow(QMainWindow):
 
     # ---- ribbon toolbar ----
     def _build_ribbon(self):
-        tb = QToolBar("Ribbon")
-        tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        tb.setIconSize(QSize(26, 26))
-        self.addToolBar(tb)
         from . import settings as _s
+        tb = QToolBar("Ribbon")
+        self._ribbon = tb
+        tb.setMovable(False)
+        tb.setIconSize(QSize(26, 26))
+        self._compact_ribbon = bool(_s.get("compact_ribbon"))
+        self.addToolBar(tb)
+        # Edit / Delete intentionally NOT here — they live in the session
+        # right-click menu (and the Session menu), keeping the ribbon clean.
         items = [
             ("🖥", "Session", self.new_session),
+            ("📷", "Camera", self.open_camera_panel),
             ("📁", "SFTP", lambda: self._show_inner("SFTP")),
             ("📜", "Logs", lambda: self._show_inner("Logs")),
-            ("🔲", "Split", self.toggle_split),
-            ("✏", "Edit", self.edit_session),
-            ("🗑", "Delete", self.delete_session),
-            ("🧾", "Log dock", self.toggle_log),
-            ("🖧", "SSH server", self.setup_ssh_server),
+            ("split", "Split", self.toggle_split),         # custom-drawn icon
+            ("📋", "Log dock", self.toggle_log),
+            ("server", "SSH server", self.setup_ssh_server),  # custom-drawn icon
             ("⬆", "Check updates", self.check_updates),
             ("⚙", "Settings", self.show_settings),
             ("❓", "Help", self._open_docs),
         ]
-        # Camera is opt-in — only add its ribbon button when enabled in Settings.
-        if _s.get("camera_enabled"):
-            items.insert(1, ("📷", "Camera", self.open_camera_panel))
+        self._ribbon_actions = []        # (action, emoji) for re-theming icons
         for emoji, label, slot in items:
-            act = QAction(theme.emoji_icon(emoji), label, self)
+            act = QAction(self._ribbon_icon(emoji), label, self)
             act.triggered.connect(slot)
             tb.addAction(act)
+            self._ribbon_actions.append((act, emoji))
         from PyQt5.QtWidgets import QSizePolicy
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
+        # one-click theme toggle (light <-> dark), changes everything instantly
+        self._theme_act = QAction(self._theme_icon(), "Theme", self)
+        self._theme_act.setToolTip("Toggle light / dark theme")
+        self._theme_act.triggered.connect(self._toggle_theme)
+        tb.addAction(self._theme_act)
+        # Compact (icons only) <-> Standard (icons + text) toggle
+        self._density_act = QAction(theme.emoji_icon("🗜"), "Compact", self)
+        self._density_act.setToolTip("Toggle compact (icons only) / standard "
+                                     "(icons + text) — compact frees screen space")
+        self._density_act.triggered.connect(self._toggle_ribbon_density)
+        tb.addAction(self._density_act)
         exit_act = QAction(theme.emoji_icon("⏻", "#f06e60"), "Exit", self)
         exit_act.triggered.connect(self.close)
         tb.addAction(exit_act)
         btn = tb.widgetForAction(exit_act)
         if btn is not None:
             btn.setStyleSheet("color:#f06e60; font-weight:700;")
+        self._apply_ribbon_density()
+
+    def _apply_ribbon_density(self):
+        self._ribbon.setToolButtonStyle(
+            Qt.ToolButtonIconOnly if self._compact_ribbon
+            else Qt.ToolButtonTextUnderIcon)
+        if hasattr(self, "_density_act"):
+            self._density_act.setText("Standard" if self._compact_ribbon else "Compact")
+
+    def _toggle_ribbon_density(self):
+        from . import settings as _s
+        self._compact_ribbon = not self._compact_ribbon
+        self._apply_ribbon_density()
+        cfg = _s.load(); cfg["compact_ribbon"] = self._compact_ribbon; _s.save(cfg)
+
+    def _ribbon_icon(self, emoji):
+        if emoji == "split":
+            return theme.split_icon()
+        if emoji == "server":
+            return theme.server_icon()
+        return theme.emoji_icon(emoji)
+
+    def _theme_icon(self):
+        from . import settings as _s
+        cur = _s.get("theme") or "dark"
+        return theme.emoji_icon("🌙" if cur == "dark" else "☀")
+
+    def _toggle_theme(self):
+        """Ribbon one-click theme switch — persists + applies everywhere instantly."""
+        from . import settings as _s
+        new = "light" if (_s.get("theme") or "dark") == "dark" else "dark"
+        cfg = _s.load(); cfg["theme"] = new; _s.save(cfg)
+        self.apply_theme(new)
+        self.log_panel.append(f"[OK] theme switched to {new}")
+
+    def apply_theme(self, name):
+        """Apply a theme everywhere IMMEDIATELY: stylesheet, log colours, the
+        theme-tinted ribbon icons, and the window/taskbar icon."""
+        QApplication.instance().setStyleSheet(theme.stylesheet(name))
+        try:
+            self.log_panel.set_theme(name)
+        except Exception:
+            pass
+        for act, emoji in getattr(self, "_ribbon_actions", []):
+            try:
+                act.setIcon(self._ribbon_icon(emoji))
+            except Exception:
+                pass
+        if hasattr(self, "_density_act"):
+            self._density_act.setIcon(theme.emoji_icon("🗜"))
+        self._apply_app_icon(name)
+
+    def _apply_app_icon(self, name=None):
+        """Set the window + taskbar icon to the current theme's variant (dark =
+        original artwork, light = generated light-tile variant)."""
+        if name is None:
+            from . import settings as _s
+            name = _s.get("theme") or "dark"
+        ic = theme.app_icon(name)
+        if ic is not None and not ic.isNull():
+            self.setWindowIcon(ic)
+            QApplication.instance().setWindowIcon(ic)
+        if hasattr(self, "_theme_act"):
+            self._theme_act.setIcon(self._theme_icon())
 
     def check_updates(self):
         """Manually check PyPI for a newer version (ribbon button). Runs the
@@ -556,6 +633,9 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
+        self.tabs.setElideMode(Qt.ElideNone)        # show full names (scroll, don't truncate)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tabs.tabBar().customContextMenuRequested.connect(self._tab_menu)
@@ -564,23 +644,59 @@ class MainWindow(QMainWindow):
         plus.setToolTip("New session")
         plus.clicked.connect(self.new_session)
         self.tabs.setCornerWidget(plus, Qt.TopRightCorner)
+        # always-visible tab-actions menu (close this / left / right / others / all)
+        tabmenu = QToolButton()
+        tabmenu.setText(" ▾ ")
+        tabmenu.setToolTip("Tab actions — close this / left / right / others / all")
+        tabmenu.clicked.connect(lambda: self._tab_menu(None))
+        self.tabs.setCornerWidget(tabmenu, Qt.TopLeftCorner)
         self.setCentralWidget(self.tabs)
 
-    def _tab_menu(self, pos):
+    def open_home(self):
+        """Show (or focus) the Home / welcome tab."""
+        from .home_tab import HomeTab
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, HomeTab):
+                w.refresh()
+                self.tabs.setCurrentIndex(i)
+                return
+        self._home = HomeTab(self, self.store)
+        self.tabs.insertTab(0, self._home, "🏠 Home")
+        self.tabs.setCurrentIndex(0)
+
+    def _refresh_home(self):
+        from .home_tab import HomeTab
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, HomeTab):
+                w.refresh()
+
+    def _tab_menu(self, pos, idx=None):
         from PyQt5.QtWidgets import QMenu
+        from PyQt5.QtGui import QCursor
         bar = self.tabs.tabBar()
-        idx = bar.tabAt(pos)
+        if idx is None and pos is not None:
+            idx = bar.tabAt(pos)
+        if idx is None or idx < 0:
+            idx = self.tabs.currentIndex()
         if idx < 0:
             return
         self.tabs.setCurrentIndex(idx)
+        ic = theme.emoji_icon
         m = QMenu(self)
-        m.addAction("Close", lambda: self._close_tab(idx))
-        m.addAction("Close others", lambda: self._close_others(idx))
-        m.addAction("Close to the left", lambda: self._close_side(idx, "left"))
-        m.addAction("Close to the right", lambda: self._close_side(idx, "right"))
+        header = m.addAction(self.tabs.tabText(idx).strip() or "This tab")
+        header.setEnabled(False)
         m.addSeparator()
-        m.addAction("Close all", self._close_all_tabs)
-        m.exec_(bar.mapToGlobal(pos))
+        m.addAction(ic("✖"), "Close this tab", lambda: self._close_tab(idx))
+        m.addAction(ic("⬅"), "Close tabs to the left", lambda: self._close_side(idx, "left"))
+        m.addAction(ic("➡"), "Close tabs to the right", lambda: self._close_side(idx, "right"))
+        m.addAction(ic("🗂"), "Close other tabs", lambda: self._close_others(idx))
+        m.addSeparator()
+        m.addAction(ic("🔲"), "Split / unsplit all", self.toggle_split)
+        m.addAction(ic("🗑"), "Close ALL tabs", self._close_all_tabs)
+        gp = bar.mapToGlobal(pos) if pos is not None else QCursor.pos()
+        m.exec_(gp)
 
     def _close_others(self, keep_idx):
         keep = self.tabs.widget(keep_idx)
@@ -617,14 +733,16 @@ class MainWindow(QMainWindow):
         for s in self.store.sessions:
             t = s.get("type")
             if t == "serial":
-                icon = "📡" if s.get("via_ssh") else "🔌"
                 sub = "serial/ssh" if s.get("via_ssh") else "serial"
+                default_icon = "📡" if s.get("via_ssh") else "🔌"
             else:
-                icon = "🖥"; sub = "ssh"
+                sub = "ssh"; default_icon = "🖥"
+            icon = s.get("icon") or default_icon      # user-chosen icon wins
             it = QListWidgetItem(f"{icon}  {s.get('name')}   ·  {sub}")
             it.setData(Qt.UserRole, s.get("name"))
             self.session_list.addItem(it)
         self._filter_sessions(self.quick.text())
+        self._refresh_home()        # keep the Home tab's session list in sync
 
     def _filter_sessions(self, text):
         text = (text or "").lower()
@@ -726,7 +844,13 @@ class MainWindow(QMainWindow):
         if not name:
             QMessageBox.information(self, "Connect", "Select a session first.")
             return
+        self.open_session_named(name)
+
+    def open_session_named(self, name):
+        """Open a saved session by name (used by the sidebar AND the Home tab)."""
         s = self.store.get(name)
+        if not s:
+            return
         pw = SessionStore.password(name) or ""
         jpw = SessionStore.jump_password(name) or ""
         kind = s.get("type")
@@ -753,7 +877,9 @@ class MainWindow(QMainWindow):
             w.failed.connect(self._on_session_failed)
         if hasattr(w, "connected"):
             w.connected.connect(self._on_session_connected)
-        idx = self.tabs.addTab(w, name)
+        icon = s.get("icon") or ("📡" if (kind == "serial" and s.get("via_ssh"))
+                                 else "🔌" if kind == "serial" else "🖥")
+        idx = self.tabs.addTab(w, f"{icon} {name}")
         self.tabs.setCurrentIndex(idx)
         self.log_panel.append(f"Opening '{name}'…")
         self.statusBar().showMessage(f"Connecting to {s.get('host')}…")
@@ -772,7 +898,6 @@ class MainWindow(QMainWindow):
 
     def toggle_split(self):
         """Tile open sessions in a grid (tabbed multi-session multi-view) <-> tabs."""
-        from . import theme as _t
         if not self._tiled:
             if self.tabs.count() == 0:
                 QMessageBox.information(self, "Split", "Open one or more sessions first.")
@@ -781,32 +906,88 @@ class MainWindow(QMainWindow):
             while self.tabs.count():
                 self._tiled_items.append((self.tabs.widget(0), self.tabs.tabText(0)))
                 self.tabs.removeTab(0)                  # widget kept (we hold the ref)
-            grid_host = QWidget()
-            grid = QGridLayout(grid_host)
-            grid.setSpacing(4)
-            grid.setContentsMargins(4, 4, 4, 4)
-            n = len(self._tiled_items)
-            cols = 1 if n == 1 else 2
-            for i, (w, title) in enumerate(self._tiled_items):
-                cell = QWidget()
-                v = QVBoxLayout(cell); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(2)
-                cap = QLabel("  " + title)
-                cap.setStyleSheet(f"background:{_t.THEMES['dark']['ribbon']};"
-                                  f"color:{_t.ACCENT};padding:4px;border-radius:5px;"
-                                  f"font-weight:600;")
-                v.addWidget(cap); v.addWidget(w, 1)
-                w.setVisible(True); w.show()        # removeTab hid it — re-show
-                grid.addWidget(cell, i // cols, i % cols)
             self.tabs.setParent(None)                   # detach so it's not deleted
-            self.setCentralWidget(grid_host)
             self._tiled = True
-            self.log_panel.append(f"[OK] Tiled {n} session(s). Click Split again for tabs.")
+            self._build_tiles()
+            self.log_panel.append(f"[OK] Tiled {len(self._tiled_items)} session(s). "
+                                  f"✕ closes a pane; click Split for tabs.")
         else:
-            for (w, title) in getattr(self, "_tiled_items", []):
-                self.tabs.addTab(w, title)              # reparents back to tabs
-            self.setCentralWidget(self.tabs)            # deletes the grid host
+            self._untile()
+
+    def _build_tiles(self):
+        """(Re)build the split view from self._tiled_items as nested QSplitters so
+        every pane is drag-resizable with visible boundaries. Each pane has a title
+        bar with a ✕ that closes just that session."""
+        import math
+        items = getattr(self, "_tiled_items", [])
+        if not items:                                   # nothing left -> back to tabs
+            self.setCentralWidget(self.tabs)
             self._tiled = False
-            self.log_panel.append("[OK] Back to tabbed view.")
+            return
+        n = len(items)
+        cols = max(1, math.ceil(math.sqrt(n)))   # 1→1, 2/3/4→2 (4 = clean 2×2), 5-9→3
+        rows_split = QSplitter(Qt.Vertical)
+        rows_split.setChildrenCollapsible(False)
+        rows_split.setHandleWidth(6)
+        i = 0
+        while i < n:
+            row = QSplitter(Qt.Horizontal)
+            row.setChildrenCollapsible(False)
+            row.setHandleWidth(6)
+            for _c in range(cols):
+                if i >= n:
+                    break
+                w, title = items[i]; i += 1
+                row.addWidget(self._make_tile_cell(w, title))
+            rows_split.addWidget(row)
+        self.setCentralWidget(rows_split)               # reparents w's; deletes old host
+
+    def _make_tile_cell(self, w, title):
+        from . import theme as _t
+        cell = QWidget()
+        cell.setStyleSheet(f"QWidget#tileCell {{ border: 1px solid {_t.ACCENT}; "
+                           f"border-radius: 6px; }}")
+        cell.setObjectName("tileCell")
+        v = QVBoxLayout(cell); v.setContentsMargins(3, 3, 3, 3); v.setSpacing(2)
+        bar = QHBoxLayout(); bar.setContentsMargins(0, 0, 0, 0)
+        cap = QLabel("  " + title)
+        cap.setStyleSheet(f"background:{_t.THEMES['dark']['ribbon']};"
+                          f"color:{_t.ACCENT};padding:4px;border-radius:5px;"
+                          f"font-weight:600;")
+        x = QPushButton("✕"); x.setProperty("role", "danger")
+        x.setFixedWidth(28); x.setToolTip("Close this session")
+        x.clicked.connect(lambda _=False, ww=w: self._close_tiled(ww))
+        bar.addWidget(cap, 1); bar.addWidget(x)
+        v.addLayout(bar); v.addWidget(w, 1)
+        w.setVisible(True); w.show()                    # removeTab hid it — re-show
+        return cell
+
+    def _close_tiled(self, w):
+        """Close one pane's session and reflow (or drop back to tabs if last)."""
+        try:
+            if hasattr(w, "close_session"):
+                w.close_session()
+        except Exception:
+            pass
+        self._tiled_items = [(x, t) for (x, t) in self._tiled_items if x is not w]
+        try:
+            w.setParent(None)                           # detach the closed session
+        except Exception:
+            pass
+        if self._tiled_items:
+            self._build_tiles()
+        else:
+            self.setCentralWidget(self.tabs)
+            self._tiled = False
+            self.log_panel.append("[OK] All split sessions closed — back to tabs.")
+
+    def _untile(self):
+        for (w, title) in getattr(self, "_tiled_items", []):
+            self.tabs.addTab(w, title)                  # reparents back to tabs
+        self._tiled_items = []
+        self.setCentralWidget(self.tabs)                # deletes the grid host
+        self._tiled = False
+        self.log_panel.append("[OK] Back to tabbed view.")
 
     def show_settings(self):
         dlg = SettingsDialog(self)
@@ -814,7 +995,7 @@ class MainWindow(QMainWindow):
             from . import settings as settings_mod, theme as _t
             cfg = dlg.result_settings()
             settings_mod.save(cfg)
-            QApplication.instance().setStyleSheet(_t.stylesheet(cfg["theme"]))
+            self.apply_theme(cfg["theme"])      # full immediate update everywhere
             self.log_panel.append(f"[OK] Settings saved — theme: {cfg['theme']}")
 
     def _close_tab(self, index):
@@ -834,19 +1015,50 @@ class MainWindow(QMainWindow):
         import webbrowser
         webbrowser.open("https://pypi.org/project/turbossh/")
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Re-assert the icon after the window is shown so the Windows TASKBAR uses
+        # it (when launched from source via pythonw there's no embedded exe icon,
+        # and the taskbar otherwise falls back to the python feather).
+        if not getattr(self, "_taskbar_icon_set", False):
+            self._taskbar_icon_set = True
+            try:
+                self._apply_app_icon()       # current theme's icon variant
+            except Exception:
+                pass
+
+    def _all_sessions(self):
+        """Every live session widget — both the tabbed ones AND any held in the
+        tiled/split view (those are removed from self.tabs, so closeEvent used to
+        miss them and leak their threads/connections)."""
+        widgets = [self.tabs.widget(i) for i in range(self.tabs.count())]
+        if getattr(self, "_tiled", False):
+            widgets += [w for (w, _t) in getattr(self, "_tiled_items", [])]
+        # only real sessions (Home/welcome tab has no close_session)
+        return [w for w in widgets if w is not None and hasattr(w, "close_session")]
+
     def closeEvent(self, event):
-        n = self.tabs.count()
-        if n > 0:
+        sessions = self._all_sessions()
+        if sessions:
             resp = QMessageBox.question(
                 self, "Quit TurboSSH",
-                f"{n} open session(s) will be disconnected and closed.\n\nQuit?",
+                f"{len(sessions)} open session(s) will be disconnected and "
+                f"closed.\n\nQuit?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if resp != QMessageBox.Yes:
                 event.ignore()
                 return
-        for i in range(self.tabs.count()):
+        # close EVERY session (serial/ssh/camera each release their own port/
+        # connection and stop their reader/worker threads in close_session).
+        for w in sessions:
             try:
-                self.tabs.widget(i).close_session()
+                if hasattr(w, "close_session"):
+                    w.close_session()
             except Exception:
                 pass
         super().closeEvent(event)
+        # make sure nothing keeps the process alive (orphaned Qt threads, etc.)
+        try:
+            QApplication.instance().quit()
+        except Exception:
+            pass

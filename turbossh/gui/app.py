@@ -50,13 +50,42 @@ def _install_excepthook():
 
 def _ensure_shortcuts():
     """Make sure the Desktop + Start-Menu shortcuts (with the proper icon) exist.
-    Runs every launch but only shells out when one is missing — so a deleted or
-    never-created shortcut gets restored, and a fresh install gets both."""
+    Normally only shells out when one is missing. Once (flag file), force-recreate
+    so an existing shortcut that still points at the slow bundled exe gets
+    repointed at the fast `pythonw -m turbossh.gui` launch."""
     try:
-        from ..cli import ensure_shortcuts
-        ensure_shortcuts()
+        from ..cli import ensure_shortcuts, create_desktop_shortcut
+        flag = os.path.join(_FLAG_DIR, "shortcuts-fast-v1")
+        if not os.path.exists(flag):
+            create_desktop_shortcut()
+            os.makedirs(_FLAG_DIR, exist_ok=True)
+            with open(flag, "w") as fh:
+                fh.write("1")
+        else:
+            ensure_shortcuts()
     except Exception as exc:
         _crash_log(f"shortcut creation failed: {exc}")
+
+
+def _migrate_settings_once():
+    """One-time: bump the OLD default terminal font (Consolas) to the crisper
+    Cascadia Mono. Guarded by a flag so a later explicit font choice sticks."""
+    try:
+        from . import settings as s
+        flag = os.path.join(_FLAG_DIR, "font-cascadia-v1")
+        if os.path.exists(flag):
+            return
+        cfg = s.load()
+        if (cfg.get("term_font") or "") == "Consolas":
+            cfg["term_font"] = "Cascadia Mono"
+            if int(cfg.get("term_font_size") or 10) < 11:
+                cfg["term_font_size"] = 11
+            s.save(cfg)
+        os.makedirs(_FLAG_DIR, exist_ok=True)
+        with open(flag, "w") as fh:
+            fh.write("1")
+    except Exception:
+        pass
 
 
 def _first_run_tasks():
@@ -75,6 +104,16 @@ def _first_run_tasks():
 
 
 def main():
+    # When launched from a shortcut (or elevated) the working directory is often
+    # System32, so cwd-relative saves (snapshots, "save output", recordings) would
+    # try to write there and fail. Move to the user's Documents/home so everything
+    # defaults to a writable, sensible place.
+    try:
+        home = os.path.expanduser("~")
+        docs = os.path.join(home, "Documents")
+        os.chdir(docs if os.path.isdir(docs) else home)
+    except Exception:
+        pass
     # Windows: set an explicit AppUserModelID BEFORE any window so the taskbar
     # shows our icon (instead of the generic python/pythonw icon).
     if os.name == "nt":
@@ -86,12 +125,19 @@ def main():
             pass
     app = QApplication(sys.argv)
     app.setApplicationName("TurboSSH")
-    if os.path.exists(ICON_PATH):
-        app.setWindowIcon(QIcon(ICON_PATH))
-    # apply the saved theme at the application level so every window/dialog is styled
+    # apply the saved theme + its matching app/taskbar icon (dark = original
+    # artwork, light = generated light-tile variant)
     from . import theme, settings as settings_mod
-    app.setStyleSheet(theme.stylesheet(settings_mod.get("theme")))
+    _theme = settings_mod.get("theme") or "dark"
+    app.setStyleSheet(theme.stylesheet(_theme))
+    try:
+        _ic = theme.app_icon(_theme)
+        if _ic is not None and not _ic.isNull():
+            app.setWindowIcon(_ic)
+    except Exception:
+        pass
     _install_excepthook()
+    _migrate_settings_once()
     _first_run_tasks()
 
     global _window

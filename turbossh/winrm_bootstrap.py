@@ -193,22 +193,30 @@ _INSTALL_FROM_ZIP = r"""
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 $zip = '{zip}'
 try {{
-    $ex = Join-Path $env:TEMP 'turbossh_ossh_x'
-    if (Test-Path $ex) {{ Remove-Item $ex -Recurse -Force }}
-    Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
-    $src = Get-ChildItem $ex -Directory | Select-Object -First 1
-    if (-not $src) {{ $src = Get-Item $ex }}
     $dest = Join-Path $env:ProgramFiles 'OpenSSH'
-    if (-not (Test-Path $dest)) {{ New-Item -ItemType Directory -Path $dest | Out-Null }}
-    Copy-Item (Join-Path $src.FullName '*') $dest -Recurse -Force
-    $inst = Join-Path $dest 'install-sshd.ps1'
-    if (Test-Path $inst) {{ & powershell -NoProfile -ExecutionPolicy Bypass -File $inst | Out-Null }}
-    $kg = Join-Path $dest 'ssh-keygen.exe'
-    if ((-not (Test-Path (Join-Path $env:ProgramData 'ssh\ssh_host_ed25519_key'))) -and (Test-Path $kg)) {{ & $kg -A | Out-Null }}
-    $fp = Join-Path $dest 'FixHostFilePermissions.ps1'
-    if (Test-Path $fp) {{ $ConfirmPreference='None'; & $fp -Confirm:$false | Out-Null }}
+    # IDEMPOTENT: if sshd is already installed, do NOT re-copy the binaries — they
+    # are locked while the service runs, so a copy would fail ("being used by
+    # another process"). Just make sure it's enabled, running and firewalled.
+    $svc = Get-Service sshd -ErrorAction SilentlyContinue
+    $alreadyInstalled = $svc -and (Test-Path (Join-Path $dest 'sshd.exe'))
+    if (-not $alreadyInstalled) {{
+        $ex = Join-Path $env:TEMP 'turbossh_ossh_x'
+        if (Test-Path $ex) {{ Remove-Item $ex -Recurse -Force }}
+        Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
+        $src = Get-ChildItem $ex -Directory | Select-Object -First 1
+        if (-not $src) {{ $src = Get-Item $ex }}
+        if (-not (Test-Path $dest)) {{ New-Item -ItemType Directory -Path $dest | Out-Null }}
+        Copy-Item (Join-Path $src.FullName '*') $dest -Recurse -Force
+        $inst = Join-Path $dest 'install-sshd.ps1'
+        if (Test-Path $inst) {{ & powershell -NoProfile -ExecutionPolicy Bypass -File $inst | Out-Null }}
+        $kg = Join-Path $dest 'ssh-keygen.exe'
+        if ((-not (Test-Path (Join-Path $env:ProgramData 'ssh\ssh_host_ed25519_key'))) -and (Test-Path $kg)) {{ & $kg -A | Out-Null }}
+        $fp = Join-Path $dest 'FixHostFilePermissions.ps1'
+        if (Test-Path $fp) {{ $ConfirmPreference='None'; & $fp -Confirm:$false | Out-Null }}
+        Remove-Item $ex -Recurse -Force -ErrorAction SilentlyContinue
+    }}
     Set-Service -Name sshd -StartupType Automatic
-    try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }}
+    if ($svc -and $svc.Status -eq 'Running') {{ }} else {{ try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }} }}
     $r = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
     if (-not $r) {{
         New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `

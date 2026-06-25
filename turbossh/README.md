@@ -341,9 +341,10 @@ TurboSSH. It's **opt-in**: turn it on in **Settings → Enable camera** and a
 **📷 Camera** button appears in the ribbon (it stays hidden otherwise).
 
 **In the GUI.** The Camera button opens a panel with the view front-and-centre:
-1. Pick a **Source** — *Local (this PC)* (the default, no connecting) or any
-   saved machine as a remote source.
-2. Pick a **Camera** from the list (Refresh re-scans), then **Start**.
+1. Pick a **Source** — *Local (this PC)* (the default, no connecting) or
+   *Remote (RDP / Windows machine)*, where you enter the machine's host/login
+   (pre-filled from Settings → Jump host).
+2. Pick a **Camera**, a **resolution** and **FPS**, then **Start**.
 3. Use **Snapshot**, **Record**, **Pause**; saved files show an *open folder*
    link. Files save on your laptop.
 

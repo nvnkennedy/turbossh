@@ -167,11 +167,18 @@ def create_desktop_shortcut(name: str = "TurboSSH") -> bool:
     """
     if os.name != "nt":
         return False
+    import importlib.util
     exe = _gui_exe_path()
-    if os.path.exists(exe):
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    frozen = bool(getattr(sys, "frozen", False))
+    have_pyqt = importlib.util.find_spec("PyQt5") is not None
+    if (not frozen) and os.path.exists(pyw) and have_pyqt:
+        # FAST path: run from source with the installed PyQt5 — avoids the bundled
+        # onefile exe self-extracting ~75 MB on every launch (slow startup).
+        target, args, workdir = pyw, "-m turbossh.gui", os.path.dirname(pyw)
+    elif os.path.exists(exe):
         target, args, workdir = exe, "", os.path.dirname(exe)
     else:
-        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
         target = pyw if os.path.exists(pyw) else sys.executable
         args = "-m turbossh.gui"
         workdir = os.path.dirname(target)
@@ -237,22 +244,24 @@ def launch_gui(argv=None) -> int:
     """
     Console entry point (`turbossh-gui`): launch the PyQt5 application.
 
-    Prefers the prebuilt exe bundled in the package (PyQt5 baked in, so it runs
-    even where PyQt5 can't be pip-installed, e.g. Windows ARM64). Falls back to
-    running from source if PyQt5 is importable.
+    Runs from SOURCE when PyQt5 is importable — that's instant. Only falls back to
+    the bundled onefile exe when PyQt5 isn't available (e.g. Windows ARM64): that
+    exe self-extracts ~75 MB to a temp dir on every launch, which is what made
+    startup slow even though PyQt5 was installed.
     """
+    try:
+        import PyQt5  # noqa: F401  (just probing availability)
+        from .gui.app import main as gui_main
+        return gui_main()
+    except ImportError:
+        pass
     exe = _gui_exe_path()
     if os.name == "nt" and os.path.exists(exe):
         args = list(argv) if argv is not None else sys.argv[1:]
         return subprocess.call([exe] + args)
-    try:
-        from .gui.app import main as gui_main
-        return gui_main()
-    except ImportError as exc:
-        print("The GUI needs PyQt5 (or the bundled Windows exe). On a platform "
-              "with PyQt5 wheels: pip install \"turbossh[gui]\".", file=sys.stderr)
-        print(str(exc), file=sys.stderr)
-        return 1
+    print("The GUI needs PyQt5 (or the bundled Windows exe). On a platform "
+          "with PyQt5 wheels: pip install \"turbossh[gui]\".", file=sys.stderr)
+    return 1
 
 
 def setup_server_main(argv=None) -> int:
@@ -279,10 +288,23 @@ def setup_server_main(argv=None) -> int:
     return subprocess.call(cmd)
 
 
-def _add_conn_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--host", required=True)
+def _resolve_ffmpeg(explicit: str | None = None) -> str | None:
+    """Find a local ffmpeg for the camera CLI: an explicit path, one on PATH, or
+    the one the GUI cached under ~/.turbossh/ffmpeg. No auto-download in the CLI."""
+    import shutil
+    if explicit and os.path.exists(explicit):
+        return explicit
+    onpath = shutil.which("ffmpeg")
+    if onpath:
+        return onpath
+    cached = os.path.join(os.path.expanduser("~"), ".turbossh", "ffmpeg", "ffmpeg.exe")
+    return cached if os.path.exists(cached) else None
+
+
+def _add_conn_args(p: argparse.ArgumentParser, required: bool = True) -> None:
+    p.add_argument("--host", required=required)
     p.add_argument("--port", type=int, default=22)
-    p.add_argument("--user", required=True)
+    p.add_argument("--user", required=required)
     p.add_argument("--domain", default=None, help="e.g. CORP for CORP\\user logins")
     p.add_argument("--key", default=None, help="private key file")
     p.add_argument("--password", action="store_true",
@@ -418,6 +440,28 @@ def main(argv=None) -> int:
                        help="host reachable from the SSH server")
     p_fwd.add_argument("--to-port", type=int, required=True)
 
+    # --- camera: list / grab (local, or --host for a remote Windows machine) ---
+    p_caml = sub.add_parser("camera-list",
+                            help="list cameras on THIS machine, or on --host (remote)")
+    _add_conn_args(p_caml, required=False)
+    p_caml.add_argument("--ffmpeg", default=None, help="local ffmpeg path (else PATH/cache)")
+    p_caml.add_argument("--remote-ffmpeg", default="ffmpeg",
+                        help="ffmpeg path on the remote host (default: on its PATH)")
+
+    p_camg = sub.add_parser("camera-grab",
+                            help="save a snapshot (.jpg) or short clip (.mp4 with "
+                                 "--seconds) from a camera (local or --host)")
+    _add_conn_args(p_camg, required=False)
+    p_camg.add_argument("--camera", required=True, help="camera name (see camera-list)")
+    p_camg.add_argument("--out", required=True, help="output file (.jpg, or .mp4 with --seconds)")
+    p_camg.add_argument("--seconds", type=float, default=0.0,
+                        help="record this many seconds (0 = single snapshot)")
+    p_camg.add_argument("--width", type=int, default=1280)
+    p_camg.add_argument("--fps", type=int, default=25)
+    p_camg.add_argument("--ffmpeg", default=None, help="local ffmpeg path (else PATH/cache)")
+    p_camg.add_argument("--remote-ffmpeg", default="ffmpeg",
+                        help="ffmpeg path on the remote host")
+
     p_setup = sub.add_parser("setup-server",
                              help="install & start OpenSSH Server on THIS Windows "
                                   "machine (self-elevates to Administrator)")
@@ -489,6 +533,82 @@ def main(argv=None) -> int:
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
+
+    # camera-list / camera-grab handle their own connection (local needs none)
+    if args.cmd == "camera-list":
+        from .core import parse_dshow_devices
+        if args.host:
+            try:
+                with SSHHandler(_build_config(args)) as ssh:
+                    cams = ssh.list_cameras(ffmpeg=args.remote_ffmpeg)
+            except SSHError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr); return 1
+            where = f"on {args.host}"
+        else:
+            ff = _resolve_ffmpeg(args.ffmpeg)
+            if not ff:
+                print("ffmpeg not found. Install it (on PATH) or pass --ffmpeg PATH.",
+                      file=sys.stderr); return 2
+            r = subprocess.run([ff, "-hide_banner", "-list_devices", "true",
+                                "-f", "dshow", "-i", "dummy"],
+                               capture_output=True, text=True)
+            cams = parse_dshow_devices((r.stdout or "") + "\n" + (r.stderr or ""))
+            where = "on this machine"
+        if not cams:
+            print(f"No cameras found {where}.", file=sys.stderr); return 0
+        for c in cams:
+            print(c)
+        return 0
+
+    if args.cmd == "camera-grab":
+        snapshot = args.seconds <= 0
+        if args.host:
+            try:
+                with SSHHandler(_build_config(args)) as ssh:
+                    lines = (ssh.run('powershell -NoProfile -Command "$env:TEMP"')
+                             .text or "").splitlines()
+                    rtmp = (lines[-1].strip() if lines else r"C:\Windows\Temp")
+                    rpath = rtmp.rstrip("\\") + "\\turbossh_grab" + \
+                        (".jpg" if snapshot else ".mp4")
+                    if snapshot:
+                        # warm the camera up (~1.5s) and keep the last frame —
+                        # `-frames:v 1` alone often grabs before any frame arrives.
+                        cmd = (f'"{args.remote_ffmpeg}" -y -hide_banner -loglevel error '
+                               f'-f dshow -i video="{args.camera}" -t 1.5 -update 1 '
+                               f'"{rpath}"')
+                    else:
+                        cmd = (f'"{args.remote_ffmpeg}" -y -hide_banner -loglevel error '
+                               f'-f dshow -i video="{args.camera}" -t {args.seconds} -an '
+                               f"-vf \"scale='min(iw,{args.width})':-2\" -r {args.fps} "
+                               f'-c:v libx264 -preset veryfast -pix_fmt yuv420p "{rpath}"')
+                    ssh.run(cmd, timeout=max(40.0, args.seconds + 25))
+                    ssh.pull(rpath, args.out)
+                    try:
+                        ssh.run(f'cmd /c del "{rpath}"', timeout=10)
+                    except Exception:
+                        pass
+            except SSHError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr); return 1
+        else:
+            ff = _resolve_ffmpeg(args.ffmpeg)
+            if not ff:
+                print("ffmpeg not found. Install it (on PATH) or pass --ffmpeg PATH.",
+                      file=sys.stderr); return 2
+            if snapshot:
+                # warm the camera up (~1.5s) and keep the last frame — `-frames:v 1`
+                # alone often grabs before the webcam delivers anything.
+                cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "dshow",
+                       "-i", f"video={args.camera}", "-t", "1.5", "-update", "1", args.out]
+            else:
+                cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "dshow",
+                       "-i", f"video={args.camera}", "-t", str(args.seconds), "-an",
+                       "-vf", f"scale='min(iw,{args.width})':-2", "-r", str(args.fps),
+                       "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                       args.out]
+            if subprocess.run(cmd).returncode != 0:
+                print("ffmpeg failed to capture.", file=sys.stderr); return 1
+        print(f"Saved {args.out}")
+        return 0
 
     try:
         with SSHHandler(_build_config(args)) as ssh:
