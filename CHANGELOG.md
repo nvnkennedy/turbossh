@@ -2,6 +2,45 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.2.26 — 2026-06-28
+
+### Fixed
+- **Terminals stay clean when you maximise, split, or resize.** Previously,
+  changing a terminal's size (maximising the window, building/closing a split,
+  or dragging a divider) fired a storm of resize events — each one reshaped the
+  screen buffer and nudged the remote shell — which left blank gaps and a
+  missing prompt/cursor until you pressed Enter. Resizes are now **debounced**
+  into a single clean update once the size settles: the view stays pinned to the
+  live prompt, and the shell is told its new size just once, so the prompt
+  redraws on its own. Applies to both SSH and serial terminals.
+
+### Changed
+- **Split view starts balanced.** Panes now open at equal sizes (even columns
+  and rows) instead of whatever the contents happened to request, so a 2-, 3- or
+  4-way split looks tidy from the start and is still drag-resizable.
+
+## 1.2.25 — 2026-06-27
+
+### Fixed
+- **Remote OpenSSH install (over WinRM) now succeeds reliably on a re-run.**
+  Two bugs made the remote installer fail intermittently — specifically on any
+  machine that had been attempted before:
+  - It now **repairs host keys and their permissions on every run**, instead of
+    only on a first install. A machine left half-installed by an interrupted
+    attempt (sshd present but missing/badly-permissioned host keys) would refuse
+    to start `sshd` and keep failing; it now heals itself on the next run, the
+    same way the local installer always has.
+  - Fixed a stray cleanup step that **reported FAILED on an already-installed
+    machine even though sshd was running fine** (it referenced an unset variable
+    and aborted before reading the service status).
+
+### Changed
+- Clearer error when the WinRM NTLM/CredSSP transport dependency is missing
+  (points you at `pip install "turbossh[winrm]"`) instead of a confusing failure
+  from inside pywinrm.
+- The offline WinRM installer now masks the password in its progress log, matching
+  the online path.
+
 ## 1.2.24 — 2026-06-25
 
 ### Added

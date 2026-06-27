@@ -140,6 +140,15 @@ class Vt100Terminal(QWidget):
         self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
         self._timer.start(33)
 
+        # resize is DEBOUNCED. Maximise / split / dragging a divider fires a STORM
+        # of resize events; applying each one (pyte screen resize + a remote
+        # SIGWINCH) mangled the buffer and left the prompt missing until you
+        # pressed Enter. We coalesce them into ONE clean resize once the size
+        # settles — see _apply_resize.
+        self._pending_size = None
+        self._resize_timer = QTimer(self); self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._apply_resize)
+
     def set_source(self, pull_fn):
         """Provide a callable() -> bytes that the timer drains each tick."""
         self._pull = pull_fn
@@ -240,13 +249,34 @@ class Vt100Terminal(QWidget):
         cols = max(20, self.width() // self.cw)
         rows = max(5, self.height() // self.ch)
         if (cols, rows) != (self.cols, self.rows):
-            self.cols, self.rows = cols, rows
-            try:
-                self.screen.resize(rows, cols)
-            except Exception:
-                pass
-            self.resized.emit(cols, rows)
+            # defer the real resize until the drag / maximise settles. Paint keeps
+            # using the current grid for the ~90 ms gap (harmless), then we apply
+            # ONE clean resize — no SIGWINCH storm, no lost prompt.
+            self._pending_size = (cols, rows)
+            self._resize_timer.start(90)
         super().resizeEvent(event)
+
+    def _apply_resize(self):
+        size = self._pending_size
+        self._pending_size = None
+        if not size or size == (self.cols, self.rows):
+            return
+        cols, rows = size
+        self.cols, self.rows = cols, rows
+        try:
+            self.screen.resize(rows, cols)
+        except Exception:
+            pass
+        # pin to the live tail so the prompt / cursor stay on-screen after a
+        # resize, instead of leaving a blank gap where the prompt used to be
+        if self._following:
+            self._to_bottom()
+        # tell the remote PTY its new size ONCE (a single SIGWINCH); bash/zsh
+        # redraw the current prompt line on it, so it reappears on its own
+        # without needing an Enter press
+        self.resized.emit(cols, rows)
+        self._dirty = True
+        self.update()
 
     # ---- rendering ----
     def _col(self, name, bright=False):
@@ -430,6 +460,10 @@ class Vt100Terminal(QWidget):
 
     def cleanup(self):
         """Close + delete the disk capture (call when the session closes)."""
+        try:
+            self._resize_timer.stop(); self._timer.stop()
+        except Exception:
+            pass
         try:
             if self._cap_fh is not None:
                 self._cap_fh.close()

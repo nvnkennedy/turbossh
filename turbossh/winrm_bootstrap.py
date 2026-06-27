@@ -37,6 +37,21 @@ class WinRMError(SSHError):
     """A WinRM bootstrap operation failed."""
 
 
+def _require_transport_deps(transport: str) -> None:
+    """Fail with a clear message if the chosen WinRM transport's optional
+    dependency is missing, instead of a confusing error from deep inside pywinrm.
+    NTLM (the default) needs ``requests_ntlm``; CredSSP needs ``requests_credssp``."""
+    mod = {"ntlm": "requests_ntlm", "credssp": "requests_credssp"}.get(transport)
+    if not mod:
+        return
+    try:
+        __import__(mod)
+    except Exception:
+        raise WinRMError(
+            f"WinRM '{transport}' transport needs the '{mod}' package. "
+            'Install the WinRM extra:  pip install "turbossh[winrm]"')
+
+
 # PowerShell that idempotently enables OpenSSH Server. {extra} is an optional
 # block (e.g. setting the default shell). Designed to be safe to re-run.
 _ENABLE_SCRIPT = r"""
@@ -91,6 +106,7 @@ def enable_openssh_via_winrm(
             "WinRM bootstrap needs pywinrm. Install it with: "
             'pip install "turbossh[winrm]"'
         )
+    _require_transport_deps(transport)
 
     raw_pw = password.reveal() if isinstance(password, Secret) else password
     login = f"{domain}\\{username}" if domain else username
@@ -209,12 +225,15 @@ try {{
         Copy-Item (Join-Path $src.FullName '*') $dest -Recurse -Force
         $inst = Join-Path $dest 'install-sshd.ps1'
         if (Test-Path $inst) {{ & powershell -NoProfile -ExecutionPolicy Bypass -File $inst | Out-Null }}
-        $kg = Join-Path $dest 'ssh-keygen.exe'
-        if ((-not (Test-Path (Join-Path $env:ProgramData 'ssh\ssh_host_ed25519_key'))) -and (Test-Path $kg)) {{ & $kg -A | Out-Null }}
-        $fp = Join-Path $dest 'FixHostFilePermissions.ps1'
-        if (Test-Path $fp) {{ $ConfirmPreference='None'; & $fp -Confirm:$false | Out-Null }}
         Remove-Item $ex -Recurse -Force -ErrorAction SilentlyContinue
     }}
+    # Repair EVERY run (even when sshd was already present) so a half-finished
+    # earlier attempt heals itself: regenerate any missing host keys and re-tighten
+    # their ACLs — without them sshd refuses to start / complete the handshake.
+    $kg = Join-Path $dest 'ssh-keygen.exe'
+    if ((-not (Test-Path (Join-Path $env:ProgramData 'ssh\ssh_host_ed25519_key'))) -and (Test-Path $kg)) {{ & $kg -A | Out-Null }}
+    $fp = Join-Path $dest 'FixHostFilePermissions.ps1'
+    if (Test-Path $fp) {{ $ConfirmPreference='None'; & $fp -Confirm:$false | Out-Null }}
     Set-Service -Name sshd -StartupType Automatic
     if ($svc -and $svc.Status -eq 'Running') {{ }} else {{ try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }} }}
     $r = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
@@ -226,7 +245,6 @@ try {{
         Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any -ErrorAction SilentlyContinue
     }}
     Remove-Item (Join-Path $env:TEMP 'turbossh_ossh') -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item $ex -Recurse -Force -ErrorAction SilentlyContinue
     'STATUS:' + (Get-Service sshd).Status
 }} catch {{ 'ERROR:' + $_.Exception.Message }}
 """
@@ -262,15 +280,18 @@ def enable_openssh_via_winrm_offline(
 
     if not _HAS_WINRM:
         raise WinRMError('WinRM bootstrap needs pywinrm: pip install "turbossh[winrm]"')
+    _require_transport_deps(transport)
 
     raw_pw = password.reveal() if isinstance(password, Secret) else password
     login = f"{domain}\\{username}" if domain else username
     scheme = "https" if use_ssl else "http"
     endpoint = f"{scheme}://{host}:{winrm_port}/wsman"
 
+    _secret = password if isinstance(password, Secret) else Secret(raw_pw)
+
     def _log(msg: str):
         if log:
-            log(msg)
+            log(mask(msg, _secret))
 
     try:
         session = winrm.Session(

@@ -939,7 +939,11 @@ class MainWindow(QMainWindow):
                     break
                 w, title = items[i]; i += 1
                 row.addWidget(self._make_tile_cell(w, title))
+            if row.count() > 1:                          # start the columns even
+                row.setSizes([1_000_000] * row.count())
             rows_split.addWidget(row)
+        if rows_split.count() > 1:                       # start the rows even
+            rows_split.setSizes([1_000_000] * rows_split.count())
         self.setCentralWidget(rows_split)               # reparents w's; deletes old host
 
     def _make_tile_cell(self, w, title):
