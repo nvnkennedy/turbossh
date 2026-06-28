@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QSpinBox, QDialogButtonBox, QCheckBox, QScrollArea)
 
 from . import theme
+from .. import __version__
 from .log_panel import LogPanel
 from .sessions import SessionStore
 from .session_dialog import SessionDialog
@@ -182,6 +183,10 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("TurboSSH ready — create or open a session")
+        _ver = QLabel(f"  v{__version__}  ")
+        _ver.setStyleSheet("color:#8a9aa5;")
+        _ver.setToolTip("TurboSSH version")
+        self.statusBar().addPermanentWidget(_ver)   # bottom-right, always visible
         self._install_shortcuts()
         self._home = None
         self.refresh_sessions()
@@ -415,7 +420,7 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Ribbon")
         self._ribbon = tb
         tb.setMovable(False)
-        tb.setIconSize(QSize(26, 26))
+        tb.setIconSize(QSize(18, 18))
         self._compact_ribbon = bool(_s.get("compact_ribbon"))
         self.addToolBar(tb)
         # Edit / Delete intentionally NOT here — they live in the session
@@ -462,9 +467,11 @@ class MainWindow(QMainWindow):
         self._apply_ribbon_density()
 
     def _apply_ribbon_density(self):
+        # Standard = icon + label side by side on ONE thin row (MobaXterm-style),
+        # not stacked (which doubled the ribbon height); compact = icons only.
         self._ribbon.setToolButtonStyle(
             Qt.ToolButtonIconOnly if self._compact_ribbon
-            else Qt.ToolButtonTextUnderIcon)
+            else Qt.ToolButtonTextBesideIcon)
         if hasattr(self, "_density_act"):
             self._density_act.setText("Standard" if self._compact_ribbon else "Compact")
 

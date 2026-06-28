@@ -565,6 +565,7 @@ class CameraPanel(QWidget):
             return
         # opening the tunnel clears stale ffmpeg + waits for connect -> do it off
         # the UI thread so the app doesn't freeze for a second or two.
+        self._last_remote = (cam, w, h, fps, force)   # remembered for in-use retry
         self.start_btn.setEnabled(False)
         self._set_status(f"Starting {cam}…", "info")
         self._starter = _RemoteStart(self._handler, cam, self._remote_ffmpeg, w, h, fps, force)
@@ -600,6 +601,24 @@ class CameraPanel(QWidget):
     def _remote_start_fail(self, msg):
         self.start_btn.setEnabled(True)
         self._set_status("Couldn't start the camera", "error")
+        cam, w, h, fps, forced = getattr(self, "_last_remote", (None, 0, 0, 0, False))
+        # "no video frames" / device-in-use almost always means another app (or a
+        # stuck ffmpeg from a previous run) is holding the camera on that machine.
+        # Offer to force any stuck holder closed and retry — unless we already did.
+        looks_busy = any(k in msg.lower() for k in (
+            "no video frames", "in use", "i/o error", "could not run graph",
+            "buffer too full", "being used", "busy", "timeout"))
+        if cam and looks_busy and not forced and self._handler is not None:
+            r = QMessageBox.question(
+                self, "Camera in use?",
+                f"Couldn't start the camera:\n\n{msg}\n\n"
+                "This usually means another app — or a stuck ffmpeg from a "
+                "previous run — is holding the camera on that machine.\n\n"
+                "Force any stuck camera process closed there and try again?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r == QMessageBox.Yes:
+                self._start_remote(cam, w, h, fps, force=True)
+                return
         QMessageBox.warning(self, "Camera", f"Couldn't start the camera:\n\n{msg}")
 
     def _after_start(self, cam):

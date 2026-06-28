@@ -23,7 +23,7 @@ so anything Paramiko can do is possible.
 
 from __future__ import annotations
 
-__version__ = "1.2.26"
+__version__ = "1.2.31"
 
 from .config import SSHConfig, FTPConfig
 from .core import SSHHandler, ShellSession

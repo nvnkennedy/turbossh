@@ -72,8 +72,9 @@ class SshSessionWidget(QWidget):
         self.reader = None
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
         self.status = QLabel("Connecting…")
+        self.status.setStyleSheet("font-size:8pt; color:#8a9aa5;")
         lay.addWidget(self.status)
 
         # inner tabs: Terminal | SFTP | Logs
@@ -83,8 +84,10 @@ class SshSessionWidget(QWidget):
         # --- Terminal tab (toolbar + VT100) ---
         term_page = QWidget()
         tlay = QVBoxLayout(term_page); tlay.setContentsMargins(0, 0, 0, 0)
-        quick = QHBoxLayout()
-        quick.addWidget(QLabel("Quick:"))
+        tlay.setSpacing(2)
+        quick = QHBoxLayout(); quick.setSpacing(4)
+        ql = QLabel("Quick:"); ql.setStyleSheet("font-size:8pt; color:#8a9aa5;")
+        quick.addWidget(ql)
         cmds = [c.strip() for c in (session.get("quick_cmds") or "").split(",")
                 if c.strip()] or ["slog2info", "journalctl", "dmesg", "ls", "ps"]
         for cmd in cmds:
@@ -269,31 +272,23 @@ class SshSessionWidget(QWidget):
         self.term.setFocus()
 
     def _welcome_banner(self):
-        """A MobaXterm-style welcome banner shown in the terminal on first connect:
-        session name, who/where, jump host and time."""
+        """A clean two-line welcome shown in the terminal on first connect:
+        who/where (+ jump host) on line 1, OS and time on line 2."""
         s = self.session
         name = s.get("name") or s.get("host") or "session"
         user = s.get("user") or "—"
         host = s.get("host"); port = s.get("port", 22)
-        C, R, G, Y, B = "\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[33m", "\x1b[1m"
-        rule = "─" * 54
-        lines = [
-            "",
-            f"{C}┌{rule}{R}",
-            f"{C}│{R}  {B}Welcome to {name}{R}",
-            f"{C}│{R}  SSH session to {G}{user}@{host}:{port}{R}",
-        ]
-        if s.get("use_jump") and s.get("jhost"):
-            lines.append(f"{C}│{R}  via jump host {Y}{s.get('jhost')}{R}")
+        C, R, G, Y, B, D = ("\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[33m",
+                            "\x1b[1m", "\x1b[90m")
+        extra = f"{Y}  via {s.get('jhost')}{R}" if (s.get("use_jump") and s.get("jhost")) else ""
         try:
             osname = self.handler.detect_os()
-            lines.append(f"{C}│{R}  remote OS: {osname}")
         except Exception:
-            pass
-        lines.append(f"{C}│{R}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"{C}└{rule}{R}")
-        lines.append("")
-        self.term.feed(("\r\n".join(lines) + "\r\n").encode("utf-8"))
+            osname = ""
+        meta = "  ·  ".join(x for x in (osname, time.strftime("%Y-%m-%d %H:%M:%S")) if x)
+        line1 = f"{C}●{R} {B}{name}{R}  {G}{user}@{host}:{port}{R}{extra}"
+        line2 = f"{D}  {meta}{R}"
+        self.term.feed((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
 
     def _interrupt(self):
         """Send Ctrl-C to the shell and immediately drop the buffered backlog, so
@@ -451,13 +446,15 @@ class SerialSessionWidget(QWidget):
         self.stream_thread = None
         self.bridge_chan = None        # raw SSH channel for native serial-over-SSH
 
-        lay = QVBoxLayout(self)
+        lay = QVBoxLayout(self); lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
         self.status = QLabel("Opening…")
+        self.status.setStyleSheet("font-size:8pt; color:#8a9aa5;")
         lay.addWidget(self.status)
         # a small toolbar (NO input box) — this is a native terminal: click in it
         # and type directly; keystrokes go straight to the port.
-        crow = QHBoxLayout()
-        crow.addWidget(QLabel("Type directly in the terminal:"))
+        crow = QHBoxLayout(); crow.setSpacing(4)
+        tl = QLabel("Type directly:"); tl.setStyleSheet("font-size:8pt; color:#8a9aa5;")
+        crow.addWidget(tl)
         ctrlc = QPushButton("Ctrl-C"); ctrlc.setProperty("role", "danger")
         ctrlc.setToolTip("Send Ctrl-C (0x03) to the port to interrupt a running command")
         ctrlc.clicked.connect(self._interrupt)
@@ -640,17 +637,11 @@ class SerialSessionWidget(QWidget):
 
     def _serial_banner(self, dev, baud, via_ssh):
         name = self.session.get("name") or dev
-        C, R, G, B = "\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[1m"
-        rule = "─" * 50
-        where = f"on {self.session.get('host')} (via SSH)" if via_ssh else "(local)"
-        self.term.feed(("\r\n".join([
-            "",
-            f"{C}┌{rule}{R}",
-            f"{C}│{R}  {B}Welcome to {name}{R}",
-            f"{C}│{R}  Serial {G}{dev} @ {baud}{R} {where}",
-            f"{C}│{R}  {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"{C}└{rule}{R}", "",
-        ]) + "\r\n").encode("utf-8"))
+        C, R, G, B, D = "\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[1m", "\x1b[90m"
+        where = f"on {self.session.get('host')} via SSH" if via_ssh else "local"
+        line1 = f"{C}●{R} {B}{name}{R}  {G}{dev} @ {baud}{R}  {D}{where}{R}"
+        line2 = f"{D}  {time.strftime('%Y-%m-%d %H:%M:%S')}{R}"
+        self.term.feed((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
 
     def close_session(self):
         if self.stream_thread:

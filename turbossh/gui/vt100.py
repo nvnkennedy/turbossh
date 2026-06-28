@@ -9,7 +9,8 @@ import re
 import pyte
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QFontMetrics, QPainter, QColor
-from PyQt5.QtWidgets import QWidget, QApplication, QMenu, QFileDialog
+from PyQt5.QtWidgets import (QWidget, QApplication, QMenu, QFileDialog,
+                             QScrollBar)
 
 # 16-color ANSI palette (xterm-ish), on a dark background
 _PALETTE = {
@@ -149,6 +150,24 @@ class Vt100Terminal(QWidget):
         self._resize_timer = QTimer(self); self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._apply_resize)
 
+        # a real, draggable vertical scrollbar so you can scroll the WHOLE session
+        # (not just nudge the wheel). The pyte screen always stays at the live
+        # bottom; _view_offset = how many lines we're scrolled UP from it, and we
+        # paint a window into history.top + the live buffer (see _visible_rows).
+        self._view_offset = 0           # 0 = live tail; >0 = scrolled back
+        self._prev_top = 0              # len(history.top) last tick (anchor on growth)
+        self._sb_w = 13
+        self._sb = QScrollBar(Qt.Vertical, self)
+        self._sb.setStyleSheet(
+            "QScrollBar:vertical{background:#0c0c0c;width:13px;margin:0;}"
+            "QScrollBar::handle:vertical{background:#3a3f47;border-radius:6px;"
+            "min-height:28px;}"
+            "QScrollBar::handle:vertical:hover{background:#525a66;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{"
+            "background:transparent;}")
+        self._sb.valueChanged.connect(self._on_scrollbar)
+
     def set_source(self, pull_fn):
         """Provide a callable() -> bytes that the timer drains each tick."""
         self._pull = pull_fn
@@ -182,9 +201,9 @@ class Vt100Terminal(QWidget):
                 pass
 
     def _feed(self, data: bytes):
-        # if we're tailing, make sure we're at the bottom before drawing new data
+        # if we're tailing, keep the view pinned to the live bottom
         if self._following:
-            self._to_bottom()
+            self._view_offset = 0
         try:
             self.stream.feed(data)
         except Exception:
@@ -201,38 +220,59 @@ class Vt100Terminal(QWidget):
             data = self._pull(262144)
             if data:
                 self._feed(data)
+        # while scrolled up, keep the view anchored to its content as new lines
+        # scroll off the top (so the page doesn't drift under you)
+        top = len(self.screen.history.top)
+        if not self._following and top > self._prev_top:
+            self._view_offset = min(top, self._view_offset + (top - self._prev_top))
+            self._dirty = True
+        self._prev_top = top
+        self._update_scrollbar()
         if self._dirty:
             self._dirty = False
             self.update()
 
     # ---- scrollback ----
+    def _update_scrollbar(self):
+        """Keep the scrollbar's range/value in sync with the scrollback. 0 = top
+        (oldest), maximum = bottom (live)."""
+        sb = self._sb
+        total = len(self.screen.history.top)
+        if (sb.maximum() != total or sb.pageStep() != max(1, self.rows)
+                or sb.value() != total - self._view_offset):
+            sb.blockSignals(True)
+            sb.setRange(0, total)
+            sb.setPageStep(max(1, self.rows))
+            sb.setSingleStep(1)
+            sb.setValue(total - self._view_offset)
+            sb.blockSignals(False)
+
+    def _on_scrollbar(self, value):
+        total = len(self.screen.history.top)
+        self._view_offset = max(0, total - value)
+        self._following = (self._view_offset == 0)
+        self._dirty = True
+        self.update()
+
     def _to_bottom(self):
         """Return the view to the live tail (after the user scrolled up)."""
-        try:
-            hist = self.screen.history
-            for _ in range(hist.size + 5):
-                before = self.screen.history.position
-                self.screen.next_page()
-                if self.screen.history.position == before:
-                    break
-        except Exception:
-            pass
+        self._view_offset = 0
         self._following = True
+        self._dirty = True
+
+    def _scroll_lines(self, delta):
+        """Scroll by `delta` lines (+ = up/older, - = down/newer)."""
+        total = len(self.screen.history.top)
+        self._view_offset = max(0, min(total, self._view_offset + delta))
+        self._following = (self._view_offset == 0)
+        self._update_scrollbar()
+        self._dirty = True
+        self.update()
 
     def wheelEvent(self, event):
         try:
             steps = event.angleDelta().y() // 120 or (1 if event.angleDelta().y() > 0 else -1)
-            if steps > 0:
-                for _ in range(steps):
-                    self.screen.prev_page()
-                self._following = False
-            elif steps < 0:
-                for _ in range(-steps):
-                    self.screen.next_page()
-                if self.screen.history.position >= self.screen.history.size:
-                    self._following = True
-            self._dirty = True
-            self.update()
+            self._scroll_lines(steps * 3)        # 3 lines per wheel notch
         except Exception:
             pass
 
@@ -246,7 +286,10 @@ class Vt100Terminal(QWidget):
 
     # ---- sizing ----
     def resizeEvent(self, event):
-        cols = max(20, self.width() // self.cw)
+        # keep the scrollbar pinned to the right edge and paint to its left
+        sbw = self._sb_w
+        self._sb.setGeometry(self.width() - sbw, 0, sbw, self.height())
+        cols = max(20, (self.width() - sbw) // self.cw)
         rows = max(5, self.height() // self.ch)
         if (cols, rows) != (self.cols, self.rows):
             # defer the real resize until the drag / maximise settles. Paint keeps
@@ -262,21 +305,57 @@ class Vt100Terminal(QWidget):
         if not size or size == (self.cols, self.rows):
             return
         cols, rows = size
+        old_rows = self.screen.lines
         self.cols, self.rows = cols, rows
         try:
-            self.screen.resize(rows, cols)
+            self._resize_screen(old_rows, rows, cols)
         except Exception:
             pass
         # pin to the live tail so the prompt / cursor stay on-screen after a
         # resize, instead of leaving a blank gap where the prompt used to be
         if self._following:
             self._to_bottom()
+        else:
+            self._view_offset = min(self._view_offset, len(self.screen.history.top))
         # tell the remote PTY its new size ONCE (a single SIGWINCH); bash/zsh
         # redraw the current prompt line on it, so it reappears on its own
         # without needing an Enter press
         self.resized.emit(cols, rows)
         self._dirty = True
         self.update()
+
+    def _resize_screen(self, old_rows, new_rows, new_cols):
+        """Reflow on resize like a real terminal (pyte's own resize is naive: it
+        clips from the top and never moves the cursor, which stranded/blanked the
+        prompt). Flatten history + the visible screen into one list of lines, then
+        choose the visible window so the cursor line stays put:
+
+        * content FITS  (cursor above the new bottom) -> TOP-anchored: content at
+          the top, blank rows BELOW it (no empty rows above a short banner).
+        * content DOESN'T fit -> cursor pinned to the BOTTOM row, older lines slide
+          up into history (scrollback preserved, draggable later).
+        """
+        s = self.screen
+        cur_y = max(0, min(s.cursor.y, old_rows - 1))
+        cur_x = s.cursor.x
+        top = s.history.top
+        all_lines = list(top) + [s.buffer[y] for y in range(old_rows)]
+        cur_abs = len(top) + cur_y
+        start = 0 if cur_abs < new_rows else cur_abs - (new_rows - 1)
+        new_top = all_lines[:start]
+        window = all_lines[start:start + new_rows]
+        # set the new dimensions; pyte's buffer/cursor churn here is overwritten below
+        s.resize(new_rows, new_cols)
+        top.clear()
+        top.extend(new_top)
+        for y in range(new_rows):
+            if y < len(window):
+                s.buffer[y] = window[y]
+            else:
+                s.buffer.pop(y, None)            # fresh blank line on next access
+        s.cursor.y = max(0, min(cur_abs - start, new_rows - 1))
+        s.cursor.x = max(0, min(cur_x, new_cols - 1))
+        s.dirty.update(range(new_rows))
 
     # ---- rendering ----
     def _col(self, name, bright=False):
@@ -308,14 +387,36 @@ class Vt100Terminal(QWidget):
                     hl[i] = color
         return hl
 
+    def _visible_rows(self):
+        """The `rows` line-objects to paint: the live buffer when at the bottom,
+        otherwise a window into history.top + the live buffer for the current
+        scroll offset (None = blank row past the end)."""
+        buf = self.screen.buffer
+        if self._view_offset <= 0:
+            return [buf[y] for y in range(self.rows)]
+        top = list(self.screen.history.top)
+        T = len(top)
+        start = T - self._view_offset
+        out = []
+        for i in range(start, start + self.rows):
+            if 0 <= i < T:
+                out.append(top[i])
+            elif 0 <= i - T < self.rows:
+                out.append(buf[i - T])
+            else:
+                out.append(None)
+        return out
+
     def paintEvent(self, event):
         p = QPainter(self)
         bg_default = self._bg
         p.fillRect(self.rect(), QColor(bg_default))
         p.setFont(self.font)
-        buf = self.screen.buffer
+        rows_data = self._visible_rows()
         for y in range(self.rows):
-            line = buf[y]
+            line = rows_data[y]
+            if line is None:
+                continue
             hl = self._row_highlights(line)
             for x in range(self.cols):
                 cell = line[x]
@@ -335,8 +436,8 @@ class Vt100Terminal(QWidget):
                 if ch != " ":
                     p.setPen(fg)
                     p.drawText(px, py + self._ascent, ch)
-        # block cursor — theme-aware so it shows on both backgrounds
-        if not self.screen.cursor.hidden:
+        # block cursor — only at the live tail (hidden while scrolled back)
+        if self._view_offset <= 0 and not self.screen.cursor.hidden:
             cx, cy = self.screen.cursor.x, self.screen.cursor.y
             if cy < self.rows and cx < self.cols:
                 cur = self._col("green"); cur.setAlpha(150)

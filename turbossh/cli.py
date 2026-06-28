@@ -458,6 +458,10 @@ def main(argv=None) -> int:
                         help="record this many seconds (0 = single snapshot)")
     p_camg.add_argument("--width", type=int, default=1280)
     p_camg.add_argument("--fps", type=int, default=25)
+    p_camg.add_argument("--force", action="store_true",
+                        help="first kill any stale ffmpeg holding the camera on "
+                             "the remote host (use if the grab says the camera is "
+                             "in use / no frames)")
     p_camg.add_argument("--ffmpeg", default=None, help="local ffmpeg path (else PATH/cache)")
     p_camg.add_argument("--remote-ffmpeg", default="ffmpeg",
                         help="ffmpeg path on the remote host")
@@ -565,6 +569,13 @@ def main(argv=None) -> int:
         if args.host:
             try:
                 with SSHHandler(_build_config(args)) as ssh:
+                    if args.force:
+                        # clear any stale ffmpeg holding the camera (turbossh_cam
+                        # stream or a previous turbossh_grab) before opening it
+                        try:
+                            ssh.webcam_release(ffmpeg_marker="turbossh", safe=True)
+                        except Exception:
+                            pass
                     lines = (ssh.run('powershell -NoProfile -Command "$env:TEMP"')
                              .text or "").splitlines()
                     rtmp = (lines[-1].strip() if lines else r"C:\Windows\Temp")
@@ -588,7 +599,11 @@ def main(argv=None) -> int:
                     except Exception:
                         pass
             except SSHError as exc:
-                print(f"ERROR: {exc}", file=sys.stderr); return 1
+                print(f"ERROR: {exc}", file=sys.stderr)
+                if not args.force:
+                    print("If the camera is in use, retry with --force to close any "
+                          "stale ffmpeg holding it first.", file=sys.stderr)
+                return 1
         else:
             ff = _resolve_ffmpeg(args.ffmpeg)
             if not ff:

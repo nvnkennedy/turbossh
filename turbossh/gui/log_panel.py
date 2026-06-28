@@ -3,6 +3,7 @@ level filter, and Clear / Save controls."""
 
 from __future__ import annotations
 
+import time
 import webbrowser
 
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
@@ -72,24 +73,32 @@ class LogPanel(QGroupBox):
 
     def append(self, text: str):
         rank, level = self._detect(text)
-        self._entries.append((rank, level, text))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._entries.append((rank, level, text, ts))
         if len(self._entries) > 50000:
             del self._entries[:10000]
         if rank >= self._min_rank:
-            self._render(level, text)
+            self._render(level, text, ts)
 
     def set_theme(self, name: str):
         """Re-colour the log for a new app theme (light needs darker hues)."""
         self._colors = theme.log_colors(name)
         self._on_filter()                 # re-render all entries with new colours
 
-    def _render(self, level: str, text: str):
+    def _render(self, level: str, text: str, ts: str = ""):
         color = self._colors.get(level, self._colors["INFO"])
         fmt = QTextCharFormat(); fmt.setForeground(QColor(color))
+        tfmt = QTextCharFormat(); tfmt.setForeground(QColor("#7a828c"))   # dim time
         cur = self.view.textCursor(); cur.movePosition(QTextCursor.End)
-        for i, line in enumerate(text.splitlines() or [""]):
+        lines = text.splitlines() or [""]
+        pad = " " * (len(ts) + 1) if ts else ""
+        for i, line in enumerate(lines):
             if i:
                 cur.insertText("\n")
+                if pad:
+                    cur.insertText(pad, tfmt)        # align continuation lines
+            elif ts:
+                cur.insertText(ts + " ", tfmt)       # timestamp prefix (first line)
             cur.insertText(line, fmt)
         cur.insertText("\n")
         self.view.setTextCursor(cur)
@@ -98,9 +107,9 @@ class LogPanel(QGroupBox):
     def _on_filter(self):
         self._min_rank = self.level_filter.currentData() or 0
         self.view.clear()
-        for rank, level, text in self._entries:
+        for rank, level, text, ts in self._entries:
             if rank >= self._min_rank:
-                self._render(level, text)
+                self._render(level, text, ts)
 
     def clear(self):
         self._entries = []

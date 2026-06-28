@@ -351,7 +351,9 @@ TurboSSH. It's **opt-in**: turn it on in **Settings → Enable camera** and a
 Local needs nothing but ffmpeg. For a remote source, it connects over that
 saved machine's own SSH connection on its own threads (so it never slows the
 terminal/serial work), runs ffmpeg there, and streams MJPEG back; closing the
-tab releases the remote camera. If a remote camera is busy it offers to take it.
+tab releases the remote camera. If the camera is busy — another app or a stuck
+ffmpeg from a previous run is holding it — TurboSSH asks whether to force that
+holder closed and try again (Yes / No), so you don't have to hunt it down.
 
 ffmpeg isn't bundled in the pip wheel (it would blow past PyPI's size limit), so
 the first time you use the camera it's fetched once from a public GitHub build,
@@ -369,7 +371,20 @@ chan = ssh.webcam_channel("Integrated Camera", ffmpeg=r"C:\ffmpeg\ffmpeg.exe",
 ssh.webcam_release()
 ```
 
-(There's no CLI subcommand for the camera — it's a GUI/library feature.)
+**From the CLI.** List cameras and grab a snapshot or a short clip — locally, or
+on a remote machine with `--host`:
+
+```bash
+turbossh camera-list                                   # cameras on this PC
+turbossh camera-list --host RDP --user me --password   # cameras on a remote box
+
+turbossh camera-grab --camera "Integrated Camera" --out shot.jpg
+turbossh camera-grab --host RDP --user me --password \
+    --camera "HD Webcam C615" --out clip.mp4 --seconds 8 --width 1280 --fps 30
+```
+
+If a remote grab reports the camera is in use / produced no frames, add
+`--force` to kill any stale ffmpeg holding it first, then retry.
 
 ## Port forwarding
 

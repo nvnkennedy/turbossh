@@ -11,7 +11,6 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLa
                              QPushButton, QListWidget, QListWidgetItem, QScrollArea)
 
 from . import theme
-from .. import __version__
 
 _ICON = os.path.join(os.path.dirname(__file__), "..", "assets", "icon.png")
 
@@ -30,22 +29,21 @@ class HomeTab(QWidget):
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         body = QWidget(); lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 22, 28, 22); lay.setSpacing(16)
+        lay.setContentsMargins(18, 12, 18, 12); lay.setSpacing(10)
         scroll.setWidget(body); outer.addWidget(scroll)
 
-        # --- header: logo + title + version ---
+        # --- header: logo + title (compact) ---
         head = QHBoxLayout()
         if os.path.exists(_ICON):
             logo = QLabel()
-            logo.setPixmap(QPixmap(_ICON).scaled(64, 64, Qt.KeepAspectRatio,
+            logo.setPixmap(QPixmap(_ICON).scaled(40, 40, Qt.KeepAspectRatio,
                                                  Qt.SmoothTransformation))
             head.addWidget(logo)
-        tbox = QVBoxLayout(); tbox.setSpacing(2)
+        tbox = QVBoxLayout(); tbox.setSpacing(0)
         title = QLabel("TurboSSH")
-        title.setStyleSheet(f"color:{theme.ACCENT}; font-size:26pt; font-weight:800;")
-        sub = QLabel(f"v{__version__}   ·   SSH / Serial / SFTP toolkit for "
-                     f"automotive & embedded work")
-        sub.setStyleSheet("color:#9aa0a6; font-size:10pt;")
+        title.setStyleSheet(f"color:{theme.ACCENT}; font-size:16pt; font-weight:800;")
+        sub = QLabel("SSH / Serial / SFTP toolkit for automotive & embedded work")
+        sub.setStyleSheet("color:#9aa0a6; font-size:9pt;")
         tbox.addWidget(title); tbox.addWidget(sub)
         head.addLayout(tbox); head.addStretch(1)
         lay.addLayout(head)
@@ -81,9 +79,9 @@ class HomeTab(QWidget):
     def _card(self, emo, label, desc, slot):
         b = QPushButton(f"{emo}  {label}\n{desc}" if desc else f"{emo}  {label}")
         b.setProperty("role", "ghost")
-        b.setMinimumHeight(58)
+        b.setMinimumHeight(54)
         b.setCursor(Qt.PointingHandCursor)
-        b.setStyleSheet("text-align:left; padding:10px 14px;")
+        b.setStyleSheet("text-align:left; padding:8px 12px;")
         b.clicked.connect(lambda _=False, s=slot: s())
         return b
 

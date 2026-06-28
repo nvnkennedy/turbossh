@@ -2,6 +2,94 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.2.31 — 2026-06-28
+
+### Changed
+- **The version now lives in the status bar** (bottom-right corner), not in the
+  Home header or the window title — out of the way but always visible.
+
+### Added
+- **Timestamps in the log dock.** Every log line is prefixed with its date and
+  time (`YYYY-MM-DD HH:MM:SS`); continuation lines of a multi-line message are
+  aligned under it.
+
+## 1.2.30 — 2026-06-28
+
+### Fixed
+- **No more empty rows above a freshly-connected terminal, and a sane view after
+  un-splitting.** The resize reflow now behaves like a real terminal: a short
+  session (e.g. just the welcome banner) stays anchored at the **top** with blank
+  space below it — not pushed to the bottom with a gap above — while a full
+  session keeps its prompt pinned to the **bottom**. The cursor line always stays
+  visible, and scrollback is still preserved all the way back to the first line.
+- **Home action cards no longer clip their text.** The compact 1.2.28/1.2.29
+  layout made the cards too short, cutting off the second line (e.g. "Local or RDP
+  webcam"); they're tall enough again.
+
+### Changed
+- The connect banner starts at the very top of the terminal (removed its leading
+  blank line).
+
+## 1.2.29 — 2026-06-28
+
+### Added
+- **A real, draggable scrollbar on every terminal.** You can now scroll a session
+  all the way back — from the very first line to the live prompt — by dragging the
+  bar (or with the wheel), for both SSH and serial. Previously only the wheel
+  scrolled and there was no visible bar, so it wasn't obvious you could go back at
+  all. Typing snaps you back to the live tail.
+
+### Fixed
+- **Quick-command buttons no longer clip their text.** The tighter 1.2.28 layout
+  squashed them so labels were cut off (e.g. `slog2info` looked like `slog7info`);
+  they render at full height again.
+
+### Changed
+- **The version is shown again** — on the Home screen header and in the window
+  title bar.
+
+## 1.2.28 — 2026-06-28
+
+### Fixed
+- **Splitting (or resizing) no longer eats a terminal's scrollback.** When a pane
+  shrank, the lines scrolled off the top were being dropped instead of moved into
+  history, so the previous output for that terminal was gone. Those lines are now
+  saved to scrollback first — wheel up and the full history is still there, per
+  terminal, for both SSH and serial.
+
+### Changed
+- **Tighter, MobaXterm-style layout — more room for the terminal.** The ribbon is
+  a single thin row (icon + label side by side, smaller icons) instead of the tall
+  stacked one; the Home screen header and action cards are smaller; and each
+  session's status line and Quick-command bar are slimmer. The terminal now gets
+  the bulk of the window.
+
+## 1.2.27 — 2026-06-28
+
+### Fixed
+- **Terminals no longer go blank or lose the prompt after split + resize.** The
+  1.2.26 debounce stopped the resize *storm*, but the terminal library still
+  anchored a resize to the top and never moved the cursor, so after splitting and
+  then maximising the prompt could end up off-screen, stacked, or dropped
+  entirely. The terminal now re-anchors to the **bottom** like a real terminal —
+  the cursor follows the content and scrollback is pulled in when the pane grows —
+  so the prompt (and `#`) stay put and visible in every view. Both SSH and serial.
+- **The connect banner is two clean lines now** (it was a box that didn't close
+  on the right): `● name  user@host:port  via jump` on the first line, OS and time
+  on the second.
+
+### Added
+- **Camera "in use" → one-click retry.** When a remote camera can't start because
+  another app (or a stuck ffmpeg from a previous run) is holding it — including the
+  "no video frames came through" case — TurboSSH now asks *"force it closed and try
+  again?"* (Yes / No) instead of just reporting the error. The CLI gains a matching
+  `turbossh camera-grab --force` that clears any stale ffmpeg on the remote first.
+
+### Changed
+- Removed the version label from the Home screen.
+- README: documented the `camera-list` / `camera-grab` CLI commands (incl.
+  `--force`) and the in-use retry behaviour.
+
 ## 1.2.26 — 2026-06-28
 
 ### Fixed
