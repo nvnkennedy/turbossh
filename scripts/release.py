@@ -41,10 +41,12 @@ def run(cmd: list[str], **kw) -> None:
 
 
 def current_version() -> str:
-    text = PYPROJECT.read_text(encoding="utf-8")
-    m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+    # The version lives ONLY in turbossh/__init__.py; pyproject reads it
+    # dynamically (tool.setuptools.dynamic), so there's a single source of truth.
+    text = INIT.read_text(encoding="utf-8")
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
     if not m:
-        sys.exit("Could not find version in pyproject.toml")
+        sys.exit("Could not find __version__ in turbossh/__init__.py")
     return m.group(1)
 
 
@@ -98,9 +100,8 @@ def main(argv=None) -> int:
     if not args.skip_tests:
         run([sys.executable, "tests/test_offline.py"])
 
-    # 2. bump version in both files
-    print("\nUpdating version strings:")
-    set_version(PYPROJECT, r'(?m)^version\s*=\s*"([^"]+)"', new, "pyproject.toml")
+    # 2. bump the single source of truth (pyproject reads it dynamically)
+    print("\nUpdating version string:")
     set_version(INIT, r'__version__\s*=\s*"([^"]+)"', new, "turbossh/__init__.py")
 
     # 3. clean previous artifacts

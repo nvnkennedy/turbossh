@@ -2,6 +2,31 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.5.0 — 2026-07-05
+
+A maintenance and project-health release. No change to SSH / serial / SFTP /
+camera behaviour — this hardens the tooling around the code. (Supersedes the
+short-lived 1.3.3, published the same day with the same content; use 1.5.0.)
+
+### Added
+- **Continuous integration** (`.github/workflows/ci.yml`): lint + offline tests
+  on Python 3.9–3.13, plus a build and `twine check` on every push/PR.
+- **Tag-triggered release workflow** using PyPI **Trusted Publishing** (OIDC, no
+  token) that rebuilds the bundled Windows GUI exe so the published wheel matches
+  the source. Requires a one-time PyPI/GitHub setup (see `release.yml`).
+- **`py.typed`** marker — the package now ships its type hints to downstream users.
+- `SECURITY.md`, `CONTRIBUTING.md`, Dependabot config, and `ruff`/`mypy` settings.
+
+### Fixed
+- `strip_ansi` now removes **OSC sequences** (e.g. `ESC]0;title BEL` window-title
+  escapes) instead of leaving the `0;title` text behind in saved logs.
+
+### Changed
+- **Single source of version truth**: `pyproject.toml` reads `__version__` from
+  `turbossh/__init__.py` dynamically, so the two can't desync.
+- Removed unused imports across the package and the dead legacy `TerminalView`
+  widget (the live terminal is the pyte-backed `Vt100Terminal`).
+
 ## 1.3.2 — 2026-07-05
 
 A correctness, security and cleanup release addressing a full code audit. The

@@ -9,9 +9,9 @@ import os
 from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QKeySequence
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QGridLayout, QListWidget, QListWidgetItem, QPushButton,
+                             QListWidget, QListWidgetItem, QPushButton,
                              QTabWidget, QDockWidget, QLabel, QLineEdit, QMessageBox,
-                             QToolBar, QAction, QStatusBar, QInputDialog, QShortcut,
+                             QToolBar, QAction, QStatusBar, QShortcut,
                              QToolButton, QApplication, QSplitter, QDialog, QFormLayout,
                              QSpinBox, QDialogButtonBox, QCheckBox, QScrollArea)
 
@@ -1017,7 +1017,7 @@ class MainWindow(QMainWindow):
     def show_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec_() == dlg.Accepted:
-            from . import settings as settings_mod, theme as _t
+            from . import settings as settings_mod
             cfg = dlg.result_settings()
             settings_mod.save(cfg)
             self.apply_theme(cfg["theme"])      # full immediate update everywhere

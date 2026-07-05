@@ -79,6 +79,9 @@ print("mkdir_p OK")
 # strip_ansi removes CSI colour codes, carriage returns and control chars
 assert strip_ansi("\x1b[31mred\x1b[0m\r\nok") == "red\nok"
 assert strip_ansi("a\x1b[2K\x1b[1Gb") == "ab"
+# OSC title sequences (BEL- and ST-terminated) are stripped whole
+assert strip_ansi("\x1b]0;my title\x07plain") == "plain"
+assert strip_ansi("x\x1b]0;t\x1b\\y") == "xy"
 print("strip_ansi OK")
 
 # an unknown host_key_policy is rejected loudly (no silent AutoAdd fallback)

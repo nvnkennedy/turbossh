@@ -5,7 +5,6 @@ and fleet operations where speed matters. Each host gets its own SSHHandler.
 
 from __future__ import annotations
 
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Sequence
 

@@ -19,7 +19,6 @@ without Kerberos setup.
 
 from __future__ import annotations
 
-import logging
 from typing import Callable, Optional
 
 from .credentials import Secret, mask

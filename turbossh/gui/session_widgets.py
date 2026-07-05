@@ -8,9 +8,9 @@ import socket
 import threading
 import time
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLabel, QTabWidget, QLineEdit)
+                             QLabel, QTabWidget)
 
 from ..config import SSHConfig
 from ..core import SSHHandler

@@ -9,7 +9,11 @@ from typing import Optional
 
 
 # ANSI/VT escape sequences (CSI like ESC[23;80H, OSC like ESC]0;title BEL, etc.)
-_ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+# NB: the CSI (\[…) and OSC (\]…) branches come BEFORE the single-char C1 branch
+# (`[@-Z\\-_]`) — that class also covers `]` (0x5D), so if it came first it would
+# swallow the ESC] introducer and leave the OSC title text (e.g. "0;title") behind.
+_ANSI_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 # control chars except tab(09), newline(0a), carriage-return(0d handled separately)
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 

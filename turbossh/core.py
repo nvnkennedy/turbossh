@@ -25,7 +25,6 @@ from .config import SSHConfig
 from .credentials import Secret, mask
 from .results import CommandResult, TransferResult, ShellResult, OperationResult
 from .exceptions import (
-    SSHError,
     SSHConnectionError,
     SSHAuthenticationError,
     SSHTimeoutError,

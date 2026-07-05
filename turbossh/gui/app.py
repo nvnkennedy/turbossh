@@ -9,10 +9,9 @@ import sys
 import traceback
 import webbrowser
 
-from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
-from .main_window import MainWindow, ICON_PATH
+from .main_window import MainWindow
 
 DOCS_URL = "https://pypi.org/project/turbossh/"
 _FLAG_DIR = os.path.join(os.path.expanduser("~"), ".turbossh")

@@ -1,19 +1,15 @@
-"""Interactive terminal widget for SSH shells and serial consoles.
+"""Reader thread for interactive terminals.
 
-A reader thread pumps incoming bytes into a QPlainTextEdit; key presses are
-translated to bytes and sent to the channel/port. ANSI escape sequences are
-stripped for readability (this is a clean line/stream terminal, not a full
-VT100 — full-screen TUIs like vim/htop won't render perfectly)."""
+A background thread pumps raw bytes from an SSH channel / serial port into a
+capped buffer; the terminal widget (see :mod:`turbossh.gui.vt100`) drains it on a
+timer, so a flood of output never blocks the UI thread.
+"""
 
 from __future__ import annotations
 
 import threading
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtGui import QFont, QTextCursor
-from PyQt5.QtWidgets import QPlainTextEdit
-
-from ..results import strip_ansi
+from PyQt5.QtCore import QThread, pyqtSignal
 
 
 class ReaderThread(QThread):
@@ -65,60 +61,3 @@ class ReaderThread(QThread):
 
     def stop(self):
         self._alive = False
-
-
-_CTRL = {Qt.Key_C: b"\x03", Qt.Key_D: b"\x04", Qt.Key_Z: b"\x1a",
-         Qt.Key_A: b"\x01", Qt.Key_E: b"\x05", Qt.Key_K: b"\x0b",
-         Qt.Key_L: b"\x0c", Qt.Key_U: b"\x15", Qt.Key_W: b"\x17"}
-
-_KEYS = {Qt.Key_Return: b"\r", Qt.Key_Enter: b"\r", Qt.Key_Backspace: b"\x7f",
-         Qt.Key_Tab: b"\t", Qt.Key_Escape: b"\x1b",
-         Qt.Key_Up: b"\x1b[A", Qt.Key_Down: b"\x1b[B",
-         Qt.Key_Right: b"\x1b[C", Qt.Key_Left: b"\x1b[D",
-         Qt.Key_Home: b"\x1b[H", Qt.Key_End: b"\x1b[F",
-         Qt.Key_PageUp: b"\x1b[5~", Qt.Key_PageDown: b"\x1b[6~",
-         Qt.Key_Delete: b"\x1b[3~"}
-
-
-class TerminalView(QPlainTextEdit):
-    """Displays remote output and forwards keystrokes via ``send_fn(bytes)``."""
-
-    def __init__(self, send_fn, parent=None):
-        super().__init__(parent)
-        self._send = send_fn
-        self.setFont(QFont("Consolas", 10))
-        self.setMaximumBlockCount(100000)
-        self.setStyleSheet("background:#06101d; color:#cfe3f7;")
-        self.setUndoRedoEnabled(False)
-
-    def feed(self, text: str):
-        text = strip_ansi(text)
-        if not text:
-            return
-        cur = self.textCursor()
-        cur.movePosition(QTextCursor.End)
-        cur.insertText(text)
-        self.setTextCursor(cur)
-        self.ensureCursorVisible()
-
-    def keyPressEvent(self, event):
-        if not self._send:
-            return
-        mods = event.modifiers()
-        key = event.key()
-        try:
-            if mods & Qt.ControlModifier and key in _CTRL:
-                self._send(_CTRL[key]); return
-            if key in _KEYS:
-                self._send(_KEYS[key]); return
-            text = event.text()
-            if text:
-                self._send(text.encode("utf-8"))
-        except Exception:
-            pass
-
-    def paste_clipboard(self):
-        from PyQt5.QtWidgets import QApplication
-        txt = QApplication.clipboard().text()
-        if txt and self._send:
-            self._send(txt.encode("utf-8"))

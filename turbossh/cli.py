@@ -323,7 +323,7 @@ def setup_server_main(argv=None) -> int:
     extra = list(argv) if argv is not None else sys.argv[1:]
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
            "-File", script] + extra
-    print(f"Launching OpenSSH Server setup (will prompt for Administrator)...")
+    print("Launching OpenSSH Server setup (will prompt for Administrator)...")
     return subprocess.call(cmd)
 
 
@@ -430,7 +430,7 @@ def main(argv=None) -> int:
     p_stream.add_argument("--save", default=None, help="tee output to this local file")
     p_stream.add_argument("--stop-on-match", action="store_true")
 
-    p_lsr = sub.add_parser("list-serial", help="list available serial/COM ports")
+    sub.add_parser("list-serial", help="list available serial/COM ports")
 
     p_ser = sub.add_parser("serial-monitor",
                            help="monitor a serial/COM port live, with match + save")

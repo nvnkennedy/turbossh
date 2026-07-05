@@ -118,7 +118,6 @@ if ($code -eq 0) {{
 def check_now(window):
     """Manually check for updates (ribbon button). Always reports the result —
     a newer version offers a one-click update, otherwise says you're current."""
-    btn = getattr(window, "_update_action_btn", None)
     th = _CheckThread(window)
     th.result.connect(lambda latest: _on_result(window, latest, manual=True))
     th.finished.connect(lambda: window.statusBar().clearMessage()

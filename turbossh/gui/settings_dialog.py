@@ -5,7 +5,6 @@ table lives in its own MachinesDialog opened from a button.
 
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QComboBox, QSpinBox, QFontComboBox, QCheckBox,
                              QDialogButtonBox, QLabel, QLineEdit, QPushButton,
