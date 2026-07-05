@@ -29,7 +29,7 @@ jobs:
           pip install ".[gui]" pyinstaller
           python scripts/build_exe.py --onefile
           Copy-Item dist\turbossh-gui.exe turbossh\bin\turbossh-gui.exe -Force
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gui-exe
           path: turbossh/bin/turbossh-gui.exe
@@ -52,7 +52,7 @@ jobs:
           python -m pip install --upgrade pip build twine
           python -m build
           python -m twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
