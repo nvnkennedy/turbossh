@@ -63,7 +63,14 @@ def set_jump_password(value: str):
         pass
 
 
-def load() -> dict:
+# In-memory cache of the merged settings. Populated from disk on first read and
+# refreshed on every save(). Without it, load()/get() re-read + re-parse the JSON
+# file on EVERY call — and theme.emoji_icon() calls get() for every icon, so
+# building a menu/ribbon/tab fired a burst of disk reads and made the UI sluggish.
+_cache: dict | None = None
+
+
+def _read_from_disk() -> dict:
     data = dict(DEFAULTS)
     try:
         with open(_FILE, "r", encoding="utf-8") as fh:
@@ -73,23 +80,46 @@ def load() -> dict:
     return data
 
 
+def load() -> dict:
+    """Return the full settings (defaults + saved), from the in-memory cache."""
+    global _cache
+    if _cache is None:
+        _cache = _read_from_disk()
+    return dict(_cache)          # a copy, so callers can't mutate the cache
+
+
 def save(data: dict) -> None:
+    # Start from the CURRENT config (defaults + whatever is already saved), not
+    # bare DEFAULTS — so saving a partial dict (e.g. only the settings a dialog
+    # exposes) preserves keys it didn't touch (compact_ribbon, …).
+    global _cache
+    merged = load()
+    merged.update(data)
     try:
         os.makedirs(_DIR, exist_ok=True)
-        # Start from the CURRENT config (defaults + whatever is already on disk),
-        # not bare DEFAULTS — so saving a partial dict (e.g. only the settings a
-        # dialog exposes) preserves keys it didn't touch (compact_ribbon, …)
-        # instead of silently resetting them.
-        merged = load()
-        merged.update(data)
         with open(_FILE, "w", encoding="utf-8") as fh:
             json.dump(merged, fh, indent=2)
     except Exception:
         pass
+    # Keep the in-memory copy authoritative even if the write failed, so the
+    # running app stays consistent (e.g. a live theme switch still takes effect).
+    _cache = merged
+
+
+def reload() -> dict:
+    """Drop the cache and re-read from disk (rarely needed; the app owns the
+    file, so the cache is normally authoritative)."""
+    global _cache
+    _cache = None
+    return load()
 
 
 def get(key):
-    return load().get(key, DEFAULTS.get(key))
+    """Return one setting from the cache (no disk hit on the hot path)."""
+    global _cache
+    if _cache is None:
+        _cache = _read_from_disk()
+    return _cache.get(key, DEFAULTS.get(key))
 
 
 def machines() -> list:

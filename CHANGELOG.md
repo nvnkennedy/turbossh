@@ -2,6 +2,17 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.5.1 — 2026-07-05
+
+### Fixed
+- **The GUI is snappy again.** The app read and re-parsed its settings file from
+  disk on *every* access, and `theme.emoji_icon()` reads a setting for each icon —
+  so opening a menu, rebuilding the ribbon, switching theme, or creating a session
+  tab fired a burst of disk reads and made the whole UI (and everything around an
+  SSH/serial action) feel sluggish. Settings are now cached in memory and
+  refreshed on save, cutting a single settings read from ~180 µs to ~150 ns with
+  no change in behaviour.
+
 ## 1.5.0 — 2026-07-05
 
 A maintenance and project-health release. No change to SSH / serial / SFTP /
