@@ -108,11 +108,10 @@ class SessionDialog(QDialog):
         tv.addWidget(_hint("SSH = log into a Linux/QNX machine and get a terminal.\n"
                            "Serial = talk to a COM port / debug board (optionally on a remote machine)."))
         trow = QHBoxLayout()
-        self.rb = {"ssh": QRadioButton("SSH"),
-                   "serial": QRadioButton("Serial")}
         # Camera is NOT a session type — it's its own panel (Local/Remote), so the
         # session dialog only handles SSH and Serial.
-        self.cam_box = None
+        self.rb = {"ssh": QRadioButton("SSH"),
+                   "serial": QRadioButton("Serial")}
         self._grp = QButtonGroup(self)
         for k, b in self.rb.items():
             self._grp.addButton(b)
@@ -173,11 +172,14 @@ class SessionDialog(QDialog):
                            "Settings → Jump host."))
         jf = QFormLayout(); jv.addLayout(jf)
         self.jhost = HostCombo(); self.jhost.setPlaceholderText("jump host / RDP machine name or IP")
+        self.jport = QSpinBox(); self.jport.setRange(1, 65535); self.jport.setValue(22)
+        self.jport.setToolTip("SSH port of the jump host (22 unless changed).")
         self.juser = QLineEdit(); self.juser.setPlaceholderText("jump user (e.g. your Windows login)")
         self.jdomain = QLineEdit(); self.jdomain.setPlaceholderText("Windows domain (optional)")
         self.jpass = QLineEdit(); self.jpass.setEchoMode(QLineEdit.Password)
         theme.attach_eye(self.jpass)
-        for label, w in (("Jump host", self.jhost), ("Jump user", self.juser),
+        for label, w in (("Jump host", self.jhost), ("Jump port", self.jport),
+                         ("Jump user", self.juser),
                          ("Jump domain", self.jdomain), ("Jump password", self.jpass)):
             jf.addRow(label, w)
         self.jump_group.setVisible(False)
@@ -212,7 +214,11 @@ class SessionDialog(QDialog):
         self.baud.setToolTip("Baud rate the board uses (115200 is the common default).")
         self.baud.addItems(["9600", "19200", "38400", "57600", "115200",
                             "230400", "460800", "921600"])
-        self.baud.setCurrentText("115200")
+        try:
+            from . import settings as _s
+            self.baud.setCurrentText(str(_s.get("default_baud") or 115200))
+        except Exception:
+            self.baud.setCurrentText("115200")
         rf.addRow("Device / port", dev_w)
         rf.addRow("Baud", self.baud)
         self.scan_status = QLabel("")
@@ -263,9 +269,10 @@ class SessionDialog(QDialog):
             self.jpass.setText(s.jump_password())
 
     def accept(self):
-        # warn if "via jump host" is on but no jump host is configured anywhere
-        uses_jump = (self._type() == "ssh" or
-                     (self._type() == "serial" and self.ser_via_ssh.isChecked()))
+        # warn if "via jump host" is on but no jump host is configured anywhere.
+        # Jump host is offered for plain SSH sessions only (the checkbox is hidden
+        # otherwise), so don't warn for serial sessions where it isn't shown.
+        uses_jump = self._type() == "ssh"
         if uses_jump and self.use_jump.isChecked() and not self.jhost.text().strip():
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(
@@ -310,25 +317,18 @@ class SessionDialog(QDialog):
     def _toggle(self, kind):
         if not hasattr(self, "ssh_box"):
             return
-        serial_via_ssh = (kind == "serial" and self.ser_via_ssh.isChecked())
-        # Camera and serial-over-RDP both talk to the RDP machine, so the shared
-        # connection box re-brands as "RDP machine" in those modes.
-        rdp_mode = serial_via_ssh or (kind == "camera")
+        # Serial-over-RDP talks to the RDP machine, so the shared connection box
+        # re-brands as "RDP machine" in that mode.
+        rdp_mode = (kind == "serial" and self.ser_via_ssh.isChecked())
         self.ssh_box.setVisible(kind == "ssh" or rdp_mode)
-        if kind == "camera":
-            self.ssh_box.setTitle("RDP machine (the camera is on it)")
-        elif serial_via_ssh:
-            self.ssh_box.setTitle("RDP machine (the COM port is plugged into it)")
-        else:
-            self.ssh_box.setTitle("SSH")
+        self.ssh_box.setTitle(
+            "RDP machine (the COM port is plugged into it)" if rdp_mode else "SSH")
         self.ssh_hint.setVisible(not rdp_mode)
         self._relabel_conn_fields(rdp_mode)
         self.ser_box.setVisible(kind == "serial")
-        self.ser_ssh_hint.setVisible(serial_via_ssh)
-        if self.cam_box is not None:
-            self.cam_box.setVisible(kind == "camera")
+        self.ser_ssh_hint.setVisible(rdp_mode)
         if hasattr(self, "scan_btn"):
-            self.scan_btn.setText("🔍 Scan remote" if serial_via_ssh else "🔍 Scan ports")
+            self.scan_btn.setText("🔍 Scan remote" if rdp_mode else "🔍 Scan ports")
         # Jump host is only for a *plain SSH* session (laptop → jump → target).
         self.use_jump.setVisible(kind == "ssh")
         self._sync_jump()
@@ -490,15 +490,12 @@ class SessionDialog(QDialog):
         self.ignore.setChecked(s.get("ignore_hostkey", True))
         self.legacy.setChecked(s.get("legacy", False))
         self.use_jump.setChecked(s.get("use_jump", False))
-        self.jhost.setText(s.get("jhost", "")); self.juser.setText(s.get("juser", ""))
+        self.jhost.setText(s.get("jhost", "")); self.jport.setValue(s.get("jport", 22))
+        self.juser.setText(s.get("juser", ""))
         self.jdomain.setText(s.get("jdomain", ""))
         self.device.setCurrentText(s.get("device", "COM5"))
         self.baud.setCurrentText(str(s.get("baud", 115200)))
         self.ser_via_ssh.setChecked(s.get("via_ssh", False))
-        if self.cam_box is not None:
-            self.camera.setCurrentText(s.get("camera", ""))
-            self.cam_res.setCurrentText(f"{s.get('cam_width', 640)}x{s.get('cam_height', 480)}")
-            self.cam_fps.setCurrentText(str(s.get("cam_fps", 15)))
         self.password.setText(SessionStore.password(s.get("name", "")) or "")
         self.jpass.setText(SessionStore.jump_password(s.get("name", "")) or "")
 
@@ -514,15 +511,11 @@ class SessionDialog(QDialog):
         if not name:
             if kind == "serial":
                 name = self.device.currentText().strip() or "serial"
-            elif kind == "camera":
-                cam = self.camera.currentText().strip() if self.cam_box else ""
-                host = self.host.text().strip()
-                name = (f"cam {cam}" if cam else f"camera @ {host}") or "camera"
             else:
                 host = self.host.text().strip()
                 user = self.user.text().strip()
                 name = (f"{user}@{host}" if user and host else host) or "ssh session"
-        out = {
+        return {
             "name": name,
             "type": kind,
             "icon": self.icon.currentText(),
@@ -531,25 +524,14 @@ class SessionDialog(QDialog):
             "user": self.user.text().strip(), "domain": self.domain.text().strip(),
             "ignore_hostkey": self.ignore.isChecked(),
             "legacy": self.legacy.isChecked(),
-            "use_jump": self.use_jump.isChecked(),
-            "jhost": self.jhost.text().strip(), "juser": self.juser.text().strip(),
+            # jump host is offered for plain SSH sessions only
+            "use_jump": self.use_jump.isChecked() and kind == "ssh",
+            "jhost": self.jhost.text().strip(), "jport": self.jport.value(),
+            "juser": self.juser.text().strip(),
             "jdomain": self.jdomain.text().strip(),
             "device": self.device.currentText().strip(), "baud": baud,
             "via_ssh": self.ser_via_ssh.isChecked(),
         }
-        if self.cam_box is not None:
-            res = (self.cam_res.currentText() or "640x480").lower().split("x")
-            try:
-                w, h = int(res[0]), int(res[1])
-            except (ValueError, IndexError):
-                w, h = 640, 480
-            try:
-                fps = int(self.cam_fps.currentText())
-            except ValueError:
-                fps = 15
-            out.update(camera=self.camera.currentText().strip(),
-                       cam_width=w, cam_height=h, cam_fps=fps)
-        return out
 
     def password_value(self) -> str:
         return self.password.text()

@@ -9,7 +9,7 @@ normal SSHHandler connects.
 
 Requirements
 ------------
-    pip install "turbossh[winrm]"        # pulls in pywinrm (+ NTLM transport)
+    pip install pywinrm requests-ntlm     # required deps of turbossh (NTLM transport)
 
 The connecting account must be a **local administrator** on the target (installing
 a Windows capability, creating a service, and adding a firewall rule all need
@@ -47,9 +47,10 @@ def _require_transport_deps(transport: str) -> None:
     try:
         __import__(mod)
     except Exception:
+        pip_name = mod.replace("_", "-")
         raise WinRMError(
             f"WinRM '{transport}' transport needs the '{mod}' package. "
-            'Install the WinRM extra:  pip install "turbossh[winrm]"')
+            f"Install it with:  pip install {pip_name}")
 
 
 # PowerShell that idempotently enables OpenSSH Server. {extra} is an optional
@@ -62,8 +63,15 @@ try {{
     if ($cap -and $cap.State -ne 'Installed') {{
         Add-WindowsCapability -Online -Name $cap.Name | Out-Null
     }}
+    $sshdCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (Test-Path $sshdCfg) {{
+        $cfgLines = Get-Content $sshdCfg
+        if ($cfgLines -match '^\s*#?\s*Port\s+\d+') {{ $cfgLines = $cfgLines -replace '^\s*#?\s*Port\s+\d+', 'Port {ssh_port}' }}
+        else {{ $cfgLines += 'Port {ssh_port}' }}
+        Set-Content -Path $sshdCfg -Value $cfgLines -Encoding ascii
+    }}
     Set-Service -Name sshd -StartupType Automatic
-    Start-Service sshd
+    try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }}
     if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {{
         New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort {ssh_port} | Out-Null
@@ -103,8 +111,7 @@ def enable_openssh_via_winrm(
     """
     if not _HAS_WINRM:
         raise WinRMError(
-            "WinRM bootstrap needs pywinrm. Install it with: "
-            'pip install "turbossh[winrm]"'
+            "WinRM bootstrap needs pywinrm. Install it with: pip install pywinrm"
         )
     _require_transport_deps(transport)
 
@@ -167,6 +174,10 @@ def _smb_copy(host, login, password, local_path, remote_winpath, log) -> bool:
     import subprocess
     if os.name != "nt":
         return False
+    if not password:
+        # no password -> can't authenticate to the admin share; let the caller
+        # fall back to the (slower) WinRM upload instead of crashing.
+        return False
     # remote_winpath is like 'C:\\Windows\\Temp\\turbossh_ossh\\openssh.zip'
     drive, rest = remote_winpath.split(":", 1)
     unc = rf"\\{host}\{drive}${rest}"                      # \\host\C$\Windows\...
@@ -177,7 +188,11 @@ def _smb_copy(host, login, password, local_path, remote_winpath, log) -> bool:
                        capture_output=True, creationflags=creationflags)
     except Exception:
         pass
-    r = subprocess.run(["net", "use", ipc, password, "/user:" + login],
+    # Pass the password on STDIN (net use ... *) rather than on the command line,
+    # so it never appears in a process listing. `*` makes net use prompt for it
+    # and read the answer from our piped stdin.
+    r = subprocess.run(["net", "use", ipc, "*", "/user:" + login],
+                       input=password + "\r\n",
                        capture_output=True, text=True, timeout=30,
                        creationflags=creationflags)
     if r.returncode != 0:
@@ -234,8 +249,16 @@ try {{
     if ((-not (Test-Path (Join-Path $env:ProgramData 'ssh\ssh_host_ed25519_key'))) -and (Test-Path $kg)) {{ & $kg -A | Out-Null }}
     $fp = Join-Path $dest 'FixHostFilePermissions.ps1'
     if (Test-Path $fp) {{ $ConfirmPreference='None'; & $fp -Confirm:$false | Out-Null }}
+    $sshdCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (Test-Path $sshdCfg) {{
+        $cfgLines = Get-Content $sshdCfg
+        if ($cfgLines -match '^\s*#?\s*Port\s+\d+') {{ $cfgLines = $cfgLines -replace '^\s*#?\s*Port\s+\d+', 'Port {port}' }}
+        else {{ $cfgLines += 'Port {port}' }}
+        Set-Content -Path $sshdCfg -Value $cfgLines -Encoding ascii
+    }}
     Set-Service -Name sshd -StartupType Automatic
-    if ($svc -and $svc.Status -eq 'Running') {{ }} else {{ try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }} }}
+    # restart every run so a changed listen-Port (sshd_config above) takes effect
+    try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }}
     $r = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
     if (-not $r) {{
         New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
@@ -279,7 +302,7 @@ def enable_openssh_via_winrm_offline(
     import os
 
     if not _HAS_WINRM:
-        raise WinRMError('WinRM bootstrap needs pywinrm: pip install "turbossh[winrm]"')
+        raise WinRMError("WinRM bootstrap needs pywinrm: pip install pywinrm")
     _require_transport_deps(transport)
 
     raw_pw = password.reveal() if isinstance(password, Secret) else password

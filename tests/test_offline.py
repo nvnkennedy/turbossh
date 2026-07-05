@@ -1,9 +1,16 @@
 import logging
 logging.disable(logging.CRITICAL)
 
+import os
+import sys
+# Test the working-tree package, not whatever 'turbossh' happens to be installed
+# in site-packages (running this file puts tests/ on sys.path, not the repo root).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import turbossh as P
-from turbossh import (SSHHandler, SSHConfig, Secret, mask, OperationResult,
-                         SSHError, TransferResult)
+from turbossh import (SSHHandler, SSHConfig, FTPConfig, SSHPool, Secret, mask,
+                         OperationResult, SSHError, TransferResult)
+from turbossh.results import strip_ansi
 
 print("version", P.__version__)
 
@@ -69,9 +76,36 @@ fs2 = FS(); SSHHandler._mkdir_p(h, fs2, "rel/x")
 assert fs2.made == ["rel", "rel/x"], fs2.made
 print("mkdir_p OK")
 
-# connect failure -> typed exc (raise) and OperationResult (safe)
+# strip_ansi removes CSI colour codes, carriage returns and control chars
+assert strip_ansi("\x1b[31mred\x1b[0m\r\nok") == "red\nok"
+assert strip_ansi("a\x1b[2K\x1b[1Gb") == "ab"
+print("strip_ansi OK")
+
+# an unknown host_key_policy is rejected loudly (no silent AutoAdd fallback)
+try:
+    SSHConfig(host="h", host_key_policy="strcit")   # typo
+    raise SystemExit("FAIL: bad host_key_policy should have raised")
+except ValueError:
+    print("host_key_policy validation OK")
+for good in ("auto", "reject", "warn", "ignore"):
+    SSHConfig(host="h", host_key_policy=good)
+
+# FTPConfig coerces its password into a Secret too
+fc = FTPConfig(host="h", username="u", password="pw")
+assert isinstance(fc.password, Secret) and fc.password.reveal() == "pw"
+print("FTPConfig secret OK")
+
+# SSHPool keeps duplicate hosts distinct instead of collapsing them
+pool = SSHPool([SSHConfig(host="dup", port=22, username="a", password="x"),
+                SSHConfig(host="dup", port=2222, username="b", password="y")])
+assert len(pool.handlers) == 2, list(pool.handlers)
+print("SSHPool duplicate hosts OK:", list(pool.handlers))
+
+# connect failure -> typed exc (raise) and OperationResult (safe).
+# diagnose_on_failure=False so this stays fast and doesn't probe RDP ports.
 bad = SSHConfig(host="10.255.255.1", username="x", password="y",
-                connect_timeout=1, max_retries=1, retry_backoff=0.1)
+                connect_timeout=1, max_retries=1, retry_backoff=0.1,
+                diagnose_on_failure=False)
 try:
     SSHHandler(bad).connect(); raise SystemExit("FAIL: should have raised")
 except SSHError as e:

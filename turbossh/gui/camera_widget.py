@@ -882,10 +882,17 @@ class CameraPanel(QWidget):
                     pass
             self._chan = None
         if self._handler is not None:
-            try:
-                self._handler.webcam_release(safe=True)
-            except Exception:
-                pass
+            # release the remote camera off the UI thread — webcam_release runs an
+            # SSH command (up to a 15s timeout) that would otherwise freeze the GUI
+            # every time you press Stop.
+            h = self._handler
+
+            def _release():
+                try:
+                    h.webcam_release(safe=True)
+                except Exception:
+                    pass
+            threading.Thread(target=_release, daemon=True).start()
         for b in (self.snap_btn, self.rec_btn, self.pause_btn):
             b.setEnabled(False)
         self._paused = False

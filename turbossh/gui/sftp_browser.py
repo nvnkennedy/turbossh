@@ -26,6 +26,36 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QInputDialog, QMessageBox, QLabel)
 
 
+class _ListThread(QThread):
+    """List a remote directory on its OWN sftp channel, off the UI thread — so the
+    browser never freezes on a slow/high-latency link. Emits the normalized path
+    and a pre-sorted list of (name, is_dir)."""
+    done = pyqtSignal(str, list)
+    fail = pyqtSignal(str)
+
+    def __init__(self, handler, cwd):
+        super().__init__()
+        self.handler, self.cwd = handler, cwd
+
+    def run(self):
+        try:
+            sftp = self.handler.client.open_sftp()
+            try:
+                cwd = self.cwd
+                try:
+                    cwd = sftp.normalize(cwd)
+                except Exception:
+                    pass
+                entries = sftp.listdir_attr(cwd)
+            finally:
+                sftp.close()
+            items = sorted(((e.filename, _attr_is_dir(e)) for e in entries),
+                           key=lambda t: (not t[1], (t[0] or "").lower()))
+            self.done.emit(cwd, items)
+        except Exception as exc:
+            self.fail.emit(f"{type(exc).__name__}: {exc}")
+
+
 class _TransferThread(QThread):
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -60,6 +90,8 @@ class SftpBrowser(QWidget):
         self.handler = handler
         self.cwd = "."
         self._threads = []
+        self._list_threads = set()
+        self._list_seq = 0
 
         lay = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -97,26 +129,30 @@ class SftpBrowser(QWidget):
 
     # --- navigation ---
     def refresh(self):
-        sftp = self.handler.sftp()
-        try:
-            try:
-                self.cwd = sftp.normalize(self.cwd)
-            except Exception:
-                pass
-            self.path.setText(self.cwd)
-            entries = sftp.listdir_attr(self.cwd)
-        except Exception as exc:
-            self.log.emit(f"[ERROR] list {self.cwd}: {exc}")
-            return
+        # list on a background thread; only the newest request's result is applied
+        self._list_seq += 1
+        seq = self._list_seq
+        t = _ListThread(self.handler, self.cwd)
+        t.done.connect(lambda cwd, items, s=seq: self._on_listed(s, cwd, items))
+        t.fail.connect(lambda msg, s=seq: self._on_list_fail(s, msg))
+        t.finished.connect(lambda tt=t: self._list_threads.discard(tt))
+        self._list_threads.add(t)
+        t.start()
+
+    def _on_listed(self, seq, cwd, items):
+        if seq != self._list_seq:
+            return                       # superseded by a newer navigation
+        self.cwd = cwd
+        self.path.setText(cwd)
         self.list.clear()
         self.list.addItem(self._mkitem("..", True))
-        try:
-            entries = sorted(entries, key=lambda x: (not _attr_is_dir(x),
-                                                     (x.filename or "").lower()))
-        except Exception:
-            pass
-        for e in entries:
-            self.list.addItem(self._mkitem(e.filename, _attr_is_dir(e)))
+        for name, is_dir in items:
+            self.list.addItem(self._mkitem(name, is_dir))
+
+    def _on_list_fail(self, seq, msg):
+        if seq != self._list_seq:
+            return
+        self.log.emit(f"[ERROR] list {self.cwd}: {msg}")
 
     def _mkitem(self, name, is_dir):
         it = QListWidgetItem(("📁 " if is_dir else "📄 ") + name)

@@ -2,6 +2,65 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.3.2 — 2026-07-05
+
+A correctness, security and cleanup release addressing a full code audit. The
+bundled Windows GUI executable is rebuilt from this source, so the frozen app
+carries the same fixes as the pip/source install.
+
+### Fixed
+- **Remote OS detection no longer misreads a PowerShell-default Windows host as
+  Linux.** The old `uname -s || ver` probe is a parse error under PowerShell
+  (`||` isn't valid there); detection now probes `uname -s` positively and falls
+  back to `cmd /c ver`, which reports Windows from cmd *and* PowerShell shells.
+- **A custom SSH port now actually takes effect.** `turbossh-setup`, the WinRM
+  bootstrap, and the offline remote install all patch `sshd_config`'s `Port`
+  directive and restart sshd — previously only the firewall was opened, so sshd
+  kept listening on 22 and setup reported "not listening".
+- **The Settings dialog no longer resets settings it doesn't display.** Saving a
+  partial config (e.g. only the fields a dialog exposes) now preserves untouched
+  keys like the compact-ribbon toggle instead of reverting them to defaults.
+- **Opening a session while the split (tiled) view is active now shows it** — it
+  used to connect but appear nowhere because the tab bar was detached.
+- **Closing a session tab mid-connect no longer risks crashing the app** — an
+  in-flight connect thread is detached instead of destroyed while running.
+- **CLI `serial-ssh` releases the remote COM port on exit** (Windows OpenSSH left
+  it locked after the stream ended).
+- **`SSHPool` keeps duplicate hosts distinct** instead of collapsing two configs
+  for the same host into one handler.
+- **`run_many(check=…)` is now honored** (it was silently ignored).
+- **FTP** `pull` no longer leaves a partial file behind on failure, and `exists()`
+  matches by basename so it works on servers whose `NLST` returns bare names.
+- **The update check no longer mistakes a PyPI pre-release for a newer version.**
+- **The SFTP browser lists directories off the UI thread**, so it no longer
+  freezes on slow/high-latency links; pressing **Stop** on a remote camera no
+  longer briefly freezes the GUI either.
+- Jump-host handling in the session dialog is consistent: a **jump port** field
+  was added, the jump is applied to SSH sessions only, and the "no jump host"
+  warning no longer fires for serial sessions.
+- The default build (`python scripts/build_exe.py`) works from a fresh clone —
+  the referenced `scripts/turbossh-gui.spec` now exists and is tracked.
+
+### Security
+- **Passwords are no longer passed on a command line.** The RDP launcher stores
+  its credential via the Win32 `CredWrite` API, and the SMB fast-path feeds
+  `net use` its password over stdin — neither shows up in a process listing. The
+  SMB helper also no longer crashes on a missing password.
+- **An unknown `host_key_policy` is now rejected** instead of silently falling
+  back to auto-accept.
+- Serial device names are escaped before embedding in PowerShell, and camera
+  names are sanitised before embedding in ffmpeg commands.
+- The GUI's terminal captures (used for *Save all output*) are now documented as
+  plaintext-on-disk, with their cleanup behaviour spelled out in the README.
+
+### Changed
+- **`setuptools>=77` is now required to build** (PEP 639 license metadata).
+- Dependency-missing error messages point at the real packages (`pip install
+  pyserial` / `pywinrm`) instead of non-existent `turbossh[serial]`/`[winrm]`
+  extras. `default_baud` and the first-run Startup toggles now actually apply.
+- Removed the unused legacy GUI (the old `worker`, `connection_panel`, and
+  `tabs/` modules) and dead camera-mode branches in the session dialog.
+
 ## 1.2.31 — 2026-06-28
 
 ### Changed

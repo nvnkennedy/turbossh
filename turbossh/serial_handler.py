@@ -2,7 +2,7 @@
 Serial / COM-port handler with the same streaming + match + save-to-file model
 as the SSH side. Built on pyserial.
 
-    pip install "turbossh[serial]"     # pulls in pyserial
+    pip install pyserial               # a required dependency of turbossh
 
 Typical use: watch a device's serial console live, match patterns (boot
 complete, errors, prompts), send commands, and tee everything to a log file.
@@ -35,7 +35,7 @@ class SerialError(SSHError):
 def list_serial_ports() -> list[dict]:
     """Return available COM ports: [{'device','description','hwid'}, ...]."""
     if not _HAS_SERIAL:
-        raise SerialError('pyserial is required. Install: pip install "turbossh[serial]"')
+        raise SerialError("pyserial is required. Install it with: pip install pyserial")
     return [{"device": p.device, "description": p.description, "hwid": p.hwid}
             for p in list_ports.comports()]
 
@@ -56,8 +56,8 @@ class SerialHandler:
                  quiet: bool = False):
         if not _HAS_SERIAL:
             raise SerialError(
-                'pyserial is required for serial support. '
-                'Install: pip install "turbossh[serial]"')
+                "pyserial is required for serial support. "
+                "Install it with: pip install pyserial")
         self.port = port
         self.baudrate = baudrate
         self._kw = dict(bytesize=bytesize, parity=parity, stopbits=stopbits,

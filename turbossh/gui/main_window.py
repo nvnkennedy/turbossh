@@ -659,9 +659,25 @@ class MainWindow(QMainWindow):
         self.tabs.setCornerWidget(tabmenu, Qt.TopLeftCorner)
         self.setCentralWidget(self.tabs)
 
+    def _host_session_widget(self, w, title, make_current=True):
+        """Add a session/camera widget either to the tab bar or, when the split
+        (tiled) view is active, into the grid — otherwise a session opened while
+        split connected but appeared nowhere (self.tabs is detached while tiled)."""
+        if getattr(self, "_tiled", False):
+            self._tiled_items.append((w, title))
+            self._build_tiles()
+        else:
+            idx = self.tabs.addTab(w, title)
+            if make_current:
+                self.tabs.setCurrentIndex(idx)
+
     def open_home(self):
         """Show (or focus) the Home / welcome tab."""
         from .home_tab import HomeTab
+        # Home has no close_session, so it can't live in the tiled grid — drop back
+        # to tabs first if we're split.
+        if getattr(self, "_tiled", False):
+            self._untile()
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if isinstance(w, HomeTab):
@@ -827,8 +843,7 @@ class MainWindow(QMainWindow):
         from .camera_widget import CameraPanel
         panel = CameraPanel(self.store)
         panel.log.connect(self.log_panel.append)
-        idx = self.tabs.addTab(panel, "📷 Camera")
-        self.tabs.setCurrentIndex(idx)
+        self._host_session_widget(panel, "📷 Camera")
 
     def edit_session(self):
         name = self._selected_name()
@@ -886,8 +901,7 @@ class MainWindow(QMainWindow):
             w.connected.connect(self._on_session_connected)
         icon = s.get("icon") or ("📡" if (kind == "serial" and s.get("via_ssh"))
                                  else "🔌" if kind == "serial" else "🖥")
-        idx = self.tabs.addTab(w, f"{icon} {name}")
-        self.tabs.setCurrentIndex(idx)
+        self._host_session_widget(w, f"{icon} {name}")
         self.log_panel.append(f"Opening '{name}'…")
         self.statusBar().showMessage(f"Connecting to {s.get('host')}…")
 

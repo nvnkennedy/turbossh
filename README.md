@@ -472,6 +472,13 @@ don't bleed into your test output.
 **In the GUI.** Saved-session passwords go straight into the OS keyring, never
 plaintext on disk. Show/hide them with the eye icon in the dialog.
 
+> **Terminal captures.** So *Save all output* can cover a whole session, the GUI
+> tees each terminal to a temporary file under `~/.turbossh/captures/`. These are
+> deleted when the session closes cleanly and any strays older than a day are
+> swept on startup — but a hard crash can leave a session's output on disk until
+> the next launch. Don't type secrets into a terminal on a shared machine, or
+> clear that folder yourself if you need to.
+
 **On the command line.**
 
 ```bash

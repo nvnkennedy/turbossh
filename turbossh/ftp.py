@@ -129,9 +129,14 @@ class FTPHandler:
                 self._require().size(path)
                 return True
             except error_perm:
-                # size() fails on dirs; fall back to a listing probe.
+                # size() fails on dirs; fall back to a listing probe. Compare by
+                # basename — some servers' NLST returns bare names, others full
+                # paths, so matching the raw path missed real entries.
                 try:
-                    return path in self._require().nlst(os.path.dirname(path) or ".")
+                    base = os.path.basename(path.rstrip("/"))
+                    listing = self._require().nlst(os.path.dirname(path) or ".")
+                    return any(os.path.basename(e.rstrip("/")) == base
+                               for e in listing)
                 except all_errors:
                     return False
         return self._guard("exists", _do, safe=safe)
@@ -163,6 +168,7 @@ class FTPHandler:
                 os.makedirs(parent, exist_ok=True)
             start = time.time()
             self._emit(logging.INFO, f"PULL {remote_path} -> {lp}")
+            existed = os.path.exists(lp)
             try:
                 with open(lp, "wb") as fh:
                     def _cb(data):
@@ -170,8 +176,16 @@ class FTPHandler:
                         if callback:
                             callback(len(data))
                     self._require().retrbinary(f"RETR {remote_path}", _cb)
-            except all_errors as exc:
-                raise FTPError(f"FTP download failed: {exc}") from exc
+            except BaseException as exc:
+                # don't leave a partial/empty local file behind on failure
+                if not existed and os.path.exists(lp):
+                    try:
+                        os.remove(lp)
+                    except OSError:
+                        pass
+                if isinstance(exc, all_errors):
+                    raise FTPError(f"FTP download failed: {exc}") from exc
+                raise
             return TransferResult(remote_path, lp, "pull", "ftp",
                                   os.path.getsize(lp), time.time() - start)
         return self._guard("pull", _do, safe=safe)

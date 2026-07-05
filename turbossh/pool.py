@@ -24,10 +24,17 @@ class SSHPool:
 
     def __init__(self, configs: Sequence[SSHConfig], *, max_workers: int = 10,
                  log_callback: Optional[Callable[[str], None]] = None):
-        self.handlers = {
-            cfg.host: SSHHandler(cfg, log_callback=log_callback, safe=True)
-            for cfg in configs
-        }
+        # Key by host, but disambiguate duplicates (same host, different port/user)
+        # so two configs for one host don't collapse into a single handler and
+        # clobber each other's results. The first keeps the bare host; later ones
+        # get "host#N" so every config is represented.
+        self.handlers: dict = {}
+        for i, cfg in enumerate(configs):
+            label = cfg.host
+            if label in self.handlers:
+                label = f"{cfg.host}#{i}"
+            self.handlers[label] = SSHHandler(cfg, log_callback=log_callback,
+                                              safe=True)
         self.max_workers = max_workers
 
     def _fanout(self, method: str, *args, **kwargs) -> dict:

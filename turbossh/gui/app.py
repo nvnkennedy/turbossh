@@ -54,6 +54,9 @@ def _ensure_shortcuts():
     so an existing shortcut that still points at the slow bundled exe gets
     repointed at the fast `pythonw -m turbossh.gui` launch."""
     try:
+        from . import settings as _s
+        if not _s.get("make_shortcut_first_run"):
+            return                       # user opted out of shortcut creation
         from ..cli import ensure_shortcuts, create_desktop_shortcut
         flag = os.path.join(_FLAG_DIR, "shortcuts-fast-v1")
         if not os.path.exists(flag):
@@ -92,11 +95,13 @@ def _first_run_tasks():
     """Open docs the first time the app runs; (re)create shortcuts every time."""
     _ensure_shortcuts()
     try:
+        from . import settings as _s
         os.makedirs(_FLAG_DIR, exist_ok=True)
         flag = os.path.join(_FLAG_DIR, "first-run-done")
         if os.path.exists(flag):
             return
-        webbrowser.open(DOCS_URL)
+        if _s.get("open_docs_first_run"):
+            webbrowser.open(DOCS_URL)
         with open(flag, "w") as fh:
             fh.write("1")
     except Exception:

@@ -129,19 +129,33 @@ class ShellSession:
     def read_until(self, marker: str, timeout: float = 30.0) -> ShellResult:
         """Read output until *marker* appears or *timeout* elapses."""
         start = time.time()
-        buf = ""
+        # Accumulate chunks in a list and join once at the end. Searching a small
+        # sliding window (rather than re-scanning the whole growing buffer each
+        # recv) keeps a long send/expect exchange linear instead of O(n²).
+        parts = []
+        window = ""
+        overlap = max(0, len(marker) - 1)
         self._chan.settimeout(0.5)
         while time.time() - start < timeout:
             try:
                 chunk = self._chan.recv(65536)
                 if not chunk:
                     break
-                buf += chunk.decode(self.encoding, errors="replace")
-                if marker in buf:
-                    return ShellResult(buf, marker, False, time.time() - start)
+                text = chunk.decode(self.encoding, errors="replace")
+                parts.append(text)
+                window += text
+                if marker and marker in window:
+                    return ShellResult("".join(parts), marker, False,
+                                       time.time() - start)
+                # keep only enough trailing chars to catch a marker spanning the
+                # boundary of the next chunk
+                if overlap and len(window) > overlap:
+                    window = window[-overlap:]
+                elif not overlap:
+                    window = ""
             except socket.timeout:
                 continue
-        return ShellResult(buf, None, True, time.time() - start)
+        return ShellResult("".join(parts), None, True, time.time() - start)
 
     def read_available(self) -> str:
         out = ""
@@ -695,15 +709,33 @@ class SSHHandler:
     # Remote OS awareness
     # ------------------------------------------------------------------ #
     def detect_os(self) -> str:
-        """Return 'windows' or 'linux' (cached). Runs one probe command."""
+        """Return 'windows' or 'linux' (cached). Runs one or two probe commands.
+
+        The old probe was ``uname -s || ver``, which is a *parse error* when the
+        remote default shell is PowerShell (``||`` isn't a valid operator there) —
+        so a Windows host whose OpenSSH default shell is PowerShell was misdetected
+        as Linux. We now probe ``uname -s`` alone (positively identifying the Unix
+        family), and only if that doesn't look Unixy do we run ``cmd /c ver``,
+        which reports Windows from cmd *and* PowerShell default shells alike.
+        """
         if self._remote_os:
             return self._remote_os
         self._ensure_connected()
-        probe = self._run("uname -s || ver", timeout=10, check=False,
+        probe = self._run("uname -s", timeout=10, check=False,
                           get_pty=False, environment=None, encoding="utf-8")
-        text = (probe.stdout + probe.stderr).lower()
-        self._remote_os = "windows" if ("windows" in text or "microsoft" in text) \
-            else "linux"
+        out = (probe.stdout or "").strip().lower()
+        unixy = ("linux", "darwin", "bsd", "qnx", "sunos", "aix", "hp-ux",
+                 "cygwin", "msys", "mingw", "unix")
+        if probe.ok and any(k in out for k in unixy):
+            self._remote_os = "linux"
+        else:
+            # uname failed or was unrecognised — probe explicitly for Windows in a
+            # way that works whether the default shell is cmd.exe or PowerShell.
+            win = self._run("cmd /c ver", timeout=10, check=False, get_pty=False,
+                            environment=None, encoding="utf-8")
+            text = (win.stdout + win.stderr).lower()
+            self._remote_os = "windows" if ("windows" in text or "microsoft" in text) \
+                else "linux"
         self._emit(logging.DEBUG, f"Detected remote OS: {self._remote_os}")
         return self._remote_os
 
@@ -751,13 +783,16 @@ class SSHHandler:
         return result
 
     def run_many(self, commands: Sequence[str], *, stop_on_error: bool = True,
-                 **kwargs) -> list[CommandResult]:
+                 timeout: Optional[float] = None, check: bool = False,
+                 get_pty: bool = False, environment: Optional[dict] = None,
+                 encoding: str = "utf-8") -> list[CommandResult]:
+        """Run several commands in order. ``check=True`` raises SSHCommandError on
+        the first non-zero exit; ``stop_on_error`` (default) stops the batch on the
+        first failure without raising."""
         results = []
         for cmd in commands:
-            res = self._run(cmd, timeout=kwargs.get("timeout"), check=False,
-                            get_pty=kwargs.get("get_pty", False),
-                            environment=kwargs.get("environment"),
-                            encoding=kwargs.get("encoding", "utf-8"))
+            res = self._run(cmd, timeout=timeout, check=check, get_pty=get_pty,
+                            environment=environment, encoding=encoding)
             results.append(res)
             if stop_on_error and not res.ok:
                 self._emit(logging.WARNING,
@@ -882,6 +917,13 @@ class SSHHandler:
         import base64
         return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
+    @staticmethod
+    def _ps_sq(value: str) -> str:
+        """Escape a value for embedding inside a single-quoted PowerShell string
+        (a single quote is doubled). Prevents a device/port name that contains a
+        quote from breaking out of the command."""
+        return str(value).replace("'", "''")
+
     def serial_stream(self, device: str = "/dev/ttyUSB0", *, baudrate: int = 115200,
                       mode: str = "auto", on_line=None, on_match=None, match=None,
                       stop_on_match: bool = False, save_to: Optional[str] = None,
@@ -910,17 +952,27 @@ class SSHHandler:
             # Force UTF-8 console output so our UTF-8 reader doesn't get mojibake,
             # and read whatever bytes are available (robust to any line ending)
             # rather than ReadLine (which hangs if the device's EOL differs).
+            # Track our PID in a per-port file (same scheme as serial_bridge) so
+            # serial_release() can kill this reader — closing the SSH exec channel
+            # does NOT terminate a no-PTY child on Windows OpenSSH, which otherwise
+            # left the COM port locked after the stream ended.
+            dev = self._ps_sq(device)
+            safekey = "".join(c for c in device if c.isalnum()) or "port"
             ps = (
                 "$ErrorActionPreference='SilentlyContinue';"
                 "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
-                f"$p=New-Object System.IO.Ports.SerialPort '{device}',{int(baudrate)},"
+                f"$pf=Join-Path $env:TEMP 'turbossh_ser_{safekey}.pid';"
+                "Set-Content -LiteralPath $pf -Value $PID;"
+                f"$p=New-Object System.IO.Ports.SerialPort '{dev}',{int(baudrate)},"
                 "'None',8,'One';"
                 "$p.Encoding=[System.Text.Encoding]::UTF8;"
                 "$p.Open();"
-                "while($true){"
+                "try{while($true){"
                 "if($p.BytesToRead -gt 0){"
                 "$s=$p.ReadExisting();[Console]::Out.Write($s);[Console]::Out.Flush()}"
-                "else{Start-Sleep -Milliseconds 30}}"
+                "else{Start-Sleep -Milliseconds 30}}}"
+                "finally{try{$p.Close()}catch{};"
+                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue}"
             )
             cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
         else:
@@ -949,8 +1001,8 @@ class SSHHandler:
             payload = data.replace("'", "''")
             meth = "WriteLine" if newline else "Write"
             ps = (
-                f"$p=New-Object System.IO.Ports.SerialPort '{device}',{int(baudrate)},"
-                "'None',8,'One';"
+                f"$p=New-Object System.IO.Ports.SerialPort '{self._ps_sq(device)}',"
+                f"{int(baudrate)},'None',8,'One';"
                 f"$p.Open();$p.{meth}('{payload}');Start-Sleep -Milliseconds 200;"
                 "$p.Close()"
             )
@@ -1032,7 +1084,7 @@ class SSHHandler:
             )
             ps = (ps.replace("__FORCEKILL__", forceblock)
                     .replace("__RETRIES__", retries)
-                    .replace("__DEV__", device)
+                    .replace("__DEV__", self._ps_sq(device))
                     .replace("__BAUD__", str(int(baudrate)))
                     .replace("__SAFE__", safe))
             cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
@@ -1056,8 +1108,8 @@ class SSHHandler:
         is_windows = (mode == "windows" or
                       (mode == "auto" and device.upper().startswith("COM")))
         if is_windows:
-            ps = (f"$p=New-Object System.IO.Ports.SerialPort '{device}',9600;"
-                  "try{$p.Open();$p.Close();'FREE'}catch{'BUSY'}")
+            ps = (f"$p=New-Object System.IO.Ports.SerialPort '{self._ps_sq(device)}',"
+                  "9600;try{$p.Open();$p.Close();'FREE'}catch{'BUSY'}")
             cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
             res = self.run(cmd, timeout=15, safe=False)
         else:
@@ -1230,6 +1282,9 @@ class SSHHandler:
         """
         import random
         self._ensure_connected()
+        # dshow device names sit inside double quotes (`-i video="Name"`); strip any
+        # stray double quote so a crafted name can't break out of the argument.
+        camera = str(camera).replace('"', "")
         marker = "turbossh_cam"
         transport = self._client.get_transport()
         # ALWAYS clear a stale ffmpeg first. Closing an SSH exec channel doesn't

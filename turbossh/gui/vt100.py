@@ -107,18 +107,19 @@ class Vt100Terminal(QWidget):
             size = int(_settings.get("term_font_size") or 11)
         except Exception:
             fam, size = "Cascadia Mono", 11
-        self.font = QFont(fam, size)
+        # NB: store as _font, not `font` — `self.font` would shadow QWidget.font().
+        self._font = QFont(fam, size)
         # crisp, MobaXterm-like rendering: monospace hint, antialiasing, and a
         # fallback chain so it stays a clean mono even if the chosen font is absent.
-        self.font.setStyleHint(QFont.Monospace, QFont.PreferAntialias)
+        self._font.setStyleHint(QFont.Monospace, QFont.PreferAntialias)
         try:
-            self.font.setFamilies([fam, "Cascadia Mono", "Consolas",
-                                   "DejaVu Sans Mono", "Courier New"])
+            self._font.setFamilies([fam, "Cascadia Mono", "Consolas",
+                                    "DejaVu Sans Mono", "Courier New"])
         except Exception:
             pass
-        self.font.setFixedPitch(True)
-        self.font.setHintingPreference(QFont.PreferFullHinting)
-        fm = QFontMetrics(self.font)
+        self._font.setFixedPitch(True)
+        self._font.setHintingPreference(QFont.PreferFullHinting)
+        fm = QFontMetrics(self._font)
         self.cw = max(1, fm.horizontalAdvance("M"))
         self.ch = fm.height()
         self._ascent = fm.ascent()
@@ -411,7 +412,7 @@ class Vt100Terminal(QWidget):
         p = QPainter(self)
         bg_default = self._bg
         p.fillRect(self.rect(), QColor(bg_default))
-        p.setFont(self.font)
+        p.setFont(self._font)
         rows_data = self._visible_rows()
         for y in range(self.rows):
             line = rows_data[y]

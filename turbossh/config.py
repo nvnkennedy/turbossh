@@ -90,10 +90,19 @@ class SSHConfig:
     # --- remote OS hint: "auto" | "linux" | "windows" ---
     remote_os: str = "auto"
 
+    _HOST_KEY_POLICIES = ("auto", "reject", "warn", "ignore")
+
     def __post_init__(self):
         # Normalize secrets so they are never plain strings internally.
         self.password = coerce_secret(self.password)
         self.key_passphrase = coerce_secret(self.key_passphrase)
+        # Reject an unknown host_key_policy loudly instead of silently falling back
+        # to AutoAddPolicy (a typo like "strict" would otherwise weaken security
+        # without any warning).
+        if self.host_key_policy not in self._HOST_KEY_POLICIES:
+            raise ValueError(
+                f"host_key_policy must be one of {self._HOST_KEY_POLICIES}, "
+                f"got {self.host_key_policy!r}")
 
     @property
     def auth_username(self) -> Optional[str]:

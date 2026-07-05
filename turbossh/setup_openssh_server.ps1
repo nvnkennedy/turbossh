@@ -174,6 +174,21 @@ if (Test-Path $fixPerms) {
     Write-Host "  Host key permissions ensured." -ForegroundColor Green
 }
 
+# Make sshd actually LISTEN on the requested port (patch sshd_config). The
+# firewall rule alone doesn't change what sshd binds to, so a non-default -Port
+# would otherwise still listen on 22 and the verification below would report FAIL.
+$sshdCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+if (Test-Path $sshdCfg) {
+    $cfgLines = Get-Content $sshdCfg
+    if ($cfgLines -match '^\s*#?\s*Port\s+\d+') {
+        $cfgLines = $cfgLines -replace '^\s*#?\s*Port\s+\d+', "Port $Port"
+    } else {
+        $cfgLines += "Port $Port"
+    }
+    Set-Content -Path $sshdCfg -Value $cfgLines -Encoding ascii
+    Write-Host "  sshd_config set to listen on port $Port." -ForegroundColor Green
+}
+
 Set-Service -Name sshd -StartupType Automatic
 try { Restart-Service sshd -ErrorAction Stop }
 catch { try { Start-Service sshd } catch { Write-Warning "Start-Service sshd failed: $($_.Exception.Message)" } }

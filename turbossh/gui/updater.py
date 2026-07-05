@@ -26,10 +26,14 @@ _PYPI_JSON = "https://pypi.org/pypi/turbossh/json"
 
 
 def _ver_tuple(v: str):
+    import re
     parts = []
     for chunk in v.split("."):
-        num = "".join(ch for ch in chunk if ch.isdigit())
-        parts.append(int(num) if num else 0)
+        # take the LEADING run of digits only, so "0rc1" -> 0 (not 1). Mixing all
+        # digits in the chunk turned a pre-release like 1.3.0rc1 into (1,3,1),
+        # which looked *newer* than the 1.3.0 release.
+        m = re.match(r"\d+", chunk)
+        parts.append(int(m.group()) if m else 0)
     return tuple(parts)
 
 

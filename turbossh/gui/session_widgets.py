@@ -22,11 +22,36 @@ from .sftp_browser import SftpBrowser
 from .logs_tab import LogsTab
 
 
+# Connect QThreads that outlive their widget (the tab was closed before the
+# connection finished) are parked here so the QThread C++ object isn't deleted
+# while still running — which aborts the app with "QThread: Destroyed while thread
+# is still running". They're dropped from the set as soon as they finish.
+_PENDING_THREADS: set = set()
+
+
+def _park_thread(thread):
+    """Detach a still-running connect thread from its (closing) widget: silence
+    its result signals and keep a reference until it finishes on its own."""
+    if thread is None:
+        return
+    for name in ("ok", "fail"):
+        sig = getattr(thread, name, None)
+        if sig is not None:
+            try:
+                sig.disconnect()
+            except Exception:
+                pass
+    if thread.isRunning():
+        _PENDING_THREADS.add(thread)
+        thread.finished.connect(lambda: _PENDING_THREADS.discard(thread))
+
+
 def config_from_session(s: dict, password: str, jump_password: str) -> SSHConfig:
     policy = "ignore" if s.get("ignore_hostkey", True) else "auto"
     jump = None
     if s.get("use_jump") and s.get("jhost"):
-        jump = SSHConfig(host=s["jhost"], username=s.get("juser") or None,
+        jump = SSHConfig(host=s["jhost"], port=s.get("jport", 22),
+                         username=s.get("juser") or None,
                          domain=s.get("jdomain") or None, password=jump_password,
                          host_key_policy=policy,
                          enable_legacy_algorithms=s.get("legacy", False))
@@ -317,6 +342,9 @@ class SshSessionWidget(QWidget):
     def close_session(self):
         self._user_closed = True          # stop any auto-reconnect
         self._reconnecting = False
+        # if a connect is still in flight, detach it so it can't call back into
+        # this (now-closing) widget and can't be deleted while still running
+        _park_thread(getattr(self, "_ct", None))
         try:
             self.logs_tab.close_tab()
         except Exception:
@@ -644,6 +672,8 @@ class SerialSessionWidget(QWidget):
         self.term.feed((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
 
     def close_session(self):
+        # detach an in-flight connect thread so closing mid-connect can't crash
+        _park_thread(getattr(self, "_ct", None))
         if self.stream_thread:
             try:
                 self.stream_thread.stop()

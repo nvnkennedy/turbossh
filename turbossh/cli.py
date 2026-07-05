@@ -128,26 +128,65 @@ def open_docs(argv=None) -> int:
 
 
 def _gui_exe_path() -> str:
-    d = os.path.join(os.path.dirname(__file__), "bin")
-    for name in ("turbossh-gui.exe", "turbossh-gui.exe"):
-        p = os.path.join(d, name)
-        if os.path.exists(p):
-            return p
-    return os.path.join(d, "turbossh-gui.exe")
+    return os.path.join(os.path.dirname(__file__), "bin", "turbossh-gui.exe")
+
+
+def _store_rdp_credential(host: str, login: str, password: str) -> bool:
+    """Store a TERMSRV/<host> generic credential via the Win32 CredWrite API, so
+    the password is NOT passed on a command line (as `cmdkey /pass:` would be,
+    exposing it to any process listing). Persists for the session only."""
+    import ctypes
+    from ctypes import wintypes
+
+    CRED_TYPE_GENERIC = 1
+    CRED_PERSIST_SESSION = 1
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD)]
+
+    class _CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+            ("LastWritten", _FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+            ("Persist", wintypes.DWORD), ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p), ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    blob = password.encode("utf-16-le")
+    buf = (ctypes.c_byte * len(blob)).from_buffer_copy(blob)
+    cred = _CREDENTIAL()
+    cred.Flags = 0
+    cred.Type = CRED_TYPE_GENERIC
+    cred.TargetName = f"TERMSRV/{host}"
+    cred.CredentialBlobSize = len(blob)
+    cred.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))
+    cred.Persist = CRED_PERSIST_SESSION
+    cred.UserName = login
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.CredWriteW.argtypes = [ctypes.POINTER(_CREDENTIAL), wintypes.DWORD]
+    advapi.CredWriteW.restype = wintypes.BOOL
+    return bool(advapi.CredWriteW(ctypes.byref(cred), 0))
 
 
 def launch_rdp(host: str, user: str = None, domain: str = None,
                password: str = None) -> bool:
     """Open the native Windows Remote Desktop client (mstsc) for *host*,
-    pre-seeding credentials via cmdkey so it doesn't prompt. Windows only."""
+    pre-seeding credentials so it doesn't prompt. Windows only. The password is
+    stored via the CredWrite API rather than on a command line."""
     if os.name != "nt":
         return False
     try:
         if user and password:
             full = f"{domain}\\{user}" if domain else user
-            subprocess.run(["cmdkey", f"/generic:TERMSRV/{host}",
-                            f"/user:{full}", f"/pass:{password}"],
-                           capture_output=True, timeout=10)
+            try:
+                _store_rdp_credential(host, full, password)
+            except Exception:
+                pass                    # mstsc will just prompt for the password
         subprocess.Popen(["mstsc", f"/v:{host}"])
         return True
     except Exception:
@@ -686,6 +725,13 @@ def main(argv=None) -> int:
                               file=sys.stderr)
                 except KeyboardInterrupt:
                     pass
+                finally:
+                    # Closing the channel doesn't kill the remote reader on Windows
+                    # OpenSSH, which would leave the COM port locked — release it.
+                    try:
+                        ssh.serial_release(args.device, safe=True)
+                    except Exception:
+                        pass
             elif args.cmd == "forward":
                 import time as _time
                 fwd = ssh.forward_local(args.to_host, args.to_port,

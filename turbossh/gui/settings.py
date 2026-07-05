@@ -22,10 +22,8 @@ DEFAULTS = {
     # teed to disk, so "Save all output" is unlimited regardless of this value.
     "term_scrollback": 10000,
     "default_baud": 115200,
-    # Camera (remote webcam over SSH via ffmpeg). Off by default — when off the
-    # Camera button/menu are hidden entirely. ffmpeg_path is an optional local
+    # Camera (remote webcam over SSH via ffmpeg). ffmpeg_path is an optional local
     # ffmpeg.exe to use instead of the auto-fetched one (fully offline).
-    "camera_enabled": False,
     "ffmpeg_path": "",
     "open_docs_first_run": True,
     "make_shortcut_first_run": True,
@@ -78,7 +76,11 @@ def load() -> dict:
 def save(data: dict) -> None:
     try:
         os.makedirs(_DIR, exist_ok=True)
-        merged = dict(DEFAULTS)
+        # Start from the CURRENT config (defaults + whatever is already on disk),
+        # not bare DEFAULTS — so saving a partial dict (e.g. only the settings a
+        # dialog exposes) preserves keys it didn't touch (compact_ribbon, …)
+        # instead of silently resetting them.
+        merged = load()
         merged.update(data)
         with open(_FILE, "w", encoding="utf-8") as fh:
             json.dump(merged, fh, indent=2)

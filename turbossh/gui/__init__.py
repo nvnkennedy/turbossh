@@ -1,15 +1,19 @@
 """
-Modular PyQt5 GUI for turbossh.
+PyQt5 GUI for turbossh — a tabbed, multi-session terminal.
 
 Structure
 ---------
-    theme.py             - colors + Qt stylesheet (automotive dark theme)
-    worker.py            - Worker(QThread): owns the SSHHandler, runs jobs
-    log_panel.py         - LogPanel: colored, capped log view + save/clear
-    connection_panel.py  - ConnectionPanel: target + jump-host fields, connect
-    tabs/                - one widget per feature (command, files, serial, stream)
-    main_window.py       - MainWindow: assembles everything
-    app.py               - main() entry point
+    app.py             - main() entry point (QApplication, crash hook, window)
+    main_window.py     - MainWindow: ribbon, session sidebar, tabbed sessions
+    session_widgets.py - SSH / serial session tabs (connect on a worker thread)
+    vt100.py           - Vt100Terminal: real pyte-backed terminal widget
+    sftp_browser.py    - remote file browser (SFTP)
+    camera_widget.py   - Local/Remote webcam panel (ffmpeg over SSH)
+    logs_tab.py        - live log follower (journalctl / slog2info / …)
+    session_dialog.py  - create / edit a saved session
+    settings_dialog.py - preferences (theme, fonts, jump host, machines, …)
+    theme.py           - colors + Qt stylesheet (dark / light)
+    log_panel.py       - colored, capped log dock
 
 Launch with `turbossh-gui` or `python -m turbossh.gui`.
 """
