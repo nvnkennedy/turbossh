@@ -9,6 +9,7 @@ import sys
 import traceback
 import webbrowser
 
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from .main_window import MainWindow
@@ -141,12 +142,19 @@ def main():
     except Exception:
         pass
     _install_excepthook()
-    _migrate_settings_once()
-    _first_run_tasks()
 
     global _window
     _window = MainWindow()
     _window.show()
+
+    # Run one-time housekeeping (settings migration, first-run docs, and shortcut
+    # creation — the last can shell out to PowerShell) AFTER the window is on
+    # screen, so startup feels instant instead of blocking the first paint.
+    def _post_show():
+        _migrate_settings_once()
+        _first_run_tasks()
+    QTimer.singleShot(0, _post_show)
+
     # Update check is on-demand via the ribbon "Check updates" button — not on
     # startup, so the app opens instantly.
     return app.exec_()

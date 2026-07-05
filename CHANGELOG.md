@@ -2,6 +2,20 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.5.2 — 2026-07-05
+
+### Fixed
+- **Much faster startup.** `import turbossh` no longer loads paramiko, pywinrm and
+  keyring eagerly — the heavy modules are imported lazily on first use (PEP 562),
+  paramiko only when you actually open a connection. The GUI window now builds and
+  paints *before* any of that loads (one-time housekeeping runs after the window
+  is on screen), cutting well over a second off cold start. `from turbossh import
+  SSHHandler` etc. still work exactly as before.
+- **No more surprise OpenSSH popup after "Check for updates".** The update check
+  now only reports the PyPI version status; it no longer also probes your saved
+  RDP/jump machines and offers to (re)install OpenSSH on them. That install is
+  available on demand from the "Set up SSH server" button.
+
 ## 1.5.1 — 2026-07-05
 
 ### Fixed

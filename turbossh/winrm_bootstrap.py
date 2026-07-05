@@ -24,12 +24,22 @@ from typing import Callable, Optional
 from .credentials import Secret, mask
 from .exceptions import SSHError
 
-try:
-    import winrm  # pywinrm
-    _HAS_WINRM = True
-except Exception:  # pragma: no cover
-    winrm = None
-    _HAS_WINRM = False
+# pywinrm is heavy to import (~0.4s, it pulls in its whole transport stack) and is
+# only needed for the rare "install OpenSSH over WinRM" feature — so import it
+# LAZILY on first use instead of at module load, keeping app startup fast.
+winrm = None            # the pywinrm module once loaded, or False if unavailable
+
+
+def _load_winrm():
+    """Import pywinrm on first use. Returns the module, or None if not installed."""
+    global winrm
+    if winrm is None:
+        try:
+            import winrm as _w
+            winrm = _w
+        except Exception:
+            winrm = False          # sentinel: tried once, not available
+    return winrm or None
 
 
 class WinRMError(SSHError):
@@ -108,7 +118,7 @@ def enable_openssh_via_winrm(
     :returns: dict with keys ``ok``, ``status``, ``stdout``, ``stderr``.
     :raises WinRMError: if pywinrm is missing or the WinRM call fails.
     """
-    if not _HAS_WINRM:
+    if _load_winrm() is None:
         raise WinRMError(
             "WinRM bootstrap needs pywinrm. Install it with: pip install pywinrm"
         )
@@ -161,7 +171,7 @@ def enable_openssh_via_winrm(
 
 
 def winrm_available() -> bool:
-    return _HAS_WINRM
+    return _load_winrm() is not None
 
 
 def _smb_copy(host, login, password, local_path, remote_winpath, log) -> bool:
@@ -300,7 +310,7 @@ def enable_openssh_via_winrm_offline(
     import base64
     import os
 
-    if not _HAS_WINRM:
+    if _load_winrm() is None:
         raise WinRMError("WinRM bootstrap needs pywinrm: pip install pywinrm")
     _require_transport_deps(transport)
 

@@ -23,18 +23,10 @@ so anything Paramiko can do is possible.
 
 from __future__ import annotations
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
+# Light modules stay eager — they're cheap to import (no paramiko/pywinrm/pyserial).
 from .config import SSHConfig, FTPConfig
-from .core import SSHHandler, ShellSession
-from .ftp import FTPHandler
-from .pool import SSHPool
-from .tunnel import LocalForward, RemoteForward, generate_keypair
-from .winrm_bootstrap import (enable_openssh_via_winrm,
-                              enable_openssh_via_winrm_offline,
-                              winrm_available, WinRMError)
-from .serial_handler import (SerialHandler, list_serial_ports, serial_available,
-                             SerialError)
 from .credentials import Secret, CredentialStore, prompt_password, mask
 from .results import CommandResult, TransferResult, ShellResult, OperationResult
 from .exceptions import (
@@ -48,6 +40,40 @@ from .exceptions import (
     FTPError,
     CredentialError,
 )
+
+# Heavy modules (paramiko / pywinrm / pyserial) are imported LAZILY the first time
+# one of their names is accessed (PEP 562). That keeps `import turbossh` — and the
+# GUI window — fast: paramiko (~0.5s to import) only loads when you actually open a
+# connection, not at startup. Access is transparent: `from turbossh import
+# SSHHandler` and `turbossh.SSHHandler` both still work.
+import importlib as _importlib
+
+_LAZY_SUBMODULES = {
+    "SSHHandler": "core", "ShellSession": "core",
+    "FTPHandler": "ftp",
+    "SSHPool": "pool",
+    "LocalForward": "tunnel", "RemoteForward": "tunnel",
+    "generate_keypair": "tunnel",
+    "enable_openssh_via_winrm": "winrm_bootstrap",
+    "enable_openssh_via_winrm_offline": "winrm_bootstrap",
+    "winrm_available": "winrm_bootstrap", "WinRMError": "winrm_bootstrap",
+    "SerialHandler": "serial_handler", "list_serial_ports": "serial_handler",
+    "serial_available": "serial_handler", "SerialError": "serial_handler",
+}
+
+
+def __getattr__(name):        # PEP 562 module-level lazy attribute access
+    modname = _LAZY_SUBMODULES.get(name)
+    if modname is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = _importlib.import_module(f".{modname}", __name__)
+    value = getattr(module, name)
+    globals()[name] = value   # cache so subsequent access is a direct global
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_SUBMODULES))
 
 __all__ = [
     "SSHHandler", "ShellSession", "SSHConfig", "FTPConfig", "FTPHandler",

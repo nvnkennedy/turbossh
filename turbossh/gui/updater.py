@@ -130,32 +130,22 @@ def check_now(window):
     th.start()
 
 
-def _offer_openssh(window):
-    """After a manual check, also offer to (re)install OpenSSH on the user's
-    machines (the part the user asked for: 'check OpenSSH too')."""
-    try:
-        fn = getattr(window, "offer_openssh_install", None)
-        if fn:
-            fn()
-    except Exception:
-        pass
-
-
 def _on_result(window, latest: str, manual: bool = False):
+    # "Check for updates" ONLY reports the PyPI version status. It no longer also
+    # offers to (re)install OpenSSH on your RDP machines — that unexpected popup
+    # is gone; use the "Set up SSH server" button for that, on demand.
     if not latest:
         if manual:
             QMessageBox.warning(
                 window, "Check for updates",
                 "Couldn't reach PyPI to check for updates.\n\n"
                 "Check your internet connection and try again.")
-            _offer_openssh(window)
         return
     if not _is_newer(latest, __version__):
         if manual:
             QMessageBox.information(
                 window, "Check for updates",
                 f"You're on the latest version of TurboSSH ({__version__}).")
-            _offer_openssh(window)
         return
 
     box = QMessageBox(window)
@@ -168,8 +158,6 @@ def _on_result(window, latest: str, manual: bool = False):
                                "'pip install -U turbossh' (or git pull).")
         box.setStandardButtons(QMessageBox.Ok)
         box.exec_()
-        if manual:
-            _offer_openssh(window)
         return
     box.setInformativeText("Update now? TurboSSH will close, update, and reopen.")
     update_btn = box.addButton("Update now", QMessageBox.AcceptRole)
@@ -184,6 +172,3 @@ def _on_result(window, latest: str, manual: bool = False):
             QMessageBox.warning(window, "TurboSSH update",
                                 "Could not start the updater. Run "
                                 "'pip install -U turbossh' manually.")
-    elif manual:
-        # chose "Later" — still offer the OpenSSH install
-        _offer_openssh(window)

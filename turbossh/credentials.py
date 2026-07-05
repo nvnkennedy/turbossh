@@ -17,12 +17,21 @@ from typing import Optional
 
 from .exceptions import CredentialError
 
-try:  # keyring is optional; only needed for the persistent store
-    import keyring
-    _HAS_KEYRING = True
-except Exception:  # pragma: no cover
-    keyring = None
-    _HAS_KEYRING = False
+# keyring is only needed for CredentialStore and pulls in platform backends
+# (~0.1-0.3s to import), so load it LAZILY on first use to keep startup fast.
+keyring = None          # the keyring module once loaded, or False if unavailable
+
+
+def _load_keyring():
+    """Import keyring on first use. Returns the module, or None if not installed."""
+    global keyring
+    if keyring is None:
+        try:
+            import keyring as _k
+            keyring = _k
+        except Exception:
+            keyring = False        # sentinel: tried once, not available
+    return keyring or None
 
 
 _REDACTED = "********"
@@ -106,7 +115,7 @@ class CredentialStore:
     """
 
     def __init__(self, service: str = "turbossh"):
-        if not _HAS_KEYRING:
+        if _load_keyring() is None:
             raise CredentialError(
                 "The 'keyring' package is required for CredentialStore. "
                 "Install it with: pip install keyring"
@@ -115,7 +124,7 @@ class CredentialStore:
 
     @staticmethod
     def available() -> bool:
-        return _HAS_KEYRING
+        return _load_keyring() is not None
 
     def set(self, username: str, password) -> None:
         """Store (or overwrite) a password for *username*."""

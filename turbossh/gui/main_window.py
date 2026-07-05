@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTabWidget, QDockWidget, QLabel, QLineEdit, QMessageBox,
                              QToolBar, QAction, QStatusBar, QShortcut,
                              QToolButton, QApplication, QSplitter, QDialog, QFormLayout,
-                             QSpinBox, QDialogButtonBox, QCheckBox, QScrollArea)
+                             QSpinBox, QDialogButtonBox)
 
 from . import theme
 from .. import __version__
@@ -21,7 +21,8 @@ from .log_panel import LogPanel
 from .sessions import SessionStore
 from .session_dialog import SessionDialog
 from .settings_dialog import SettingsDialog
-from .session_widgets import SshSessionWidget, SerialSessionWidget
+# NB: session_widgets pulls in paramiko (via ..core) — import it lazily, inside
+# open_session_named, so building the window doesn't load paramiko up front.
 
 ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                          "assets", "icon.ico")
@@ -84,81 +85,6 @@ class _RemoteInstallThread(QThread):
             self.done.emit(True, res.get("status", "Running"))
         except Exception as exc:
             self.done.emit(False, f"{type(exc).__name__}: {exc}")
-
-
-class _BatchSshInstallDialog(QDialog):
-    """Pick which previously-used machines to (re)install OpenSSH on, with one
-    shared local-admin credential (typical in a domain)."""
-
-    def __init__(self, hosts, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Install OpenSSH on your machines")
-        self.setMinimumWidth(480)
-        from . import theme
-        lay = QVBoxLayout(self)
-        info = QLabel("Install / refresh the bundled OpenSSH Server (offline) on "
-                      "the machines you use, over WinRM. Tick the ones to do and "
-                      "enter a local-admin account (one that works on all of them).")
-        info.setWordWrap(True); lay.addWidget(info)
-
-        lay.addWidget(QLabel("Machines:"))
-        box = QScrollArea(); box.setWidgetResizable(True); box.setMaximumHeight(170)
-        inner = QWidget(); il = QVBoxLayout(inner)
-        self._checks = []
-        for h in hosts:
-            cb = QCheckBox(h); cb.setChecked(True)
-            il.addWidget(cb); self._checks.append(cb)
-        il.addStretch(1)
-        box.setWidget(inner); lay.addWidget(box)
-
-        form = QFormLayout(); lay.addLayout(form)
-        self.user = QLineEdit(); self.user.setPlaceholderText("local-admin user")
-        self.domain = QLineEdit(); self.domain.setPlaceholderText("Windows domain (optional)")
-        self.password = QLineEdit(); self.password.setEchoMode(QLineEdit.Password)
-        theme.attach_eye(self.password)
-        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(22)
-        form.addRow("User", self.user)
-        form.addRow("Domain", self.domain)
-        form.addRow("Password", self.password)
-        form.addRow("SSH port", self.port)
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("Install")
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-    def selected(self) -> dict:
-        return {"hosts": [c.text() for c in self._checks if c.isChecked()],
-                "user": self.user.text().strip(), "domain": self.domain.text().strip(),
-                "password": self.password.text(), "port": self.port.value()}
-
-
-class _BatchInstallThread(QThread):
-    progress = pyqtSignal(str)
-    done = pyqtSignal(str)               # final summary
-
-    def __init__(self, hosts, creds, openssh_dir):
-        super().__init__()
-        self.hosts = hosts
-        self.creds = creds
-        self.openssh_dir = openssh_dir
-
-    def run(self):
-        from ..winrm_bootstrap import enable_openssh_via_winrm_offline
-        ok, fail = [], []
-        for h in self.hosts:
-            self.progress.emit(f"=== {h}: installing OpenSSH over WinRM… ===")
-            try:
-                enable_openssh_via_winrm_offline(
-                    h, self.creds["user"], self.creds["password"], self.openssh_dir,
-                    domain=self.creds.get("domain") or None,
-                    ssh_port=self.creds.get("port", 22), log=self.progress.emit)
-                ok.append(h)
-                self.progress.emit(f"=== {h}: OK ===")
-            except Exception as exc:
-                fail.append(h)
-                self.progress.emit(f"=== {h}: FAILED — {exc} ===")
-        self.done.emit(f"OpenSSH install finished — {len(ok)} ok, {len(fail)} failed."
-                       + (f" Failed: {', '.join(fail)}" if fail else ""))
 
 
 class MainWindow(QMainWindow):
@@ -533,69 +459,11 @@ class MainWindow(QMainWindow):
 
     def check_updates(self):
         """Manually check PyPI for a newer version (ribbon button). Runs the
-        network call off the UI thread; reports the outcome either way. After the
-        version result it also offers to install/refresh OpenSSH on your machines."""
+        network call off the UI thread and reports the version outcome. It does
+        NOT probe or offer OpenSSH installs on your machines — that's on-demand
+        only, via the "Set up SSH server" button."""
         from .updater import check_now
         check_now(self)
-
-    def _collect_remote_hosts(self):
-        """Windows machines we've used as SSH gateways / serial-over-SSH hosts /
-        jump hosts — the candidates for an OpenSSH (re)install."""
-        hosts = []
-        try:
-            for s in self.store.sessions:
-                if s.get("use_jump") and s.get("jhost"):
-                    hosts.append(s["jhost"].strip())
-                if s.get("type") == "serial" and s.get("via_ssh") and s.get("host"):
-                    hosts.append(s["host"].strip())
-        except Exception:
-            pass
-        # de-dup, keep order
-        seen, out = set(), []
-        for h in hosts:
-            if h and h not in seen:
-                seen.add(h); out.append(h)
-        return out
-
-    def offer_openssh_install(self):
-        """Called after a manual update check: offer to install/refresh the
-        bundled OpenSSH on the machines this user works with (over WinRM)."""
-        if os.name != "nt":
-            return
-        hosts = self._collect_remote_hosts()
-        if not hosts:
-            return
-        shown = ", ".join(hosts[:6]) + ("…" if len(hosts) > 6 else "")
-        r = QMessageBox.question(
-            self, "OpenSSH on your machines",
-            "TurboSSH bundles OpenSSH Server for offline install.\n\n"
-            f"Install or refresh it on the remote machine(s) you use, over WinRM?\n\n{shown}",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if r != QMessageBox.Yes:
-            return
-        dlg = _BatchSshInstallDialog(hosts, self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        sel = dlg.selected()
-        if not sel["hosts"] or not sel["user"]:
-            QMessageBox.warning(self, "Nothing to do",
-                                "Pick at least one machine and enter a user.")
-            return
-        from ..cli import _setup_script_path
-        openssh_dir = os.path.join(os.path.dirname(_setup_script_path()), "openssh")
-        self.log_panel.append(f"[..] Installing OpenSSH on {len(sel['hosts'])} "
-                              f"machine(s) over WinRM…")
-        self.statusBar().showMessage("Installing OpenSSH on your machines…")
-        self._batch_install = _BatchInstallThread(
-            sel["hosts"], sel, openssh_dir)
-        self._batch_install.progress.connect(lambda m: self.log_panel.append(f"    {m}"))
-        self._batch_install.done.connect(self._on_batch_install_done)
-        self._batch_install.start()
-
-    def _on_batch_install_done(self, summary):
-        self.log_panel.append(f"[OK] {summary}")
-        self.statusBar().showMessage(summary, 10000)
-        QMessageBox.information(self, "OpenSSH install finished", summary)
 
     def _show_inner(self, name):
         """Switch the CURRENT session tab to its Terminal/SFTP/Logs inner tab."""
@@ -873,6 +741,8 @@ class MainWindow(QMainWindow):
         s = self.store.get(name)
         if not s:
             return
+        # lazy import (loads paramiko on first connect, not at window startup)
+        from .session_widgets import SshSessionWidget, SerialSessionWidget
         pw = SessionStore.password(name) or ""
         jpw = SessionStore.jump_password(name) or ""
         kind = s.get("type")
