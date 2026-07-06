@@ -2,6 +2,18 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.6.0 — 2026-07-06
+
+### Changed
+- **Releases are published manually again.** Removed the tag-triggered PyPI
+  publish workflow (and its GitHub↔PyPI Trusted Publishing link) — pushing a
+  tag no longer uploads anything. Use `python scripts/release.py X.Y.Z` to
+  build and publish. The CI workflow (lint + tests + build check on every
+  push) is unchanged.
+- Removed the Dependabot configuration — no more automated dependency-bump
+  pull requests.
+- No functional changes to the library, CLI, or GUI since 1.5.2.
+
 ## 1.5.2 — 2026-07-05
 
 ### Fixed

@@ -23,7 +23,7 @@ so anything Paramiko can do is possible.
 
 from __future__ import annotations
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 # Light modules stay eager — they're cheap to import (no paramiko/pywinrm/pyserial).
 from .config import SSHConfig, FTPConfig
