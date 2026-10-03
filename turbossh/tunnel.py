@@ -9,6 +9,7 @@ Forwarding runs on daemon threads so it never blocks the caller.
 
 from __future__ import annotations
 
+import os
 import select
 import socket
 import socketserver
@@ -55,7 +56,10 @@ class _LocalHandler(socketserver.BaseRequestHandler):
 
 class _ForwardServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # SO_REUSEADDR means "rebind a port in TIME_WAIT" on POSIX, but on Windows it
+    # lets a second socket bind a port that is actively in use — so a forward on
+    # a busy port would "succeed" and then receive connections at random.
+    allow_reuse_address = os.name != "nt"
 
 
 class LocalForward:
@@ -96,16 +100,18 @@ class RemoteForward:
         self.transport = transport
         self.local_host, self.local_port = local_host, local_port
         self._alive = True
-        self.remote_port = transport.request_port_forward("", remote_port)
-        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._thread.start()
+        # A per-forward handler, not transport.accept(): the accept queue is
+        # shared by the whole transport, so with two remote forwards each one's
+        # accept loop could take the other's connection and send it to the wrong
+        # local port.
+        self.remote_port = transport.request_port_forward(
+            "", remote_port, handler=self._on_channel)
 
-    def _accept_loop(self):
-        while self._alive:
-            chan = self.transport.accept(1.0)
-            if chan is None:
-                continue
-            threading.Thread(target=self._serve, args=(chan,), daemon=True).start()
+    def _on_channel(self, chan, origin, server):
+        if not self._alive:
+            chan.close()
+            return
+        threading.Thread(target=self._serve, args=(chan,), daemon=True).start()
 
     def _serve(self, chan):
         sock = socket.socket()

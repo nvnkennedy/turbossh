@@ -2,46 +2,23 @@
 
 We ask PyPI for the latest ``turbossh`` version in a background thread, so the
 UI never blocks and startup stays instant. If a newer one exists we offer to
-update: the GUI closes, a detached helper runs ``pip install -U turbossh``, pops
-a native "Updated to X" message, and relaunches the app — overwriting the
-running exe is impossible while it's open, so the helper waits for us to exit
-first.
+update: the GUI closes, a detached helper waits for it to exit, runs
+``pip install turbossh==<version>`` with the interpreter that owns this install,
+checks the result, and relaunches the app.
+
+The logic (version comparison, finding the owning interpreter, the helper script)
+lives in :mod:`turbossh.update`, which has no Qt in it; this module is the dialog.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import json
-import shutil
-import subprocess
-import urllib.request
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import QMessageBox
 
-from .. import __version__
-
-_PYPI_JSON = "https://pypi.org/pypi/turbossh/json"
-
-
-def _ver_tuple(v: str):
-    import re
-    parts = []
-    for chunk in v.split("."):
-        # take the LEADING run of digits only, so "0rc1" -> 0 (not 1). Mixing all
-        # digits in the chunk turned a pre-release like 1.3.0rc1 into (1,3,1),
-        # which looked *newer* than the 1.3.0 release.
-        m = re.match(r"\d+", chunk)
-        parts.append(int(m.group()) if m else 0)
-    return tuple(parts)
-
-
-def _is_newer(latest: str, current: str) -> bool:
-    try:
-        return _ver_tuple(latest) > _ver_tuple(current)
-    except Exception:
-        return bool(latest) and latest != current
+from .. import __version__, update
 
 
 class _CheckThread(QThread):
@@ -49,30 +26,7 @@ class _CheckThread(QThread):
     result = pyqtSignal(str)        # latest version string ("" on failure)
 
     def run(self):
-        try:
-            req = urllib.request.Request(
-                _PYPI_JSON, headers={"User-Agent": f"turbossh/{__version__}"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                data = json.load(r)
-            self.result.emit(str(data["info"]["version"]))
-        except Exception:
-            self.result.emit("")
-
-
-def _python_for_pip() -> str:
-    """Best guess at the interpreter that owns this install. When frozen, the
-    exe lives at <python>/Lib/site-packages/turbossh/bin/turbossh-gui.exe, so
-    the interpreter is four directories up. Falls back to PATH."""
-    try:
-        bindir = os.path.dirname(sys.executable)
-        root = os.path.abspath(os.path.join(bindir, "..", "..", "..", ".."))
-        for exe in ("python.exe", "pythonw.exe"):
-            cand = os.path.join(root, exe)
-            if os.path.exists(cand):
-                return cand
-    except Exception:
-        pass
-    return shutil.which("python") or shutil.which("py") or "python"
+        self.result.emit(update.latest_version() or "")
 
 
 def _relaunch_target() -> str:
@@ -85,34 +39,6 @@ def _relaunch_target() -> str:
     except Exception:
         pass
     return sys.executable
-
-
-def _spawn_updater(latest: str) -> bool:
-    """Launch a detached PowerShell helper that waits for this process to exit,
-    upgrades the package, shows a result message, and relaunches the GUI."""
-    py = _python_for_pip()
-    exe = _relaunch_target()
-    ps = f"""
-$ErrorActionPreference = 'SilentlyContinue'
-Add-Type -AssemblyName PresentationFramework
-Start-Sleep -Seconds 2
-& "{py}" -m pip install --upgrade --no-input turbossh
-$code = $LASTEXITCODE
-if ($code -eq 0) {{
-  [System.Windows.MessageBox]::Show("TurboSSH has been updated to {latest}.","TurboSSH update") | Out-Null
-  Start-Process "{exe}"
-}} else {{
-  [System.Windows.MessageBox]::Show("Couldn't update automatically. Open a terminal and run:`n`n    pip install -U turbossh","TurboSSH update") | Out-Null
-}}
-"""
-    try:
-        DETACHED = 0x00000008 | 0x00000200      # DETACHED_PROCESS | NEW_PROCESS_GROUP
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-            creationflags=DETACHED, close_fds=True)
-        return True
-    except Exception:
-        return False
 
 
 def check_now(window):
@@ -141,7 +67,7 @@ def _on_result(window, latest: str, manual: bool = False):
                 "Couldn't reach PyPI to check for updates.\n\n"
                 "Check your internet connection and try again.")
         return
-    if not _is_newer(latest, __version__):
+    if not update.is_newer(latest):
         if manual:
             QMessageBox.information(
                 window, "Check for updates",
@@ -159,16 +85,32 @@ def _on_result(window, latest: str, manual: bool = False):
         box.setStandardButtons(QMessageBox.Ok)
         box.exec_()
         return
+    python = update.owning_python(sys.executable)
+    if python is None:
+        # A standalone exe (downloaded, not installed by pip): there is no
+        # install for pip to upgrade. Running some `python` from PATH would
+        # upgrade a different copy and then relaunch this same old exe.
+        box.setInformativeText(
+            "This copy isn't managed by pip, so it can't update itself. "
+            f"Download the new version from:\n{update.RELEASES_URL}\n\n"
+            "(or install with 'pip install -U turbossh').")
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec_()
+        return
     box.setInformativeText("Update now? TurboSSH will close, update, and reopen.")
     update_btn = box.addButton("Update now", QMessageBox.AcceptRole)
     box.addButton("Later", QMessageBox.RejectRole)
     box.setDefaultButton(update_btn)
     box.exec_()
-    if box.clickedButton() is update_btn:
-        if _spawn_updater(latest):
-            from PyQt5.QtWidgets import QApplication
-            QApplication.quit()
-        else:
-            QMessageBox.warning(window, "TurboSSH update",
-                                "Could not start the updater. Run "
-                                "'pip install -U turbossh' manually.")
+    if box.clickedButton() is not update_btn:
+        return
+    # Close through the window's own closeEvent (it asks about open sessions and
+    # releases remote ports) rather than quitting the event loop under it. Only
+    # if the window really closed is the helper started — it waits for this
+    # process to exit before pip touches the locked exe.
+    if not window.close():
+        return
+    if not update.spawn_update(latest, python, _relaunch_target()):
+        QMessageBox.warning(None, "TurboSSH update",
+                            "Could not start the updater. Run "
+                            "'pip install -U turbossh' manually.")

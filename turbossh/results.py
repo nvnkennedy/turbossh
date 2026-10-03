@@ -12,8 +12,15 @@ from typing import Optional
 # NB: the CSI (\[…) and OSC (\]…) branches come BEFORE the single-char C1 branch
 # (`[@-Z\\-_]`) — that class also covers `]` (0x5D), so if it came first it would
 # swallow the ESC] introducer and leave the OSC title text (e.g. "0;title") behind.
+# The same goes for the string sequences (DCS/SOS/PM/APC … ST). Sequences with an
+# intermediate byte (ESC ( B — the charset designation ncurses emits for sgr0)
+# need their own branch too, or "(B" is left behind in the text.
 _ANSI_RE = re.compile(
-    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"                  # CSI
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"              # OSC … BEL / ST
+    r"|[PX^_][^\x1b]*\x1b\\"                       # DCS / SOS / PM / APC … ST
+    r"|[ -/]+[0-~]"                                # intermediate(s) + final: ESC ( B
+    r"|[0-~])")                                    # two-character escapes: ESC 7, ESC M
 # control chars except tab(09), newline(0a), carriage-return(0d handled separately)
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 

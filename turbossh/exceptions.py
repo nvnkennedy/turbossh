@@ -16,7 +16,15 @@ class SSHAuthenticationError(SSHError):
 
 
 class SSHTimeoutError(SSHError):
-    """An operation exceeded its allotted time."""
+    """An operation exceeded its allotted time.
+
+    For a command timeout, ``result`` holds a CommandResult (exit_code -1) with
+    whatever the command had printed before it was cut off.
+    """
+
+    def __init__(self, message: str = "", result=None):
+        super().__init__(message)
+        self.result = result
 
 
 class SSHCommandError(SSHError):

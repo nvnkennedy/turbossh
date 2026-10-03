@@ -146,7 +146,7 @@ res.exit_code     # the actual number
 res.duration      # seconds it took
 
 ssh.run("reboot", check=True)        # raise SSHCommandError on a non-zero exit
-ssh.sudo("mount -o remount,rw /")    # sudo, password fed on stdin
+ssh.sudo("mount -o remount,rw /")    # sudo; the password is sent only if sudo asks
 ssh.run_many(["sync", "reboot"])     # several commands over one channel
 ```
 
@@ -482,7 +482,7 @@ plaintext on disk. Show/hide them with the eye icon in the dialog.
 **On the command line.**
 
 ```bash
-turbossh store-credential --user nkennedy --domain EU --service my_lab
+turbossh store-credential --user nkennedy --domain EU --host H --service my_lab
 turbossh run --host H --user nkennedy --domain EU --use-stored --service my_lab uname -a
 ```
 
@@ -495,23 +495,41 @@ turbossh-gui
 ```
 
 - **Sidebar** of saved sessions with a quick-connect filter. Right-click for
-  new / open / edit / duplicate / delete.
+  new / open / edit / duplicate / delete. Sessions log in with a password, a key
+  file, or your SSH agent.
 - **Tabbed sessions**, each with **Terminal**, **SFTP**, and **Logs** tabs.
-- **Real VT100 terminal** — htop, vim, less render correctly.
+- **Real terminal** — htop, vim, less render correctly and give the screen back
+  when they exit. Select with the mouse, Ctrl+C copies a selection, Ctrl+wheel
+  zooms, and every key goes to the shell (the window's own shortcuts are
+  Ctrl+Shift+T for a new session and Ctrl+Shift+W to close the tab).
 - **10,000 lines of scrollback** (configurable in Settings), and **Save all
-  output**, which writes the *entire* session to disk, not just what's on
-  screen — it scales to millions of lines.
+  output**, which writes the whole session to disk, not just what's on screen.
+- **Dual-pane file browser** — this PC on the left, the remote host on the right.
+  Move files and folders with the arrow buttons, by dragging between the panes or
+  in from Explorer; sort by any column; rename, delete, make folders; double-click
+  a remote text file to edit it in place. The **Transfers** panel underneath keeps
+  the history with progress, speed, time left, cancel and retry.
+- **Logs** tab — follow `journalctl -f` / `slog2info -w`, filter by regex, lines
+  coloured by level, Ctrl+F to find.
+- **Local terminal** — PowerShell or Command Prompt (your shell on Linux / macOS)
+  in a tab, next to the remote sessions.
 - **Split view** tiles several sessions at once.
+- **Toasts** in the corner for news that needs no click: connected, connection
+  lost, transfer finished.
 - **Menu bar** (File / Edit / View / Session / Help) and a ribbon with the same
   actions plus **SSH server**, **Check updates**, and **Settings**.
-- **Check updates** pulls the latest from PyPI and reinstalls in place, then
-  offers to refresh the bundled OpenSSH on the machines you use.
-- Dark and light themes; a desktop and Start-menu shortcut on first run.
+- **Check updates** compares with PyPI and, for a pip-installed copy, updates
+  in place and reopens.
+- Nine themes (dark, light, midnight, paper, nord, nord-light, solarized-dark,
+  solarized-light, dracula); a desktop and Start-menu shortcut on first run.
 
 ## CLI reference
 
-Connection flags (`--host --user [--domain] [--key] [--password|--use-stored]`)
-are shared.
+The full reference — every command, every option, exit codes — is in
+[CLI.md](https://github.com/nvnkennedy/turbossh/blob/main/CLI.md). In short:
+
+Connection flags (`--host --user [--domain] [--key] [--password|--password-stdin|--use-stored]`)
+are shared, and `--session NAME` (`-s`) uses a session saved in the GUI instead.
 
 ```bash
 turbossh run     --host H --user U uname -a
@@ -527,8 +545,16 @@ turbossh forward     --host H --user U --local-port 8080 --to-host 10.0.0.9 --to
 turbossh list-serial
 turbossh serial-monitor --port COM5 --baud 115200
 
+turbossh sudo    --host H --user U --password mount -o remount,rw /
+turbossh ls      --host H --user U /var/log
+turbossh run     -s my-saved-session uname -a      # a session saved in the GUI
+turbossh sessions                                  # list those sessions
+
 turbossh install-ssh-remote --host H --user "DOMAIN\\admin"
-turbossh store-credential --user U --domain CORP --service my_lab
+turbossh store-credential --user U --host H
+turbossh keygen ~/.ssh/lab && turbossh copy-id --host H --user U --password --public-key ~/.ssh/lab.pub
+turbossh diagnose --host H                         # is the SSH port reachable?
+turbossh check-update
 
 turbossh-gui          # the GUI
 turbossh-setup        # install OpenSSH Server on THIS machine (offline)

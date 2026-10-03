@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QToolButton, QApplication, QSplitter, QDialog, QFormLayout,
                              QSpinBox, QDialogButtonBox)
 
-from . import theme
+from . import theme, qtutil
 from .. import __version__
 from .log_panel import LogPanel
 from .sessions import SessionStore
@@ -114,9 +114,32 @@ class MainWindow(QMainWindow):
         _ver.setToolTip("TurboSSH version")
         self.statusBar().addPermanentWidget(_ver)   # bottom-right, always visible
         self._install_shortcuts()
+        from .toast import ToastHost
+        self._toasts = ToastHost(self)
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#8a9aa5;")
+        self.statusBar().insertPermanentWidget(0, self._summary)
         self._home = None
         self.refresh_sessions()
         self.open_home()        # MobaXterm-style welcome screen at startup
+        QTimer.singleShot(0, self._report_store_problems)
+
+    def _report_store_problems(self):
+        """Say so when sessions.json / settings.json could not be read. The file
+        was copied aside; staying silent would look like the sessions just
+        vanished, and the next save would replace the file."""
+        from . import settings as settings_mod
+        problems = [m for m in (self.store.load_problem, settings_mod.load_problem,
+                                settings_mod.save_problem) if m]
+        if not problems:
+            return
+        for message in problems:
+            self.log_panel.append(f"[ERROR] {message}")
+        QMessageBox.warning(
+            self, "Saved data could not be read",
+            "\n\n".join(problems) +
+            "\n\nTurboSSH is starting without it. Nothing was deleted: fix or "
+            "restore the copy named above if you need what was in it.")
 
     # ---- menu bar ----
     def _build_menubar(self):
@@ -127,6 +150,8 @@ class MainWindow(QMainWindow):
         m_file.addAction(ic("🏠"), "Home", self.open_home)
         m_file.addAction(ic("🖥"), "New session…", self.new_session,
                          QKeySequence("Ctrl+N"))
+        m_file.addAction(ic("💻"), "Local terminal", self.open_local_terminal,
+                         QKeySequence("Ctrl+Shift+L"))
         m_file.addAction(ic("📷"), "Camera…", self.open_camera_panel)
         m_file.addAction(ic("💾"), "Save terminal output…", self._save_current_output,
                          QKeySequence("Ctrl+S"))
@@ -162,9 +187,22 @@ class MainWindow(QMainWindow):
         m_help.addAction(ic("❓"), "Documentation", self._open_docs)
 
     # --- menu helpers that act on the current session's terminal ---
+    def _current_session_widget(self):
+        """The session the user is working in: the current tab — or, in split
+        view (where the tab bar is empty, so every menu action used to do
+        nothing), the pane that holds the keyboard focus, else the first pane."""
+        if getattr(self, "_tiled", False):
+            panes = [w for (w, _title) in getattr(self, "_tiled_items", [])]
+            focus = QApplication.focusWidget()
+            while focus is not None:
+                if focus in panes:
+                    return focus
+                focus = focus.parentWidget()
+            return panes[0] if panes else None
+        return self.tabs.currentWidget() if hasattr(self, "tabs") else None
+
     def _current_term(self):
-        w = self.tabs.currentWidget() if hasattr(self, "tabs") else None
-        return getattr(w, "term", None)
+        return getattr(self._current_session_widget(), "term", None)
 
     def _save_current_output(self):
         t = self._current_term()
@@ -353,6 +391,7 @@ class MainWindow(QMainWindow):
         # right-click menu (and the Session menu), keeping the ribbon clean.
         items = [
             ("🖥", "Session", self.new_session),
+            ("💻", "Local", self.open_local_terminal),
             ("📷", "Camera", self.open_camera_panel),
             ("📁", "SFTP", lambda: self._show_inner("SFTP")),
             ("📜", "Logs", lambda: self._show_inner("Logs")),
@@ -417,12 +456,12 @@ class MainWindow(QMainWindow):
     def _theme_icon(self):
         from . import settings as _s
         cur = _s.get("theme") or "dark"
-        return theme.emoji_icon("🌙" if cur == "dark" else "☀")
+        return theme.emoji_icon("☀" if theme.is_light(cur) else "🌙")
 
     def _toggle_theme(self):
         """Ribbon one-click theme switch — persists + applies everywhere instantly."""
         from . import settings as _s
-        new = "light" if (_s.get("theme") or "dark") == "dark" else "dark"
+        new = theme.counterpart(_s.get("theme") or "dark")
         cfg = _s.load(); cfg["theme"] = new; _s.save(cfg)
         self.apply_theme(new)
         self.log_panel.append(f"[OK] theme switched to {new}")
@@ -467,7 +506,7 @@ class MainWindow(QMainWindow):
 
     def _show_inner(self, name):
         """Switch the CURRENT session tab to its Terminal/SFTP/Logs inner tab."""
-        w = self.tabs.currentWidget()
+        w = self._current_session_widget()
         if w is not None and hasattr(w, "inner"):
             for i in range(w.inner.count()):
                 if w.inner.tabText(i) == name:
@@ -538,6 +577,7 @@ class MainWindow(QMainWindow):
             idx = self.tabs.addTab(w, title)
             if make_current:
                 self.tabs.setCurrentIndex(idx)
+        self._update_summary()
 
     def open_home(self):
         """Show (or focus) the Home / welcome tab."""
@@ -613,8 +653,15 @@ class MainWindow(QMainWindow):
         self._log_dock = dock
 
     def _install_shortcuts(self):
-        for seq, slot in (("Ctrl+T", self.new_session), ("Ctrl+N", self.new_session),
+        # Ctrl+N is NOT here: it is the File menu action's shortcut, and
+        # registering the same key twice makes it ambiguous — Qt then fires
+        # neither. The Ctrl+Shift variants are the ones that work while a
+        # terminal has the keyboard: it keeps plain Ctrl+W / Ctrl+T / Ctrl+N /
+        # Ctrl+S / Ctrl+Q for the shell (see Vt100Terminal.event).
+        for seq, slot in (("Ctrl+T", self.new_session),
+                          ("Ctrl+Shift+T", self.new_session),
                           ("Ctrl+W", self._close_current_tab),
+                          ("Ctrl+Shift+W", self._close_current_tab),
                           ("Ctrl+Return", self.open_selected), ("F1", self._open_docs)):
             QShortcut(QKeySequence(seq), self, activated=slot)
 
@@ -675,7 +722,7 @@ class MainWindow(QMainWindow):
         s = dict(self.store.get(name) or {})
         if not s:
             return
-        s["name"] = s.get("name", "session") + " (copy)"
+        s["name"] = self.store.unique_name(s.get("name", "session") + " (copy)")
         self.store.save(s, SessionStore.password(name) or "",
                         SessionStore.jump_password(name) or "")
         self.refresh_sessions()
@@ -691,11 +738,28 @@ class MainWindow(QMainWindow):
             dlg.host.setText(prefill_host)
         if prefer_type and prefer_type in dlg.rb:
             dlg.rb[prefer_type].setChecked(True)
-        if dlg.exec_() == dlg.Accepted:
+        accepted = dlg.exec_() == dlg.Accepted
+        dlg.deleteLater()               # a parented dialog is otherwise kept forever
+        if accepted:
             s = dlg.result_session()
             if not s["name"]:
                 QMessageBox.warning(self, "Session", "Give the session a name.")
                 return
+            if self.store.exists(s["name"]):
+                # saving used to replace the existing session without a word
+                # (the auto-derived name user@host collides easily)
+                other = self.store.unique_name(s["name"])
+                answer = QMessageBox.question(
+                    self, "Session name in use",
+                    f"A session named '{s['name']}' already exists.\n\n"
+                    f"Yes replaces it. No keeps both and saves this one as "
+                    f"'{other}'.",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                    QMessageBox.No)
+                if answer == QMessageBox.Cancel:
+                    return
+                if answer == QMessageBox.No:
+                    s["name"] = other
             self.store.save(s, dlg.password_value(), dlg.jump_password_value())
             self.refresh_sessions()
             self.log_panel.append(f"[OK] Saved session '{s['name']}'")
@@ -705,6 +769,13 @@ class MainWindow(QMainWindow):
                     self.session_list.setCurrentRow(i)
                     break
             self.open_selected()
+
+    def open_local_terminal(self, *_):
+        """A shell on THIS machine in its own tab (PowerShell / cmd, or $SHELL)."""
+        from .local_terminal import LocalTerminalWidget
+        panel = LocalTerminalWidget()
+        panel.log.connect(self.log_panel.append)
+        self._host_session_widget(panel, "💻 Local")
 
     def open_camera_panel(self, *_):
         """Open the Camera viewer in its own tab (Local/Remote, not a session)."""
@@ -718,9 +789,21 @@ class MainWindow(QMainWindow):
         if not name:
             return
         dlg = SessionDialog(self, existing=self.store.get(name))
-        if dlg.exec_() == dlg.Accepted:
-            self.store.save(dlg.result_session(), dlg.password_value(),
-                            dlg.jump_password_value())
+        accepted = dlg.exec_() == dlg.Accepted
+        dlg.deleteLater()
+        if accepted:
+            s = dlg.result_session()
+            if s["name"] != name:
+                # a rename: move the entry and its stored passwords. Saving under
+                # the new name alone left the old session (and its secret) behind.
+                if self.store.exists(s["name"]):
+                    QMessageBox.warning(
+                        self, "Session name in use",
+                        f"A session named '{s['name']}' already exists — pick "
+                        f"another name.")
+                    return
+                self.store.rename(name, s["name"])
+            self.store.save(s, dlg.password_value(), dlg.jump_password_value())
             self.refresh_sessions()
 
     def delete_session(self):
@@ -749,8 +832,7 @@ class MainWindow(QMainWindow):
         # a serial port can't be shared — if it's already open, offer to reopen
         if kind == "serial":
             dev = s.get("device")
-            for i in range(self.tabs.count()):
-                tw = self.tabs.widget(i)
+            for tw in self._all_sessions():
                 if isinstance(tw, SerialSessionWidget) and tw.session.get("device") == dev:
                     resp = QMessageBox.question(
                         self, "Serial port in use",
@@ -759,7 +841,7 @@ class MainWindow(QMainWindow):
                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                     if resp != QMessageBox.Yes:
                         return
-                    self._close_tab(i)
+                    self._close_session_widget(tw)
                     break
         w = SerialSessionWidget(s, pw, jpw) if kind == "serial" \
             else SshSessionWidget(s, pw, jpw)
@@ -769,20 +851,39 @@ class MainWindow(QMainWindow):
             w.failed.connect(self._on_session_failed)
         if hasattr(w, "connected"):
             w.connected.connect(self._on_session_connected)
+        if hasattr(w, "notify"):
+            # e.g. the file browser's "download finished" (it logs it itself)
+            w.notify.connect(lambda text, kind: self.notify(text, kind, log=False))
         icon = s.get("icon") or ("📡" if (kind == "serial" and s.get("via_ssh"))
                                  else "🔌" if kind == "serial" else "🖥")
         self._host_session_widget(w, f"{icon} {name}")
         self.log_panel.append(f"Opening '{name}'…")
         self.statusBar().showMessage(f"Connecting to {s.get('host')}…")
 
+    def notify(self, text, kind="info", log=True):
+        """Tell the user something that needs no answer: a toast in the corner,
+        the status bar, and (unless the caller already logged it) the log dock."""
+        if log:
+            tag = {"ok": "[OK]", "warn": "[WARN]", "error": "[ERROR]"}.get(kind, "[i]")
+            self.log_panel.append(f"{tag} {text}")
+        self.statusBar().showMessage(text, 15000 if kind in ("warn", "error") else 6000)
+        self._toasts.show(text, kind)
+
+    def _update_summary(self):
+        """The standing line at the right of the status bar: what is open."""
+        count = len(self._all_sessions())
+        self._summary.setText(f"  {count} open session{'s' if count != 1 else ''}  "
+                              if count else "")
+
+    # Connection news is a toast + the status bar (and the tab's own terminal, and
+    # the log) — not a modal box. With several sessions open, a dropped VPN used
+    # to stack one dialog per tab, and a second round when the reconnect window
+    # ran out.
     def _on_session_failed(self, msg):
-        self.statusBar().showMessage("Connection failed")
-        QMessageBox.warning(self, "Connection failed", msg)
+        self.notify(f"Connection failed — {msg}", "error", log=False)
 
     def _on_session_connected(self, ok, msg):
-        self.statusBar().showMessage(msg)
-        if not ok:
-            QMessageBox.information(self, "Connection", msg)
+        self.notify(msg, "ok" if ok else "warn", log=False)
 
     def toggle_log(self):
         self._log_dock.setVisible(not self._log_dock.isVisible())
@@ -846,7 +947,9 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(cell); v.setContentsMargins(3, 3, 3, 3); v.setSpacing(2)
         bar = QHBoxLayout(); bar.setContentsMargins(0, 0, 0, 0)
         cap = QLabel("  " + title)
-        cap.setStyleSheet(f"background:{_t.THEMES['dark']['ribbon']};"
+        from . import settings as _s
+        palette = _t.THEMES.get(_s.get("theme") or "dark", _t.THEMES["dark"])
+        cap.setStyleSheet(f"background:{palette['ribbon']};"
                           f"color:{_t.ACCENT};padding:4px;border-radius:5px;"
                           f"font-weight:600;")
         x = QPushButton("✕"); x.setProperty("role", "danger")
@@ -859,16 +962,8 @@ class MainWindow(QMainWindow):
 
     def _close_tiled(self, w):
         """Close one pane's session and reflow (or drop back to tabs if last)."""
-        try:
-            if hasattr(w, "close_session"):
-                w.close_session()
-        except Exception:
-            pass
         self._tiled_items = [(x, t) for (x, t) in self._tiled_items if x is not w]
-        try:
-            w.setParent(None)                           # detach the closed session
-        except Exception:
-            pass
+        self._dispose(w)
         if self._tiled_items:
             self._build_tiles()
         else:
@@ -893,15 +988,43 @@ class MainWindow(QMainWindow):
             self.apply_theme(cfg["theme"])      # full immediate update everywhere
             self.log_panel.append(f"[OK] Settings saved — theme: {cfg['theme']}")
 
+    def _dispose(self, w):
+        """Shut a tab's widget down and DELETE it. Removing the tab only hides the
+        page: every session ever closed used to stay alive until exit, with its
+        whole scrollback (16 KB a line) and its timers."""
+        if w is None:
+            return
+        try:
+            if hasattr(w, "close_session"):
+                w.close_session()
+        except Exception as exc:
+            self.log_panel.append(f"[WARN] closing a tab: {type(exc).__name__}: {exc}")
+        if w is self._home:
+            self._home = None
+        w.setParent(None)
+        w.deleteLater()
+        self._update_summary()
+
     def _close_tab(self, index):
         w = self.tabs.widget(index)
-        try:
-            w.close_session()
-        except Exception:
-            pass
         self.tabs.removeTab(index)
+        self._dispose(w)
+
+    def _close_session_widget(self, w):
+        """Close a session wherever it lives — a tab, or a pane in split view."""
+        if getattr(self, "_tiled", False):
+            self._close_tiled(w)
+        else:
+            index = self.tabs.indexOf(w)
+            if index >= 0:
+                self._close_tab(index)
 
     def _close_current_tab(self):
+        if getattr(self, "_tiled", False):
+            w = self._current_session_widget()
+            if w is not None:
+                self._close_tiled(w)
+            return
         i = self.tabs.currentIndex()
         if i >= 0:
             self._close_tab(i)
@@ -951,6 +1074,17 @@ class MainWindow(QMainWindow):
                     w.close_session()
             except Exception:
                 pass
+        # workers this window started must not be destroyed while running
+        for attr in ("_remote_install", "_update_thread"):
+            qtutil.park_thread(getattr(self, attr, None))
+        # close_session hands the slow part (releasing a remote COM port or
+        # camera, disconnecting) to background threads so tabs close instantly;
+        # give those a moment to finish, or the remote port stays locked.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            qtutil.wait_for_teardowns(6.0)
+        finally:
+            QApplication.restoreOverrideCursor()
         super().closeEvent(event)
         # make sure nothing keeps the process alive (orphaned Qt threads, etc.)
         try:

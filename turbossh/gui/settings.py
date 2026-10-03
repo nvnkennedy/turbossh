@@ -1,15 +1,20 @@
-"""Persisted app settings (theme, fonts, defaults) at ~/.turbossh/settings.json."""
+"""Persisted app settings (theme, fonts, defaults) in <state dir>/settings.json.
+
+Written atomically; an unreadable file is copied aside (see ``load_problem``)
+rather than silently replaced by defaults on the next save."""
 
 from __future__ import annotations
 
-import os
-import json
+import copy
 
-_DIR = os.path.join(os.path.expanduser("~"), ".turbossh")
-_FILE = os.path.join(_DIR, "settings.json")
+from .. import paths
+from .._jsonstore import atomic_write_json, read_json
+
+_DIR = paths.state_dir()
+_FILE = paths.state_path("settings.json")
 
 DEFAULTS = {
-    "theme": "dark",            # "dark" | "light"
+    "theme": "dark",            # any name in theme.THEME_NAMES
     "term_font_size": 11,
     # crisp modern monospace (ships with Win10/11); falls back to Consolas/Courier
     "term_font": "Cascadia Mono",
@@ -25,6 +30,12 @@ DEFAULTS = {
     # Camera (remote webcam over SSH via ffmpeg). ffmpeg_path is an optional local
     # ffmpeg.exe to use instead of the auto-fetched one (fully offline).
     "ffmpeg_path": "",
+    # optional SHA-256 the downloaded ffmpeg.exe must match (pins the build)
+    "ffmpeg_sha256": "",
+    # ask before pasting several lines into a shell that would run them at once
+    "confirm_multiline_paste": True,
+    # where the file browser's local pane opens (remembered from last time)
+    "local_browser_dir": "",
     "open_docs_first_run": True,
     "make_shortcut_first_run": True,
     # shared jump host (the RDP/Windows machine) — entered once in Settings and
@@ -68,15 +79,20 @@ def set_jump_password(value: str):
 # file on EVERY call — and theme.emoji_icon() calls get() for every icon, so
 # building a menu/ribbon/tab fired a burst of disk reads and made the UI sluggish.
 _cache: dict | None = None
+# Set when settings.json existed but could not be read (it was copied aside), or
+# when the last save failed — so the app can say so instead of failing silently.
+load_problem: str | None = None
+save_problem: str | None = None
 
 
 def _read_from_disk() -> dict:
-    data = dict(DEFAULTS)
-    try:
-        with open(_FILE, "r", encoding="utf-8") as fh:
-            data.update(json.load(fh) or {})
-    except Exception:
-        pass
+    global load_problem
+    data = copy.deepcopy(DEFAULTS)
+    saved, problem = read_json(_FILE, dict)
+    if problem:
+        load_problem = problem
+    if saved:
+        data.update(saved)
     return data
 
 
@@ -85,22 +101,22 @@ def load() -> dict:
     global _cache
     if _cache is None:
         _cache = _read_from_disk()
-    return dict(_cache)          # a copy, so callers can't mutate the cache
+    # a deep copy, so callers can't mutate the cache (nested lists included)
+    return copy.deepcopy(_cache)
 
 
 def save(data: dict) -> None:
     # Start from the CURRENT config (defaults + whatever is already saved), not
     # bare DEFAULTS — so saving a partial dict (e.g. only the settings a dialog
     # exposes) preserves keys it didn't touch (compact_ribbon, …).
-    global _cache
+    global _cache, save_problem
     merged = load()
     merged.update(data)
     try:
-        os.makedirs(_DIR, exist_ok=True)
-        with open(_FILE, "w", encoding="utf-8") as fh:
-            json.dump(merged, fh, indent=2)
-    except Exception:
-        pass
+        atomic_write_json(_FILE, merged)
+        save_problem = None
+    except Exception as exc:
+        save_problem = f"settings could not be saved: {exc}"
     # Keep the in-memory copy authoritative even if the write failed, so the
     # running app stays consistent (e.g. a live theme switch still takes effect).
     _cache = merged

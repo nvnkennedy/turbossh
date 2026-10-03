@@ -17,10 +17,12 @@ import stat
 import time
 import logging
 import posixpath
+import threading
 from typing import Callable, Optional, Sequence, Union
 
 import paramiko
 
+from . import _logging
 from .config import SSHConfig
 from .credentials import Secret, mask
 from .results import CommandResult, TransferResult, ShellResult, OperationResult
@@ -32,6 +34,19 @@ from .exceptions import (
     SSHTransferError,
     SSHNotConnectedError,
 )
+
+# Every long-lived serial PowerShell we start begins with this comment line, so
+# its -EncodedCommand argument starts with a fixed base64 prefix. That prefix is
+# how a "force" open finds OUR stale readers on the remote machine without
+# touching any other PowerShell there. 18 characters -> 36 UTF-16 bytes -> exactly
+# 48 base64 characters, so it encodes to a stable prefix with no padding.
+_SERIAL_PS_TAG = "#turbossh-serial\n\n"
+
+
+def _serial_ps_tag_b64() -> str:
+    import base64
+    return base64.b64encode(_SERIAL_PS_TAG.encode("utf-16-le")).decode("ascii")
+
 
 try:  # optional SCP support
     from scp import SCPClient
@@ -123,7 +138,8 @@ class ShellSession:
     def send(self, data: str) -> None:
         if not data.endswith("\n"):
             data += "\n"
-        self._chan.send(data)
+        # sendall: send() may accept only part of a large write
+        self._chan.sendall(data)
 
     def read_until(self, marker: str, timeout: float = 30.0) -> ShellResult:
         """Read output until *marker* appears or *timeout* elapses."""
@@ -215,6 +231,9 @@ class SSHHandler:
         self._sftp: Optional[paramiko.SFTPClient] = None
         self._jump: Optional["SSHHandler"] = None
         self._bootstrap_attempted = False
+        # Serialises connect / reconnect / disconnect, so two threads that find
+        # the link down don't both reconnect (and leak one of the clients).
+        self._conn_lock = threading.RLock()
         self._remote_os: Optional[str] = (
             None if config.remote_os == "auto" else config.remote_os
         )
@@ -223,17 +242,11 @@ class SSHHandler:
     # Logging (secret-aware)
     # ------------------------------------------------------------------ #
     def _build_logger(self) -> logging.Logger:
-        logger = logging.getLogger(f"turbossh.{self.config.host}")
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(
-                logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-            )
-            logger.addHandler(handler)
-        # set the level every time so quiet= is honored even if the per-host
-        # logger was created by an earlier handler instance
-        logger.setLevel(logging.WARNING if self._quiet else logging.INFO)
-        return logger
+        # One console handler lives on the package logger (and only when the
+        # application hasn't set up logging itself). ``quiet`` is applied per
+        # instance in _emit, never by changing a logger other handlers share.
+        _logging.ensure_console_handler()
+        return _logging.get_logger(self.config.host)
 
     def _secrets(self) -> list:
         s = [self.config.password, self.config.key_passphrase]
@@ -243,7 +256,8 @@ class SSHHandler:
 
     def _emit(self, level: int, msg: str) -> None:
         safe_msg = mask(msg, *self._secrets())
-        self.log.log(level, safe_msg)
+        if not (getattr(self, "_quiet", False) and level < logging.WARNING):
+            self.log.log(level, safe_msg)
         if self._log_callback:
             try:
                 self._log_callback(f"[{logging.getLevelName(level)}] {safe_msg}")
@@ -286,11 +300,14 @@ class SSHHandler:
     def _ensure_connected(self) -> None:
         if self.is_connected:
             return
-        if self.config.auto_reconnect:
-            self._emit(logging.WARNING, "Session not active; reconnecting…")
-            self._connect_with_retries()
-        else:
-            raise SSHNotConnectedError("Not connected (auto_reconnect disabled).")
+        with self._conn_lock:
+            if self.is_connected:          # another thread reconnected meanwhile
+                return
+            if self.config.auto_reconnect:
+                self._emit(logging.WARNING, "Session not active; reconnecting…")
+                self._connect_with_retries()
+            else:
+                raise SSHNotConnectedError("Not connected (auto_reconnect disabled).")
 
     # ------------------------------------------------------------------ #
     # Connect / disconnect
@@ -298,31 +315,65 @@ class SSHHandler:
     def connect(self, *, safe: Optional[bool] = None):
         return self._guard("connect", self._connect_with_retries, safe=safe)
 
+    # Legacy KEX / host-key / cipher / MAC names old embedded and automotive SSH
+    # servers still need, each with the Transport table that says whether this
+    # Paramiko build can actually speak it (newer releases dropped some — offering
+    # a name the Transport has no implementation for fails mid-handshake).
+    _LEGACY_ALGORITHMS = {
+        "_preferred_kex": ("_kex_info", ("diffie-hellman-group14-sha1",
+                                         "diffie-hellman-group1-sha1",
+                                         "diffie-hellman-group-exchange-sha1")),
+        "_preferred_keys": ("_key_info", ("ssh-rsa", "ssh-dss")),
+        "_preferred_ciphers": ("_cipher_info", ("aes128-cbc", "aes256-cbc",
+                                                "3des-cbc", "blowfish-cbc")),
+        "_preferred_macs": ("_mac_info", ("hmac-sha1", "hmac-md5")),
+    }
+
+    @classmethod
+    def _legacy_preferences(cls) -> dict:
+        """The Transport preference tuples extended with the legacy names this
+        Paramiko supports."""
+        from paramiko.transport import Transport
+        out = {}
+        for attr, (info_attr, names) in cls._LEGACY_ALGORITHMS.items():
+            current = tuple(getattr(Transport, attr, ()))
+            known = getattr(Transport, info_attr, None)
+            extra = tuple(n for n in names if n not in current
+                          and (known is None or n in known))
+            out[attr] = current + extra
+        return out
+
+    @classmethod
+    def _legacy_transport_class(cls):
+        """A Transport subclass that also offers the legacy algorithms — used for
+        ONE connection, so enabling them for an old ECU doesn't weaken every
+        other connection in the process."""
+        from paramiko.transport import Transport
+        return type("LegacyTransport", (Transport,), cls._legacy_preferences())
+
     @staticmethod
-    def _apply_legacy_algorithms():
-        """Extend Paramiko's preferred algorithm lists with legacy KEX/ciphers/
-        host-keys so very old embedded/automotive SSH servers can negotiate.
-        Process-wide and idempotent."""
+    def _supports_transport_factory() -> bool:
+        import inspect
+        try:
+            return "transport_factory" in inspect.signature(
+                paramiko.SSHClient.connect).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _apply_legacy_algorithms(cls):
+        """Fallback for Paramiko < 3.2 (no per-connection ``transport_factory``):
+        extend the Transport class itself. Process-wide and idempotent."""
         try:
             from paramiko.transport import Transport
-            extra = {
-                "_preferred_kex": ("diffie-hellman-group14-sha1",
-                                   "diffie-hellman-group1-sha1",
-                                   "diffie-hellman-group-exchange-sha1"),
-                "_preferred_keys": ("ssh-rsa", "ssh-dss"),
-                "_preferred_ciphers": ("aes128-cbc", "aes256-cbc", "3des-cbc",
-                                       "blowfish-cbc"),
-                "_preferred_macs": ("hmac-sha1", "hmac-md5"),
-            }
-            for attr, vals in extra.items():
-                cur = tuple(getattr(Transport, attr, ()))
-                merged = cur + tuple(v for v in vals if v not in cur)
+            for attr, merged in cls._legacy_preferences().items():
                 setattr(Transport, attr, merged)
         except Exception:
             pass
 
     def _make_client(self) -> paramiko.SSHClient:
-        if self.config.enable_legacy_algorithms:
+        if (self.config.enable_legacy_algorithms
+                and not self._supports_transport_factory()):
             self._apply_legacy_algorithms()
         client = paramiko.SSHClient()
         if self.config.host_key_policy == "ignore":
@@ -344,20 +395,37 @@ class SSHHandler:
         return client
 
     def _open_jump_channel(self):
-        """Connect the jump host and return a direct-tcpip channel to target."""
-        self._jump = SSHHandler(
-            self.config.jump_host,
-            log_callback=self._log_callback,
-            logger=self.log,
-        )
-        self._jump._connect_with_retries()
-        self._emit(logging.INFO, f"Tunnelling through jump host "
-                                 f"{self.config.jump_host.host}.")
+        """Return a NEW direct-tcpip channel to the target through the jump host.
+
+        The jump connection is made once and reused: every auth strategy and
+        every retry needs its own channel (a failed attempt closes the one it
+        used), but reconnecting the jump host each time leaked a connection per
+        attempt."""
+        if self._jump is None or not self._jump.is_connected:
+            self._close_jump()
+            self._jump = SSHHandler(
+                self.config.jump_host,
+                log_callback=self._log_callback,
+                logger=self.log,
+                quiet=self._quiet,
+            )
+            self._jump._connect_with_retries()
+            self._emit(logging.INFO, f"Tunnelling through jump host "
+                                     f"{self.config.jump_host.host}.")
         return self._jump.transport.open_channel(
             "direct-tcpip",
             dest_addr=(self.config.host, self.config.port),
             src_addr=("127.0.0.1", 0),
+            timeout=self.config.connect_timeout,
         )
+
+    def _close_jump(self) -> None:
+        if self._jump is not None:
+            try:
+                self._jump.disconnect()
+            except Exception:
+                pass
+            self._jump = None
 
     def _build_connect_kwargs(self, *, empty_password: bool, sock) -> dict:
         cfg = self.config
@@ -381,6 +449,8 @@ class SSHHandler:
             kwargs["sock"] = sock
         if cfg.disabled_algorithms:
             kwargs["disabled_algorithms"] = cfg.disabled_algorithms
+        if cfg.enable_legacy_algorithms and self._supports_transport_factory():
+            kwargs["transport_factory"] = self._legacy_transport_class()
 
         keys = cfg.normalized_key_files()
         if keys:
@@ -410,14 +480,25 @@ class SSHHandler:
                 kwargs["look_for_keys"] = False
         return kwargs
 
-    def _attempt_strategies(self, sock) -> None:
+    def _attempt_strategies(self, open_sock=None) -> None:
+        """Try each auth strategy on its own connection. ``open_sock`` (jump
+        hosts) is called per attempt, because a rejected attempt closes the
+        channel it ran over."""
         cfg = self.config
         last_auth: Optional[Exception] = None
+        supplied = (cfg.password.reveal() if isinstance(cfg.password, Secret)
+                    else cfg.password)
         strategies = [False]
-        if cfg.allow_empty_password and not cfg.passwordless:
+        # The blank-password fallback is for accounts where NO password was given
+        # (lab targets with an empty root password). After a real password was
+        # rejected it would only add a second failed login per connect — which
+        # halves the distance to an account lockout — and with password="" the
+        # primary attempt already is the blank one.
+        if cfg.allow_empty_password and not cfg.passwordless and supplied is None:
             strategies.append(True)
 
         for empty in strategies:
+            sock = open_sock() if open_sock else None
             client = self._make_client()
             kwargs = self._build_connect_kwargs(empty_password=empty, sock=sock)
             label = "empty-password" if empty else "primary"
@@ -450,6 +531,14 @@ class SSHHandler:
             except OSError as exc:
                 client.close()
                 raise exc
+            except EOFError as exc:
+                # Paramiko surfaces a peer that hangs up mid-handshake as a bare
+                # EOFError; turn it into the connection error it is, so it is
+                # retried and reported through our own exception types.
+                client.close()
+                raise paramiko.SSHException(
+                    "the server closed the connection during the SSH handshake"
+                ) from exc
         if last_auth and "no authentication methods" in str(last_auth).lower():
             raise SSHAuthenticationError(
                 f"No usable credentials for {cfg.auth_username}@{cfg.host}. "
@@ -463,15 +552,21 @@ class SSHHandler:
         )
 
     def _connect_with_retries(self) -> "SSHHandler":
+        with self._conn_lock:
+            try:
+                return self._connect_locked()
+            except BaseException:
+                self._close_jump()      # never leave a jump connection behind
+                raise
+
+    def _connect_locked(self) -> "SSHHandler":
         cfg = self.config
         attempt, delay, last_exc = 0, cfg.retry_backoff, None
+        opener = self._open_jump_channel if cfg.jump_host else None
         while attempt < max(1, cfg.max_retries):
             attempt += 1
-            sock = None
             try:
-                if cfg.jump_host:
-                    sock = self._open_jump_channel()
-                self._attempt_strategies(sock)
+                self._attempt_strategies(opener)
                 return self
             except SSHAuthenticationError:
                 raise  # retrying won't help
@@ -488,7 +583,9 @@ class SSHHandler:
                 delay *= cfg.retry_backoff
 
         # Optional self-heal: if SSH is down but WinRM is up, enable sshd and retry.
+        # (Not through a jump host: these probes run from THIS machine.)
         if (cfg.auto_bootstrap_via_winrm and not self._bootstrap_attempted
+                and not cfg.jump_host
                 and not self._port_open(cfg.host, cfg.port, 3.0)
                 and self._port_open(cfg.host, cfg.winrm_port, 3.0)):
             self._bootstrap_attempted = True
@@ -499,6 +596,7 @@ class SSHHandler:
             enable_openssh_via_winrm(
                 cfg.host, cfg.username, cfg.password, domain=cfg.domain,
                 winrm_port=cfg.winrm_port, use_ssl=cfg.winrm_use_ssl,
+                verify_ssl=cfg.winrm_verify_ssl,
                 transport=cfg.winrm_transport, ssh_port=cfg.port,
                 log=lambda m: self._emit(logging.INFO, m),
             )
@@ -506,7 +604,7 @@ class SSHHandler:
                 if self._port_open(cfg.host, cfg.port, 2.0):
                     break
                 time.sleep(1.0)
-            return self._connect_with_retries()  # one more pass now that sshd is up
+            return self._connect_locked()  # one more pass now that sshd is up
 
         hint = self._connection_hint(last_exc) if cfg.diagnose_on_failure else ""
         if isinstance(last_exc, socket.timeout):
@@ -531,6 +629,13 @@ class SSHHandler:
     def _connection_hint(self, last_exc=None) -> str:
         """A short, actionable explanation appended to connect failures."""
         host, port = self.config.host, self.config.port
+        if self.config.jump_host:
+            # The port probes below run from THIS machine, which says nothing
+            # about a target that is only reachable from the jump host.
+            jump = self.config.jump_host.host
+            return (f" The target is reached through jump host {jump}; check that "
+                    f"{jump} itself can reach {host}:{port} and that an SSH server "
+                    f"is listening there.")
         probe_to = min(self.config.connect_timeout, 3.0)
         if self._port_open(host, port, probe_to):
             # Port is open but the connection still failed. If it was a banner /
@@ -665,6 +770,7 @@ class SSHHandler:
             res = enable_openssh_via_winrm(
                 cfg.host, cfg.username, cfg.password, domain=cfg.domain,
                 winrm_port=cfg.winrm_port, use_ssl=cfg.winrm_use_ssl,
+                verify_ssl=cfg.winrm_verify_ssl,
                 transport=cfg.winrm_transport, ssh_port=cfg.port,
                 set_powershell_default=set_powershell_default,
                 log=lambda m: self._emit(logging.INFO, m),
@@ -685,22 +791,21 @@ class SSHHandler:
         self._sftp = None
 
     def disconnect(self) -> None:
-        if self._sftp is not None:
-            try:
-                self._sftp.close()
-            except Exception:
-                pass
-            self._sftp = None
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._emit(logging.INFO, f"Disconnected from {self.config.host}.")
-            self._client = None
-        if self._jump is not None:
-            self._jump.disconnect()
-            self._jump = None
+        with self._conn_lock:
+            if self._sftp is not None:
+                try:
+                    self._sftp.close()
+                except Exception:
+                    pass
+                self._sftp = None
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                self._emit(logging.INFO, f"Disconnected from {self.config.host}.")
+                self._client = None
+            self._close_jump()
 
     close = disconnect
 
@@ -742,6 +847,12 @@ class SSHHandler:
     def is_windows(self) -> bool:
         return self.detect_os() == "windows"
 
+    @property
+    def known_os(self) -> Optional[str]:
+        """The remote OS if it is already known ('windows' / 'linux'), else None.
+        Never touches the network — safe to call from a GUI thread."""
+        return self._remote_os
+
     # ------------------------------------------------------------------ #
     # Command execution
     # ------------------------------------------------------------------ #
@@ -755,31 +866,134 @@ class SSHHandler:
                            encoding=encoding, safe=safe)
 
     def _run(self, command, *, timeout, check, get_pty, environment, encoding):
-        self._ensure_connected()
         eff_timeout = timeout if timeout is not None else self.config.command_timeout
-        self._emit(logging.INFO, f"$ {command}")
-        start = time.time()
-        try:
-            _, stdout, stderr = self._client.exec_command(
-                command, timeout=eff_timeout, get_pty=get_pty, environment=environment)
-            exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode(encoding, errors="replace")
-            err = stderr.read().decode(encoding, errors="replace")
-        except socket.timeout as exc:
-            raise SSHTimeoutError(
-                f"Command timed out after {eff_timeout}s: {command!r}") from exc
-        except paramiko.SSHException as exc:
-            res = CommandResult(command, -1, "", str(exc), time.time() - start,
-                                host=self.config.host)
-            raise SSHCommandError(command, res) from exc
-
-        result = CommandResult(command, exit_code, out, err, time.time() - start,
-                               host=self.config.host)
+        result = self._exec(command, timeout=eff_timeout, get_pty=get_pty,
+                            environment=environment, encoding=encoding)
         lvl = logging.INFO if result.ok else logging.WARNING
         self._emit(lvl, f"exit={result.exit_code} ({result.duration:.2f}s)")
         if check and not result.ok:
             raise SSHCommandError(command, result)
         return result
+
+    # After the exit status arrives, output is drained until the remote closes
+    # the stream. A child the command left in the background can hold that
+    # stream open forever, so stop this long after the last byte.
+    _EXIT_DRAIN_GRACE = 1.0
+    # sudo prints its prompt before any command output; only look this far for it.
+    _PROMPT_SCAN = 8192
+
+    def _exec(self, command, *, timeout, get_pty, environment, encoding,
+              prompt=None, label=None) -> CommandResult:
+        """Run *command* on its own channel and return a CommandResult.
+
+        stdout and stderr are drained WHILE waiting for the exit status, and the
+        whole call is bounded by *timeout* (None = no limit). Waiting for the exit
+        status first — ``recv_exit_status()`` then ``read()`` — never times out,
+        and deadlocks as soon as the output exceeds the SSH channel window: the
+        remote blocks writing while we block waiting for it to exit.
+
+        On timeout the channel is closed and :class:`SSHTimeoutError` carries the
+        partial output in ``.result``.
+
+        ``prompt=(marker, reply)``: the first time *marker* appears in the output,
+        *reply* is written to the command's stdin (see :meth:`sudo`).
+        ``label`` is what gets logged / reported instead of the raw command.
+        """
+        shown = label or command
+        transport = self.transport                # ensures we are connected
+        self._emit(logging.INFO, f"$ {shown}")
+        started_at, start = time.time(), time.monotonic()
+        deadline = None if not timeout else start + timeout
+        out, err = bytearray(), bytearray()
+
+        def result(code: int, note: str = "") -> CommandResult:
+            stderr_text = err.decode(encoding, errors="replace")
+            if note:
+                stderr_text = (stderr_text.rstrip() + "\n" + note).strip()
+            return CommandResult(shown, code, out.decode(encoding, errors="replace"),
+                                 stderr_text, time.monotonic() - start,
+                                 host=self.config.host, started_at=started_at)
+
+        chan = None
+        try:
+            open_timeout = min(t for t in (timeout, self.config.connect_timeout,
+                                           3600.0) if t)
+            chan = transport.open_session(timeout=open_timeout)
+            if get_pty:
+                chan.get_pty()
+            if environment:
+                chan.update_environment(environment)
+            chan.exec_command(command)
+
+            replied, rejected = False, False
+            exit_seen = None          # when the exit status was first observed
+            idle = 0.001
+            while True:
+                progressed = False
+                while chan.recv_ready():
+                    data = chan.recv(65536)
+                    if not data:
+                        break
+                    out += data
+                    progressed = True
+                while chan.recv_stderr_ready():
+                    data = chan.recv_stderr(65536)
+                    if not data:
+                        break
+                    err += data
+                    progressed = True
+
+                if prompt and progressed:
+                    marker, reply = prompt
+                    seen = (out[:self._PROMPT_SCAN].count(marker)
+                            + err[:self._PROMPT_SCAN].count(marker))
+                    if seen and not replied:
+                        replied = True
+                        chan.sendall(reply)
+                        if not get_pty:
+                            # nothing more to say: give the command EOF on stdin
+                            # (and a re-prompt after a wrong reply fails at once
+                            # instead of waiting for input that never comes)
+                            chan.shutdown_write()
+                    elif seen > 1 and get_pty:
+                        rejected = True     # asked again: the reply was refused
+                        break
+
+                if chan.exit_status_ready():
+                    drained = not chan.recv_ready() and not chan.recv_stderr_ready()
+                    if drained and (chan.eof_received or chan.closed):
+                        break
+                    now = time.monotonic()
+                    if progressed or exit_seen is None:
+                        exit_seen = now
+                    elif now - exit_seen > self._EXIT_DRAIN_GRACE:
+                        break
+
+                if deadline is not None and time.monotonic() > deadline:
+                    raise SSHTimeoutError(
+                        f"Command timed out after {timeout}s: {shown!r}",
+                        result=result(-1))
+                if progressed:
+                    idle = 0.001
+                else:
+                    time.sleep(idle)
+                    idle = min(idle * 2, 0.05)
+
+            if rejected:
+                return result(-1, "the reply to the password prompt was not accepted")
+            # exit_status_ready() is also true for a channel that closed without
+            # reporting a status (killed by a signal, link dropped): that reads -1.
+            return result(chan.recv_exit_status())
+        except SSHTimeoutError:
+            raise
+        except (paramiko.SSHException, OSError, EOFError) as exc:
+            raise SSHCommandError(shown, result(-1, str(exc))) from exc
+        finally:
+            if chan is not None:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
 
     def run_many(self, commands: Sequence[str], *, stop_on_error: bool = True,
                  timeout: Optional[float] = None, check: bool = False,
@@ -817,8 +1031,7 @@ class SSHHandler:
         >>> for line in ssh.iter_lines("tail -f /var/log/syslog"):
         ...     print(line)
         """
-        self._ensure_connected()
-        chan = self._client.get_transport().open_session()
+        chan = self.transport.open_session(timeout=self.config.connect_timeout)
         if get_pty:
             chan.get_pty()
         # merge stderr into stdout so error messages and tools that log to
@@ -881,8 +1094,11 @@ class SSHHandler:
         def _do():
             pat = re.compile(match) if isinstance(match, str) else match
             matches, count = [], 0
-            fh = open(save_to, "a" if append else "w", encoding=encoding) \
-                if save_to else None
+            fh = None
+            if save_to:
+                target = os.path.abspath(os.path.expanduser(save_to))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                fh = open(target, "a" if append else "w", encoding=encoding)
             try:
                 for line in self.iter_lines(command, timeout=timeout,
                                             stop_event=stop_event, encoding=encoding,
@@ -965,7 +1181,12 @@ class SSHHandler:
                 f"$p=New-Object System.IO.Ports.SerialPort '{dev}',{int(baudrate)},"
                 "'None',8,'One';"
                 "$p.Encoding=[System.Text.Encoding]::UTF8;"
-                "$p.Open();"
+                # say so and stop if the port will not open — otherwise the loop
+                # below just spins on a closed port and the stream looks empty
+                "try{$p.Open()}catch{"
+                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue;"
+                "[Console]::Out.WriteLine('[serial] cannot open the port: '"
+                "+$_.Exception.Message);[Console]::Out.Flush();exit 2};"
                 "try{while($true){"
                 "if($p.BytesToRead -gt 0){"
                 "$s=$p.ReadExisting();[Console]::Out.Write($s);[Console]::Out.Flush()}"
@@ -973,7 +1194,8 @@ class SSHHandler:
                 "finally{try{$p.Close()}catch{};"
                 "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue}"
             )
-            cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
+            cmd = ("powershell -NoProfile -EncodedCommand "
+                   + self._ps_encode(_SERIAL_PS_TAG + ps))
         else:
             dev = shlex.quote(device)
             if configure:
@@ -1027,8 +1249,10 @@ class SSHHandler:
         PTY teardown also kills the process if the SSH link drops unexpectedly.
 
         ``force=True`` clears a stale holder of the port first (kills the tracked
-        PID and any other turbossh serial PowerShell), then retries — use it only
-        after the user confirms taking a port that's already in use.
+        PID and any other turbossh serial PowerShell — recognised by the tag our
+        serial scripts start with, so no unrelated PowerShell on that machine is
+        touched), then retries — use it only after the user confirms taking a
+        port that's already in use.
         """
         self._ensure_connected()
         is_windows = (mode == "windows" or
@@ -1038,7 +1262,7 @@ class SSHHandler:
             forceblock = (
                 "Get-CimInstance Win32_Process|Where-Object{"
                 "$_.Name -eq 'powershell.exe' -and $_.ProcessId -ne $PID -and "
-                "$_.CommandLine -like '*EncodedCommand*'}|ForEach-Object{"
+                "$_.CommandLine -like '*__TAG__*'}|ForEach-Object{"
                 "try{Stop-Process -Id $_.ProcessId -Force}catch{}};"
                 "Start-Sleep -Milliseconds 300;"
             ) if force else ""
@@ -1085,15 +1309,17 @@ class SSHHandler:
                     .replace("__RETRIES__", retries)
                     .replace("__DEV__", self._ps_sq(device))
                     .replace("__BAUD__", str(int(baudrate)))
-                    .replace("__SAFE__", safe))
-            cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
+                    .replace("__SAFE__", safe)
+                    .replace("__TAG__", _serial_ps_tag_b64()))
+            cmd = ("powershell -NoProfile -EncodedCommand "
+                   + self._ps_encode(_SERIAL_PS_TAG + ps))
         else:
             dev = shlex.quote(device)
             fk = f"fuser -k {dev} 2>/dev/null; " if force else ""
             cmd = (f"{fk}"
                    f"stty -F {dev} {int(baudrate)} raw -echo 2>/dev/null; "
                    f"cat {dev} & __r=$!; cat > {dev}; kill $__r 2>/dev/null")
-        chan = self._client.get_transport().open_session()
+        chan = self.transport.open_session(timeout=self.config.connect_timeout)
         # PTY -> stdin delivered interactively (input works). Wide so the remote
         # conpty doesn't hard-wrap the device's output.
         chan.get_pty(term="xterm", width=250, height=50)
@@ -1371,6 +1597,12 @@ class SSHHandler:
             try: chan.close()
             except Exception: pass
 
+        # The last attempt's ffmpeg is still running (closing an exec channel
+        # does not kill it on Windows) — release the camera before giving up.
+        try:
+            self.webcam_release(safe=True)
+        except Exception:
+            pass
         raise SSHConnectionError(
             "The remote camera opens, but no video frames came through over SSH "
             "(tried both a forwarded tunnel and stdout). That usually means another "
@@ -1393,28 +1625,40 @@ class SSHHandler:
 
     def sudo(self, command: str, password: Optional[Union[str, Secret]] = None,
              *, timeout: Optional[float] = None, check: bool = False,
-             safe: Optional[bool] = None):
-        """Run a command via ``sudo -S`` feeding the password on stdin."""
+             get_pty: bool = False, safe: Optional[bool] = None):
+        """Run a command via ``sudo -S``.
+
+        The password is sent only if — and when — sudo actually asks for it: sudo
+        is given a private prompt marker, and the password is written once that
+        marker appears. So on a root / NOPASSWD account, where sudo never asks,
+        the password is never written at all (it used to be typed into a PTY up
+        front, which echoed it into the command's output and fed it to the
+        command's own stdin). A rejected password fails promptly instead of
+        waiting forever on a second prompt.
+
+        ``get_pty=True`` is for hosts whose sudoers has ``requiretty``; stderr is
+        merged into stdout there. ``timeout`` defaults to ``command_timeout``.
+        If the command itself reads stdin and sudo did not prompt, redirect it
+        (``... < /dev/null``).
+        """
         pw = password if password is not None else self.config.password
         raw = pw.reveal() if isinstance(pw, Secret) else (pw or "")
 
         def _do():
-            self._ensure_connected()
-            full = f"sudo -S -p '' {command}"
-            self._emit(logging.INFO, f"$ sudo {command}")
-            start = time.time()
-            stdin, stdout, stderr = self._client.exec_command(full, timeout=timeout,
-                                                              get_pty=True)
-            if raw:
-                stdin.write(raw + "\n")
-                stdin.flush()
-            exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
-            result = CommandResult(f"sudo {command}", exit_code, out, err,
-                                   time.time() - start, host=self.config.host)
+            marker = f"[sudo-{os.urandom(6).hex()}]"
+            eff_timeout = timeout if timeout is not None else self.config.command_timeout
+            result = self._exec(
+                f"sudo -S -p '{marker}' {command}", timeout=eff_timeout,
+                get_pty=get_pty, environment=None, encoding="utf-8",
+                prompt=(marker.encode("ascii"), (raw + "\n").encode("utf-8")),
+                label=f"sudo {command}")
+            # the prompt marker is ours, not part of the command's output
+            result.stdout = result.stdout.replace(marker, "")
+            result.stderr = result.stderr.replace(marker, "")
+            lvl = logging.INFO if result.ok else logging.WARNING
+            self._emit(lvl, f"exit={result.exit_code} ({result.duration:.2f}s)")
             if check and not result.ok:
-                raise SSHCommandError(command, result)
+                raise SSHCommandError(f"sudo {command}", result)
             return result
 
         return self._guard("sudo", _do, safe=safe)
@@ -1435,11 +1679,50 @@ class SSHHandler:
     # SFTP — full operation surface
     # ------------------------------------------------------------------ #
     def sftp(self) -> paramiko.SFTPClient:
-        """Return the live SFTPClient (opened lazily, reused)."""
+        """Return the live SFTPClient (opened lazily, reused; reopened if the
+        SFTP subsystem channel died while the connection stayed up).
+
+        One SFTPClient must not be used from two threads at once — Paramiko can
+        hand one thread's reply to the other, which then waits forever. A worker
+        thread should open its own (``handler.client.open_sftp()``) and pass it
+        to :meth:`push` / :meth:`pull` as ``sftp=``.
+        """
         self._ensure_connected()
-        if self._sftp is None:
-            self._sftp = self._client.open_sftp()
-        return self._sftp
+        with self._conn_lock:
+            if self._sftp is not None:
+                chan = self._sftp.get_channel()
+                if chan is None or chan.closed:
+                    self._sftp = None
+            if self._sftp is None:
+                self._sftp = self._client.open_sftp()
+            return self._sftp
+
+    # How many symlinked folders deep a recursive walk follows. A link loop is
+    # normally caught by comparing real paths, but that relies on the server's
+    # realpath resolving links; this bounds the walk on servers where it doesn't.
+    _MAX_LINK_HOPS = 8
+
+    def _entry_kind(self, sftp, entry, path: str):
+        """``(kind, is_link)`` for a listdir_attr entry: kind is 'dir' or 'file'
+        after following a symlink (one extra stat), or None for a dangling link.
+        Tolerates servers that send no st_mode."""
+        mode = entry.st_mode
+        is_link = mode is not None and stat.S_ISLNK(mode)
+        if is_link:
+            try:
+                mode = sftp.stat(path).st_mode
+            except IOError:
+                return None, True
+        if mode is None:
+            return "file", is_link
+        return ("dir" if stat.S_ISDIR(mode) else "file"), is_link
+
+    @staticmethod
+    def _real_dir(sftp, path: str) -> str:
+        try:
+            return sftp.normalize(path)
+        except IOError:
+            return path
 
     @staticmethod
     def _rnorm(path: str) -> str:
@@ -1517,9 +1800,16 @@ class SSHHandler:
                            safe=safe)
 
     def rename(self, old: str, new: str, *, safe=None):
-        return self._guard("rename",
-                           lambda: self.sftp().posix_rename(self._rnorm(old),
-                                                            self._rnorm(new)), safe=safe)
+        def _do():
+            sftp, src, dst = self.sftp(), self._rnorm(old), self._rnorm(new)
+            try:
+                return sftp.posix_rename(src, dst)
+            except IOError:
+                # posix-rename is an OpenSSH extension; fall back to the plain
+                # SFTP rename for servers without it (a genuine failure — no
+                # permission, missing source — fails again here and is raised).
+                return sftp.rename(src, dst)
+        return self._guard("rename", _do, safe=safe)
 
     def chmod(self, path: str, mode: int, *, safe=None):
         return self._guard("chmod", lambda: self.sftp().chmod(self._rnorm(path), mode),
@@ -1558,31 +1848,54 @@ class SSHHandler:
             return len(data)
         return self._guard("write_text", _do, safe=safe)
 
-    def walk(self, remote_path: str):
-        """Generator like os.walk over a remote tree (dirpath, dirs, files)."""
+    def walk(self, remote_path: str, _seen: Optional[set] = None, _links: int = 0):
+        """Generator like os.walk over a remote tree (dirpath, dirs, files).
+        Symlinked directories are followed once (a link loop is not re-entered);
+        dangling links are skipped."""
         sftp = self.sftp()
         remote_path = self._rnorm(remote_path)
-        dirs, files = [], []
+        seen = set() if _seen is None else _seen
+        real = self._real_dir(sftp, remote_path)
+        if real in seen:
+            return
+        seen.add(real)
+        dirs, files, linked = [], [], set()
         for entry in sftp.listdir_attr(remote_path):
-            (dirs if stat.S_ISDIR(entry.st_mode) else files).append(entry.filename)
+            kind, is_link = self._entry_kind(
+                sftp, entry, posixpath.join(remote_path, entry.filename))
+            if kind == "dir":
+                if is_link and _links >= self._MAX_LINK_HOPS:
+                    continue                # a link loop the server didn't resolve
+                dirs.append(entry.filename)
+                if is_link:
+                    linked.add(entry.filename)
+            elif kind == "file":
+                files.append(entry.filename)
         yield remote_path, dirs, files
         for d in dirs:
-            yield from self.walk(posixpath.join(remote_path, d))
+            yield from self.walk(posixpath.join(remote_path, d), seen,
+                                 _links + (1 if d in linked else 0))
 
     # ------------------------------------------------------------------ #
     # Push / Pull (SFTP) with TransferResult
     # ------------------------------------------------------------------ #
     def push(self, local_path: str, remote_path: str, *, recursive: bool = False,
-             make_dirs: bool = True, callback=None, safe: Optional[bool] = None):
-        """Upload a file or directory (SFTP). Returns TransferResult."""
+             make_dirs: bool = True, callback=None, sftp=None,
+             safe: Optional[bool] = None):
+        """Upload a file or directory (SFTP). Returns TransferResult.
+
+        ``callback(bytes_done, bytes_total)`` is called per file as it moves;
+        raising from it aborts the transfer. ``sftp`` lets a worker thread use
+        its own SFTP client instead of the shared one (see :meth:`sftp`)."""
         return self._guard("push", self._push, local_path, remote_path,
                            recursive=recursive, make_dirs=make_dirs,
-                           callback=callback, safe=safe)
+                           callback=callback, sftp=sftp, safe=safe)
 
-    def _push(self, local_path, remote_path, *, recursive, make_dirs, callback):
+    def _push(self, local_path, remote_path, *, recursive, make_dirs, callback,
+              sftp=None):
         local_path = os.path.expanduser(local_path)
         remote_path = self._rnorm(remote_path)
-        sftp = self.sftp()
+        sftp = sftp or self.sftp()
         if not os.path.exists(local_path):
             raise SSHTransferError(f"Local path does not exist: {local_path}")
         start = time.time()
@@ -1626,16 +1939,34 @@ class SSHHandler:
         return total, count
 
     def pull(self, remote_path: str, local_path: str, *, recursive: bool = False,
-             make_dirs: bool = True, callback=None, safe: Optional[bool] = None):
-        """Download a file or directory (SFTP). Returns TransferResult."""
+             make_dirs: bool = True, callback=None, sftp=None,
+             safe: Optional[bool] = None):
+        """Download a file or directory (SFTP). Returns TransferResult.
+
+        ``callback`` and ``sftp`` work as in :meth:`push`. A file that fails or is
+        aborted part-way is removed rather than left half-written."""
         return self._guard("pull", self._pull, remote_path, local_path,
                            recursive=recursive, make_dirs=make_dirs,
-                           callback=callback, safe=safe)
+                           callback=callback, sftp=sftp, safe=safe)
 
-    def _pull(self, remote_path, local_path, *, recursive, make_dirs, callback):
+    def _get_file(self, sftp, remote_path, local_path, callback) -> None:
+        """sftp.get that never leaves a partial / empty local file behind."""
+        existed = os.path.exists(local_path)
+        try:
+            sftp.get(remote_path, local_path, callback=callback)
+        except BaseException:
+            if not existed and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+            raise
+
+    def _pull(self, remote_path, local_path, *, recursive, make_dirs, callback,
+              sftp=None):
         remote_path = self._rnorm(remote_path)
         local_path = os.path.expanduser(local_path)
-        sftp = self.sftp()
+        sftp = sftp or self.sftp()
         start = time.time()
         # Verify the remote path exists FIRST, so a missing source never leaves
         # behind an empty local file (sftp.get opens the local file before fetch).
@@ -1653,17 +1984,7 @@ class SSHHandler:
                     if parent and not os.path.exists(parent):
                         os.makedirs(parent, exist_ok=True)
                 self._emit(logging.INFO, f"PULL {remote_path} -> {local_path}")
-                existed = os.path.exists(local_path)
-                try:
-                    sftp.get(remote_path, local_path, callback=callback)
-                except BaseException:
-                    # don't leave a partial/empty local file behind on failure
-                    if not existed and os.path.exists(local_path):
-                        try:
-                            os.remove(local_path)
-                        except OSError:
-                            pass
-                    raise
+                self._get_file(sftp, remote_path, local_path, callback)
                 size, count = os.path.getsize(local_path), 1
         except SSHTransferError:
             raise
@@ -1673,20 +1994,35 @@ class SSHHandler:
         return TransferResult(remote_path, local_path, "pull", "sftp", size,
                               time.time() - start, count)
 
-    def _pull_dir(self, sftp, remote_dir, local_dir, callback):
+    def _pull_dir(self, sftp, remote_dir, local_dir, callback, _seen=None,
+                  _links=0):
+        seen = set() if _seen is None else _seen
+        real = self._real_dir(sftp, remote_dir)
+        if real in seen:                    # a symlink loop: already copied
+            return 0, 0
+        seen.add(real)
         os.makedirs(local_dir, exist_ok=True)
         total, count = 0, 0
         for entry in sftp.listdir_attr(remote_dir):
             rpath = posixpath.join(remote_dir, entry.filename)
             lpath = os.path.join(local_dir, entry.filename)
-            if stat.S_ISDIR(entry.st_mode):
-                s, c = self._pull_dir(sftp, rpath, lpath, callback)
+            kind, is_link = self._entry_kind(sftp, entry, rpath)
+            if kind is None:
+                self._emit(logging.WARNING, f"Skipping dangling link {rpath}")
+            elif kind == "dir":
+                hops = _links + (1 if is_link else 0)
+                if hops > self._MAX_LINK_HOPS:
+                    self._emit(logging.WARNING,
+                               f"Skipping {rpath}: too many nested symlinked "
+                               f"folders (a link loop?)")
+                    continue
+                s, c = self._pull_dir(sftp, rpath, lpath, callback, seen, hops)
                 total += s
                 count += c
             else:
                 self._emit(logging.INFO, f"PULL {rpath} -> {lpath}")
-                sftp.get(rpath, lpath, callback=callback)
-                total += entry.st_size or 0
+                self._get_file(sftp, rpath, lpath, callback)
+                total += os.path.getsize(lpath)
                 count += 1
         return total, count
 
@@ -1711,9 +2047,15 @@ class SSHHandler:
         """Upload via the SCP protocol (alternative to SFTP push)."""
         def _do():
             start = time.time()
-            with self._scp_client(callback) as scp:
-                scp.put(os.path.expanduser(local_path), remote_path,
-                        recursive=recursive)
+            try:
+                with self._scp_client(callback) as scp:
+                    scp.put(os.path.expanduser(local_path), remote_path,
+                            recursive=recursive)
+            except SSHTransferError:
+                raise
+            except Exception as exc:
+                raise SSHTransferError(f"SCP push {local_path} -> {remote_path} "
+                                       f"failed: {exc}") from exc
             size = (os.path.getsize(os.path.expanduser(local_path))
                     if os.path.isfile(os.path.expanduser(local_path)) else 0)
             return TransferResult(local_path, remote_path, "push", "scp", size,
@@ -1725,9 +2067,15 @@ class SSHHandler:
         """Download via the SCP protocol (alternative to SFTP pull)."""
         def _do():
             start = time.time()
-            with self._scp_client(callback) as scp:
-                scp.get(remote_path, os.path.expanduser(local_path),
-                        recursive=recursive)
+            try:
+                with self._scp_client(callback) as scp:
+                    scp.get(remote_path, os.path.expanduser(local_path),
+                            recursive=recursive)
+            except SSHTransferError:
+                raise
+            except Exception as exc:
+                raise SSHTransferError(f"SCP pull {remote_path} -> {local_path} "
+                                       f"failed: {exc}") from exc
             lp = os.path.expanduser(local_path)
             size = os.path.getsize(lp) if os.path.isfile(lp) else 0
             return TransferResult(remote_path, local_path, "pull", "scp", size,

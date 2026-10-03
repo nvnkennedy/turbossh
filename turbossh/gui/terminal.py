@@ -25,6 +25,7 @@ class ReaderThread(QThread):
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._cap = cap
+        self._dropped = 0             # bytes discarded since take_dropped()
 
     def run(self):
         while self._alive:
@@ -37,8 +38,10 @@ class ReaderThread(QThread):
             if chunk:
                 with self._lock:
                     self._buf += chunk
-                    if len(self._buf) > self._cap:    # keep only the latest data
-                        del self._buf[:-self._cap]
+                    over = len(self._buf) - self._cap
+                    if over > 0:                      # keep only the latest data
+                        del self._buf[:over]
+                        self._dropped += over
             else:
                 self.msleep(15)
         self.closed.emit()
@@ -52,12 +55,21 @@ class ReaderThread(QThread):
             del self._buf[:maxn]
             return data
 
+    def take_dropped(self) -> int:
+        """Bytes discarded because the backlog hit its cap, since the last call —
+        so the terminal can show that output was skipped instead of hiding it."""
+        with self._lock:
+            n, self._dropped = self._dropped, 0
+            return n
+
     def flush(self):
         """Drop any buffered-but-not-yet-shown bytes. Called on Ctrl-C so a flood
         of output (slog2info -w etc.) stops draining immediately instead of
-        trickling out for seconds after the command was interrupted."""
+        trickling out for seconds after the command was interrupted. (That is the
+        user's own choice, so it is not reported as skipped output.)"""
         with self._lock:
             self._buf.clear()
+            self._dropped = 0
 
     def stop(self):
         self._alive = False

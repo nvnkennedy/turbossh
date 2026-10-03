@@ -2,6 +2,143 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 1.7.0 — 2026-10-04
+
+A review-driven hardening pass across the library, CLI and GUI, plus the
+features TurboADB already had: a dual-pane file browser with transfer history,
+a local terminal, toasts, log colouring and search, more themes, and a complete
+CLI reference.
+
+### Added — GUI
+- **Dual-pane file browser.** This PC on the left, the remote host on the right:
+  arrow buttons, drag-and-drop between the panes and in from Explorer, column
+  sorting (folders stay first), rename / delete / new folder on both sides
+  (local deletes go to the recycle bin), quick-jump buttons.
+- **Transfers panel** with the history of every upload and download: progress,
+  live speed, time left, status filter, cancel, retry failed, and a copyable
+  report.
+- **Edit remote files in place** — double-click a remote text file; line endings,
+  encoding and permissions are kept. Binary and very large files are refused.
+- **Local terminal** tab: PowerShell or Command Prompt on Windows (with line
+  editing, history, and Ctrl-C that stops the running command), your shell on a
+  real pty elsewhere. Ctrl+Shift+L.
+- **Toasts** for connected / disconnected / failed / transfer finished, and a
+  count of open sessions in the status bar.
+- **Logs tab:** lines coloured by level, and find-in-log (Ctrl+F, F3 / Shift+F3,
+  match case).
+- **Seven more themes:** midnight, paper, nord, nord-light, solarized-dark,
+  solarized-light, dracula. The toggle switches between each dark theme and its
+  light partner.
+
+### Added — CLI
+- `--session NAME` (`-s`) on every connecting command: use a session saved in the
+  GUI — host, user, key, jump host and stored passwords.
+- Connection flags `--jump-host` / `--jump-user` / `--jump-port`,
+  `--host-key-policy`, `--legacy`, `--passwordless`.
+- New commands: `sudo`, `ls`, `copy-id`, `keygen`, `diagnose`, `sessions`,
+  `check-update`, and `gui` / `docs` / `shortcut` / `version` (the separate entry
+  points still work).
+- **`CLI.md`** — the full reference. A test compares it with the parser, and
+  another runs every command, so the two cannot drift apart.
+
+### Fixed — library
+- **Command timeouts are enforced, and large output no longer deadlocks.**
+  `run()` waited for the exit status before reading, which never times out and
+  hangs once output exceeds the SSH channel window (~2 MB). Output is now drained
+  while waiting; on timeout `SSHTimeoutError.result` holds what was printed.
+- **`sudo()` only sends the password when sudo asks for it.** It was typed into a
+  PTY up front, so on root / NOPASSWD accounts it was echoed into the result and
+  fed to the command's stdin. A wrong password now fails promptly. `get_pty=True`
+  is available for `requiretty` hosts; `timeout` defaults to `command_timeout`.
+- **Jump hosts:** one jump connection is reused per connect (a failed attempt no
+  longer leaves one open), each auth attempt gets its own channel, and a wrong
+  target password is reported as an authentication error instead of a "banner"
+  error after three retries. The failure hint no longer probes ports from the
+  local machine for a jump-only target.
+- Two `forward_remote()` tunnels on one connection no longer steal each other's
+  connections; a local forward on a busy port fails on Windows instead of
+  silently sharing it.
+- A handshake cut off by the peer (`EOFError`) is a normal, retried connection
+  error. Concurrent callers reconnect once, not once each.
+- `sftp()` reopens a dead SFTP channel; `rename()` falls back to plain rename on
+  servers without the OpenSSH extension; recursive `pull()` / `walk()` follow
+  symlinked folders (once) and skip dangling links; a failed or aborted file in a
+  recursive pull is removed. `push()` / `pull()` accept `sftp=` for worker threads.
+- Taking a busy remote COM port with `force=True` now only stops TurboSSH's own
+  serial readers, not every `powershell -EncodedCommand` on that machine. A
+  remote port that cannot be opened is reported instead of streaming nothing.
+- `enable_legacy_algorithms` applies to that connection only (Paramiko ≥ 3.2)
+  and only offers algorithms the installed Paramiko implements.
+- The library no longer attaches its own log handlers or changes shared logger
+  levels; FTP and serial log under `turbossh.*` too.
+- Serial errors are `SerialError` (an `SSHError`), not raw pyserial exceptions.
+- `strip_ansi` removes charset designations (no more stray `(B`); 
+  `CommandResult.started_at` is the start time.
+- WinRM: the firewall rule follows a changed SSH port, `sshd_config` gets exactly
+  one `Port` line, and the fallback upload reuses one shell.
+
+### Fixed — GUI
+- **The terminal gets its keys.** Ctrl+W no longer closes the tab, Ctrl+Q no
+  longer quits, Ctrl+S / Ctrl+T no longer open dialogs, Ctrl+N works again (it was
+  registered twice). F5–F12, Insert, Shift+Tab, Alt+key, modified arrows and
+  application-cursor mode are encoded as xterm does.
+- **Key-based login works from the GUI** — a blank password field now means "use
+  my keys / agent", as the dialog always said — and sessions have a key-file field.
+- **Full-screen programs** (vim, less, htop) restore the screen on exit
+  (alternate screen), and cursor-position queries are answered.
+- **Speed:** terminal parsing is ~16× faster and bounded per frame, painting
+  draws runs instead of cells, and skipped output is announced.
+- Mouse selection, double-click word select, Ctrl+C copies a selection, Ctrl+wheel
+  zoom, Shift+PageUp/Down. Paste sends CR, honours bracketed paste, asks before
+  running several lines, and is no longer cut off at 32 KB. "Clear" keeps the
+  scrollback.
+- Closed tabs are deleted (each kept its scrollback and timers alive); reconnects
+  and camera scans close the connection they replace.
+- Nothing network-bound runs on the GUI thread any more: OS detection, opening and
+  releasing the serial bridge, SFTP operations, shortcut creation, recording
+  finalisation. Quitting waits briefly for remote ports / cameras to be released.
+- Local serial echo no longer lags by up to a second; an unplugged port is reported.
+- Connection news goes to the status bar, not one modal box per tab.
+- Split view: Copy / Paste / Save / SFTP / Logs / close act on the focused pane.
+- **SFTP browser:** folders and multiple files, progress and cancel, drag-and-drop
+  upload, size / date / permission columns, symlinked folders, recursive delete,
+  overwrite prompts, and no more acting on the wrong folder after a failed listing.
+- **Camera:** the remote view no longer stops at the first 100 ms pause on
+  Python ≥ 3.10; a local camera that fails is reported; switching source during a
+  scan no longer crashes; a failed recording is not reported as saved.
+- **ffmpeg** is downloaded and uploaded atomically, size-checked, hash-recorded,
+  and can be pinned (`ffmpeg_sha256` setting / `TURBOSSH_FFMPEG_SHA256`).
+- Sessions and settings are written atomically; an unreadable file is copied
+  aside and reported instead of being overwritten. Renaming a session moves it
+  (and its stored passwords); a duplicate name asks first.
+- The updater waits for the app to exit, upgrades the interpreter that owns the
+  install to the exact version, and verifies the result.
+- One non-modal error popup however many errors; worker-thread errors are logged.
+
+### Changed
+- `allow_empty_password` now only adds the blank-password attempt when **no**
+  password was supplied. A rejected password is one failed login, not two.
+- `winrm_use_ssl` now validates the server certificate; set
+  `winrm_verify_ssl=False` (or `verify_ssl=False`) for a self-signed listener.
+- CLI: `-V/--version`; `--password-stdin` and `TURBOSSH_PASSWORD`; `--json` for
+  `list-serial`, `scan-ports` and `camera-list`; Ctrl+C exits 130; expected errors
+  print a message instead of a traceback; `store-credential --host` stores per
+  host (the old user-only entry is still read). Importing `turbossh.cli` (and so
+  `turbossh-gui`) no longer loads Paramiko.
+- Window shortcuts that must work while a terminal has focus are Ctrl+Shift+T
+  (new session) and Ctrl+Shift+W (close tab).
+- Desktop / Start-Menu shortcuts are created on first run only and found even
+  when Desktop is redirected to OneDrive.
+- The elevated OpenSSH setup is staged in a fresh folder per run.
+- `TURBOSSH_HOME` relocates the state folder (default `~/.turbossh`).
+- Terminal captures are capped at 256 MB per session.
+
+### Added
+- A pytest suite with a loopback SSH/SFTP server and headless Qt; CI runs it on
+  Linux and Windows, plus GUI and Python 3.8 jobs.
+- `scripts/release.py` checks the changelog, requires the bundled exe in the
+  wheel, and restores the version if a step fails.
+
 ## 1.6.0 — 2026-07-06
 
 ### Changed

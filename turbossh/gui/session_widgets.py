@@ -1,11 +1,11 @@
-"""Session tab widgets: an SSH tab (interactive terminal + SFTP browser split)
-and a Serial tab (interactive serial console). Each connects in a background
-thread so the UI never blocks."""
+"""Session tab widgets: an SSH tab (interactive terminal + SFTP browser + logs)
+and a Serial tab (interactive serial console). Everything that touches the
+network or a port — connecting, probing, opening the serial bridge, releasing it,
+disconnecting — runs off the GUI thread, so the window never blocks."""
 
 from __future__ import annotations
 
 import socket
-import threading
 import time
 
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
@@ -16,78 +16,95 @@ from ..config import SSHConfig
 from ..core import SSHHandler
 from ..serial_handler import SerialHandler
 from ..results import OperationResult
+from . import qtutil
 from .terminal import ReaderThread
 from .vt100 import Vt100Terminal
-from .sftp_browser import SftpBrowser
+from .file_browser import FileBrowser
 from .logs_tab import LogsTab
-
-
-# Connect QThreads that outlive their widget (the tab was closed before the
-# connection finished) are parked here so the QThread C++ object isn't deleted
-# while still running — which aborts the app with "QThread: Destroyed while thread
-# is still running". They're dropped from the set as soon as they finish.
-_PENDING_THREADS: set = set()
-
-
-def _park_thread(thread):
-    """Detach a still-running connect thread from its (closing) widget: silence
-    its result signals and keep a reference until it finishes on its own."""
-    if thread is None:
-        return
-    for name in ("ok", "fail"):
-        sig = getattr(thread, name, None)
-        if sig is not None:
-            try:
-                sig.disconnect()
-            except Exception:
-                pass
-    if thread.isRunning():
-        _PENDING_THREADS.add(thread)
-        thread.finished.connect(lambda: _PENDING_THREADS.discard(thread))
 
 
 def config_from_session(s: dict, password: str, jump_password: str) -> SSHConfig:
     policy = "ignore" if s.get("ignore_hostkey", True) else "auto"
+    # A blank password field means "no password" — pass None, not "". With None
+    # the handler tries the key file, the agent and the default keys, and only
+    # then a blank-password login. Passing "" told it to send an empty password
+    # and switched key lookup OFF, although the dialog says to leave the field
+    # blank for key logins — so key-based login from the GUI could never work.
     jump = None
     if s.get("use_jump") and s.get("jhost"):
         jump = SSHConfig(host=s["jhost"], port=s.get("jport", 22),
                          username=s.get("juser") or None,
-                         domain=s.get("jdomain") or None, password=jump_password,
+                         domain=s.get("jdomain") or None,
+                         password=jump_password or None,
                          host_key_policy=policy,
                          enable_legacy_algorithms=s.get("legacy", False))
     return SSHConfig(
         host=s.get("host", ""), port=s.get("port", 22),
         username=s.get("user") or None, domain=s.get("domain") or None,
-        password=password, jump_host=jump, host_key_policy=policy,
+        password=password or None, key_filename=s.get("key_file") or None,
+        jump_host=jump, host_key_policy=policy,
         enable_legacy_algorithms=s.get("legacy", False),
     )
+
+
+def _engine_log(signal, name: str):
+    """A log_callback that forwards the handler's own log lines (connect, each
+    command, errors) to the GUI log. They used to go to stderr only, which a
+    windowed app does not have. DEBUG chatter is left out."""
+    def forward(message: str):
+        if not message.startswith("[DEBUG]"):
+            signal.emit(f"{message}  ({name})")
+    return forward
+
+
+def _close_handler(handler):
+    """Close a handler nobody is waiting for any more, off the GUI thread."""
+    if handler is not None:
+        closer = getattr(handler, "disconnect", None) or getattr(handler, "close", None)
+        if closer is not None:
+            qtutil.run_teardown(closer, "close-orphan")
 
 
 class _SshConnectThread(QThread):
     ok = pyqtSignal(object, object)     # handler, shell
     fail = pyqtSignal(str)
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, log_callback=None):
         super().__init__()
         self.cfg = cfg
+        self._log = log_callback
 
     def run(self):
+        h = None
         try:
-            h = SSHHandler(self.cfg, safe=True)
+            h = SSHHandler(self.cfg, safe=True, quiet=True, log_callback=self._log)
             res = h.connect()
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error)); return
             sh = h.open_shell()
             shell = sh.value if isinstance(sh, OperationResult) else sh
+            # Probe the remote OS HERE: it costs one or two round trips, and the
+            # welcome banner and the Logs tab then read the cached answer instead
+            # of running commands on the GUI thread.
+            try:
+                h.detect_os()
+            except Exception:
+                pass
             self.ok.emit(h, shell)
         except Exception as exc:
+            if h is not None:
+                try:
+                    h.disconnect()
+                except Exception:
+                    pass
             self.fail.emit(f"{type(exc).__name__}: {exc}")
 
 
 class SshSessionWidget(QWidget):
     log = pyqtSignal(str)
     connected = pyqtSignal(bool, str)        # ok, message  -> main window status
-    failed = pyqtSignal(str)                 # error message -> main window popup
+    failed = pyqtSignal(str)                 # error message -> main window status
+    notify = pyqtSignal(str, str)            # text, kind   -> main window toast
 
     def __init__(self, session: dict, password: str, jump_password: str, parent=None):
         super().__init__(parent)
@@ -95,6 +112,8 @@ class SshSessionWidget(QWidget):
         self.handler = None
         self.shell = None
         self.reader = None
+        self._ct = None
+        self._closed = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
@@ -156,31 +175,39 @@ class SshSessionWidget(QWidget):
         self._connect()
 
     def _connect(self):
-        self._ct = _SshConnectThread(self._cfg)
+        self._ct = _SshConnectThread(
+            self._cfg, _engine_log(self.log, self.session.get("name", "")))
         self._ct.ok.connect(self._on_connected)
         self._ct.fail.connect(self._on_reconnect_fail if self._reconnecting
                               else self._on_fail)
         self._ct.start()
 
+    def _drop_reader(self):
+        """Stop the current reader without waiting on the GUI thread. It is
+        parked, so it can finish on its own and is never destroyed mid-run."""
+        reader, self.reader = self.reader, None
+        if reader is not None:
+            reader.stop()
+            qtutil.park_thread(reader)
+
     def _on_connected(self, handler, shell):
+        if self._closed:                   # the tab was closed while connecting
+            _close_handler(handler)
+            return
         # re-entrant: this also runs on a successful auto/Ctrl-R reconnect, so
-        # tear down any previous reader first and clear the reconnect state.
+        # tear down the previous connection's pieces first.
         was_reconnect = self._reconnecting
         self._reconnecting = False
         self._reconnect_until = 0.0
         self.term.reconnect_armed = False
-        if self.reader:
-            try:
-                self.reader.closed.disconnect()   # don't let the old one re-trigger
-            except Exception:
-                pass
-            try:
-                self.reader.stop(); self.reader.wait(1000)
-            except Exception:
-                pass
-            self.reader = None
+        self._drop_reader()
+        previous = self.handler
         self.handler = handler
         self.shell = shell
+        if previous is not None and previous is not handler:
+            # a reconnect made a NEW handler; the old one (and its jump host
+            # connection) used to be left open for the life of the app
+            _close_handler(previous)
         if shell is None:
             self._on_fail("Connected, but the interactive shell could not open.")
             return
@@ -210,7 +237,8 @@ class SshSessionWidget(QWidget):
         self.reader = ReaderThread(read_fn)
         self.reader.closed.connect(self._on_disconnected)
         self.reader.start()
-        self.term.set_source(self.reader.pull)        # GUI drains on a timer
+        # the GUI drains on a timer, and is told when output had to be skipped
+        self.term.set_source(self.reader.pull, self.reader.take_dropped)
         # keyboard Ctrl-C should also drop the buffered flood, not just the button
         self.term.on_interrupt = lambda: self.reader.flush() if self.reader else None
         try:
@@ -225,14 +253,29 @@ class SshSessionWidget(QWidget):
 
         # populate the SFTP tab — never let an SFTP error break the session
         try:
-            browser = SftpBrowser(handler)
+            browser = FileBrowser(handler)        # local | remote + transfers
             browser.log.connect(self.log)
+            browser.notify.connect(self.notify)
             idx = self.inner.indexOf(self.sftp_page)
             self.inner.removeTab(idx)
+            self._discard_sftp_page()
             self.sftp_page = browser
             self.inner.insertTab(idx, browser, "SFTP")
         except Exception as exc:
             self.log.emit(f"[ERROR] SFTP browser unavailable: {exc}")
+
+    def _discard_sftp_page(self):
+        """Close and delete the page that is being replaced (removeTab only
+        hides it — on every reconnect one more browser used to be left behind)."""
+        old = self.sftp_page
+        closer = getattr(old, "close_browser", None)
+        if closer is not None:
+            try:
+                closer()
+            except Exception:
+                pass
+        old.setParent(None)
+        old.deleteLater()
 
     def _on_disconnected(self):
         # reader signals this when the channel drops. Unless the user is closing
@@ -280,14 +323,16 @@ class SshSessionWidget(QWidget):
 
     def _on_fail(self, msg):
         self.status.setText("Connect failed")
-        self.term.feed(f"\n[connect failed] {msg}\n".encode())
+        self.term.feed(f"\r\n\x1b[31m[connect failed]\x1b[0m {msg}\r\n".encode())
         self.log.emit(f"[ERROR] {self.session['name']}: {msg}")
         self.failed.emit(f"{self.session.get('name')}: {msg}")
 
     def _send(self, data: bytes):
         try:
             if self.shell:
-                self.shell.channel.send(data)
+                # sendall: send() may take only part of a large write (a long
+                # paste was silently cut off at the SSH packet size)
+                self.shell.channel.sendall(data)
         except Exception as exc:
             self.log.emit(f"[ERROR] send: {exc}")
 
@@ -306,10 +351,8 @@ class SshSessionWidget(QWidget):
         C, R, G, Y, B, D = ("\x1b[36m", "\x1b[0m", "\x1b[32m", "\x1b[33m",
                             "\x1b[1m", "\x1b[90m")
         extra = f"{Y}  via {s.get('jhost')}{R}" if (s.get("use_jump") and s.get("jhost")) else ""
-        try:
-            osname = self.handler.detect_os()
-        except Exception:
-            osname = ""
+        # the connect thread already probed the OS; this never hits the network
+        osname = self.handler.known_os or ""
         meta = "  ·  ".join(x for x in (osname, time.strftime("%Y-%m-%d %H:%M:%S")) if x)
         line1 = f"{C}●{R} {B}{name}{R}  {G}{user}@{host}:{port}{R}{extra}"
         line2 = f"{D}  {meta}{R}"
@@ -340,30 +383,32 @@ class SshSessionWidget(QWidget):
             self.term.setFocus()
 
     def close_session(self):
+        """Shut the session down. Never waits on the GUI thread, and leaves
+        nothing that could call back into this widget (it is deleted next)."""
+        if self._closed:
+            return
+        self._closed = True
         self._user_closed = True          # stop any auto-reconnect
         self._reconnecting = False
-        # if a connect is still in flight, detach it so it can't call back into
-        # this (now-closing) widget and can't be deleted while still running
-        _park_thread(getattr(self, "_ct", None))
+        # a connect still in flight: let it finish, then close what it opened
+        qtutil.park_thread(self._ct, orphan={"ok": lambda h, _shell: _close_handler(h)})
         try:
             self.logs_tab.close_tab()
         except Exception:
             pass
-        if self.reader:
+        self._drop_reader()
+        closer = getattr(self.sftp_page, "close_browser", None)
+        if closer is not None:
             try:
-                self.reader.closed.disconnect()
+                closer()
             except Exception:
                 pass
-            self.reader.stop(); self.reader.wait(1000)
         try:
             self.term.cleanup()
         except Exception:
             pass
-        if self.handler:
-            try:
-                self.handler.disconnect()
-            except Exception:
-                pass
+        handler, self.handler, self.shell = self.handler, None, None
+        _close_handler(handler)
 
 
 class _SerialConnectThread(QThread):
@@ -376,7 +421,10 @@ class _SerialConnectThread(QThread):
 
     def run(self):
         try:
-            h = SerialHandler(self.device, baudrate=self.baud, safe=True)
+            # a short read timeout: the reader asks for whatever has arrived, and
+            # this bounds how long it takes to notice the tab was closed
+            h = SerialHandler(self.device, baudrate=self.baud, safe=True,
+                              quiet=True, timeout=0.1)
             res = h.open()
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error)); return
@@ -392,14 +440,16 @@ class _SerialSshConnectThread(QThread):
     ok = pyqtSignal(object, bool)       # handler, busy
     fail = pyqtSignal(str)
 
-    def __init__(self, cfg, device):
+    def __init__(self, cfg, device, log_callback=None):
         super().__init__()
         self.cfg = cfg
         self.device = device
+        self._log = log_callback
 
     def run(self):
+        h = None
         try:
-            h = SSHHandler(self.cfg, safe=True)
+            h = SSHHandler(self.cfg, safe=True, quiet=True, log_callback=self._log)
             res = h.connect()
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error)); return
@@ -410,50 +460,12 @@ class _SerialSshConnectThread(QThread):
                 busy = False
             self.ok.emit(h, busy)
         except Exception as exc:
+            if h is not None:
+                try:
+                    h.disconnect()
+                except Exception:
+                    pass
             self.fail.emit(f"{type(exc).__name__}: {exc}")
-
-
-class _SerialStreamThread(threading.Thread):
-    """Runs handler.serial_stream() on a background thread and buffers every line
-    so the GUI can drain it on a timer (no per-line signal flooding). Mirrors the
-    working 1.5.0 'script' approach: a line-buffered exec channel reading the
-    remote serial port — COMx via PowerShell, /dev/* via stty+cat (auto)."""
-
-    def __init__(self, handler, device, baud):
-        super().__init__(daemon=True)
-        self.handler = handler
-        self.device = device
-        self.baud = int(baud)
-        self._buf = bytearray()
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self.error = None
-
-    def _on_line(self, line: str):
-        with self._lock:
-            self._buf.extend((line + "\r\n").encode("utf-8", "replace"))
-            if len(self._buf) > 4 * 1024 * 1024:        # cap at 4MB
-                del self._buf[:len(self._buf) - 4 * 1024 * 1024]
-
-    def pull(self, maxn=262144):
-        with self._lock:
-            if not self._buf:
-                return b""
-            chunk = bytes(self._buf[:maxn])
-            del self._buf[:maxn]
-            return chunk
-
-    def run(self):
-        try:
-            self.handler.serial_stream(self.device, baudrate=self.baud,
-                                       mode="auto", on_line=self._on_line,
-                                       clean=True, stop_event=self._stop)
-        except Exception as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
-            self._on_line(f"[serial stream ended] {self.error}")
-
-    def stop(self):
-        self._stop.set()
 
 
 class SerialSessionWidget(QWidget):
@@ -471,8 +483,9 @@ class SerialSessionWidget(QWidget):
         self.handler = None
         self.shell = None
         self.reader = None
-        self.stream_thread = None
         self.bridge_chan = None        # raw SSH channel for native serial-over-SSH
+        self._jobs: set = set()        # worker threads (bridge open)
+        self._closed = False
 
         lay = QVBoxLayout(self); lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
         self.status = QLabel("Opening…")
@@ -505,7 +518,9 @@ class SerialSessionWidget(QWidget):
 
         if self.via_ssh:
             cfg = config_from_session(session, password, jump_password)
-            self._ct = _SerialSshConnectThread(cfg, session.get("device", "/dev/ser1"))
+            self._ct = _SerialSshConnectThread(
+                cfg, session.get("device", "/dev/ser1"),
+                _engine_log(self.log, session.get("name", "")))
             self._ct.ok.connect(self._on_ssh_ok)
             self._ct.fail.connect(self._on_fail)
             self._ct.start()
@@ -516,31 +531,56 @@ class SerialSessionWidget(QWidget):
             self._ct.fail.connect(self._on_fail)
             self._ct.start()
 
+    def _start_reader(self, read_fn):
+        self.reader = ReaderThread(read_fn)
+        # the port going away (unplugged, bridge ended, link dropped) used to
+        # leave the tab silently showing "Open"
+        self.reader.closed.connect(self._on_port_closed)
+        self.reader.start()
+        self.term.set_source(self.reader.pull, self.reader.take_dropped)
+        self.term.setFocus()
+
+    def _on_port_closed(self):
+        if self._closed:
+            return
+        dev = self.session.get("device", "the port")
+        self.status.setText(f"{dev} — closed")
+        self.term.feed(f"\r\n\x1b[31m[{dev} closed — the port was unplugged or the "
+                       f"link dropped; reopen the session to continue]\x1b[0m\r\n"
+                       .encode("utf-8"))
+        self.log.emit(f"[WARN] serial {dev} closed")
+        self.connected.emit(False, f"Serial {dev} closed")
+
     # --- local serial (native interactive) ---
     def _on_open_local(self, handler):
+        if self._closed:
+            _close_handler(handler)
+            return
         self.handler = handler
         dev = self.session.get("device")
         self.status.setText(f"Open — {dev} @ {self.session.get('baud')}")
         self.log.emit(f"[OK] serial {dev} open")
         self.connected.emit(True, f"Serial {dev} open")
         self._serial_banner(dev, self.session.get("baud"), False)
-        ser = handler._require()
 
         def read_fn():
+            # read_available returns what has arrived as soon as it arrives.
+            # (ser.read(4096) waited for 4096 bytes or the whole timeout, so
+            # every keystroke echoed up to a second late.)
             try:
-                return ser.read(4096)
+                return handler.read_available()
             except Exception:
                 return None
 
-        self.reader = ReaderThread(read_fn)
-        self.reader.start()
-        self.term.set_source(self.reader.pull)
-        self.term.setFocus()
+        self._start_reader(read_fn)
 
     # --- serial over SSH: a NATIVE, bidirectional bridge (char-by-char, Tab
     #     completion, Ctrl-C all work). Keystrokes -> raw SSH channel -> port;
     #     port -> channel -> terminal. Closing the channel releases the port.
     def _on_ssh_ok(self, handler, busy=False):
+        if self._closed:
+            _close_handler(handler)
+            return
         self.handler = handler
         dev = self.session.get("device", "/dev/ser1")
         baud = self.session.get("baud", 115200)
@@ -559,12 +599,25 @@ class SerialSessionWidget(QWidget):
                 self.failed.emit(f"{self.session.get('name')}: {dev} in use")
                 return
             force = True
-        try:
-            chan = handler.serial_bridge(dev, baudrate=int(baud), mode="auto",
-                                         force=force)
-        except Exception as exc:
-            self._on_fail(f"could not open serial bridge: {exc}")
+        self.status.setText(f"Opening {dev} on {self.session.get('host')}…")
+        # opening the bridge is an SSH round trip (plus up to several seconds of
+        # retries on the remote when forcing) — not on the GUI thread
+        qtutil.run_job(
+            self._jobs,
+            lambda: handler.serial_bridge(dev, baudrate=int(baud), mode="auto",
+                                          force=force),
+            on_done=self._on_bridge,
+            on_fail=lambda msg: self._on_fail(f"could not open serial bridge: {msg}"))
+
+    def _on_bridge(self, chan):
+        if self._closed:
+            try:
+                chan.close()
+            except Exception:
+                pass
             return
+        dev = self.session.get("device", "/dev/ser1")
+        baud = self.session.get("baud", 115200)
         self.bridge_chan = chan
         chan.settimeout(0.1)
         self.status.setText(f"Serial over SSH — {dev} @ {baud} (native)")
@@ -583,13 +636,10 @@ class SerialSessionWidget(QWidget):
             except Exception:
                 return None
 
-        self.reader = ReaderThread(read_fn)
-        self.reader.start()
-        self.term.set_source(self.reader.pull)
+        self._start_reader(read_fn)
         # match the remote PTY to our terminal so the conpty doesn't pad the
         # output with stray blank lines.
         self._on_term_resize(self.term.cols, self.term.rows)
-        self.term.setFocus()
 
     def _on_term_resize(self, cols, rows):
         # keep the remote bridge's PTY the SAME size as our terminal — an oversized
@@ -610,6 +660,8 @@ class SerialSessionWidget(QWidget):
         self._ct.start()
 
     def _on_fail(self, msg):
+        if self._closed:
+            return
         from PyQt5.QtWidgets import QMessageBox
         self.status.setText("Open failed")
         dev = self.session.get("device", "the port")
@@ -632,7 +684,7 @@ class SerialSessionWidget(QWidget):
             self.failed.emit(f"{self.session.get('name')}: {dev} in use")
             self.log.emit(f"[ERROR] serial: {dev} in use (held by another app)")
             return
-        self.term.feed(f"\n[serial open failed] {msg}\n".encode())
+        self.term.feed(f"\r\n\x1b[31m[serial open failed]\x1b[0m {msg}\r\n".encode())
         self.log.emit(f"[ERROR] serial: {msg}")
         self.failed.emit(f"{self.session.get('name')}: {msg}")
 
@@ -641,9 +693,9 @@ class SerialSessionWidget(QWidget):
         try:
             if self.via_ssh:
                 if self.bridge_chan and not self.bridge_chan.closed:
-                    self.bridge_chan.send(data)
+                    self.bridge_chan.sendall(data)
             elif self.handler:
-                self.handler._require().write(data)
+                self.handler.write_bytes(data, safe=False)
         except Exception as exc:
             self.log.emit(f"[ERROR] serial write: {exc}")
 
@@ -672,47 +724,55 @@ class SerialSessionWidget(QWidget):
         self.term.feed((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
 
     def close_session(self):
-        # detach an in-flight connect thread so closing mid-connect can't crash
-        _park_thread(getattr(self, "_ct", None))
-        if self.stream_thread:
-            try:
-                self.stream_thread.stop()
-            except Exception:
-                pass
-        # Release the COM port reliably: EOF alone can leave the remote bridge
-        # orphaned (Windows OpenSSH), so EXPLICITLY kill it by PID over the still-
-        # open SSH connection, THEN tear the channel down. Otherwise the port
-        # stays locked ("access denied" / "permission denied") next time.
-        if self.bridge_chan is not None:
-            try:
-                self.bridge_chan.shutdown_write()      # ask it to stop (EOF)
-            except Exception:
-                pass
-            if self.via_ssh and self.handler is not None:
-                try:                                   # the decisive step: kill it
-                    self.handler.serial_release(
-                        self.session.get("device", ""), mode="auto", safe=True)
-                except Exception:
-                    pass
-            try:
-                self.bridge_chan.close()
-            except Exception:
-                pass
-        if self.reader:
-            try:
-                self.reader.stop()
-            except Exception:
-                pass
-            self.reader.wait(1000)
+        """Release the port and close the connection — on a background thread,
+        because the release is a remote command (seconds on Windows) and used to
+        freeze the window on every tab close and once per tab at exit. The main
+        window joins these teardowns before the process ends."""
+        if self._closed:
+            return
+        self._closed = True
+        # an open still in flight: let it finish, then close what it opened
+        qtutil.park_thread(self._ct, orphan={"ok": lambda h, *_: _close_handler(h)})
+        qtutil.close_jobs(self._jobs)
+        reader, self.reader = self.reader, None
+        if reader is not None:
+            reader.stop()
+            qtutil.park_thread(reader)
         try:
             self.term.cleanup()
         except Exception:
             pass
-        if self.handler:
-            try:
-                self.handler.close()
-            except Exception:
+        handler, chan = self.handler, self.bridge_chan
+        self.handler, self.bridge_chan = None, None
+        device, via_ssh = self.session.get("device", ""), self.via_ssh
+
+        def teardown():
+            # Release the COM port reliably: EOF alone can leave the remote bridge
+            # orphaned (Windows OpenSSH), so EXPLICITLY kill it by PID over the
+            # still-open SSH connection, THEN tear the channel down. Otherwise the
+            # port stays locked ("access denied") next time. This also covers a
+            # bridge whose open was still in flight when the tab closed.
+            if chan is not None:
                 try:
-                    self.handler.disconnect()
+                    chan.shutdown_write()          # ask it to stop (EOF)
                 except Exception:
                     pass
+            if via_ssh and handler is not None:
+                try:
+                    handler.serial_release(device, mode="auto", safe=True)
+                except Exception:
+                    pass
+            if chan is not None:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+            if handler is not None:
+                closer = getattr(handler, "disconnect", None) or handler.close
+                try:
+                    closer()
+                except Exception:
+                    pass
+
+        if handler is not None or chan is not None:
+            qtutil.run_teardown(teardown, "serial-teardown")

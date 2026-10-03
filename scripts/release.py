@@ -11,6 +11,12 @@ Usage
     python scripts/release.py 1.0.1 --dry-run    # build + check, do NOT upload
     python scripts/release.py 1.0.1 --test-pypi  # upload to TestPyPI
 
+Before it builds, the script checks that CHANGELOG.md has a section for the
+version; after it builds, that the wheel contains the bundled GUI exe
+(turbossh/bin/turbossh-gui.exe — build it with scripts/build_exe.py --onefile and
+copy it there first). ``--skip-changelog`` / ``--no-exe`` override those. If any
+step fails, the version string is put back.
+
 The PyPI token is read from the environment, never hard-coded:
     TWINE_USERNAME=__token__   (default if unset)
     TWINE_PASSWORD=pypi-...    (your token)
@@ -31,6 +37,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 INIT = ROOT / "turbossh" / "__init__.py"
+CHANGELOG = ROOT / "CHANGELOG.md"
+EXE_IN_WHEEL = "turbossh/bin/turbossh-gui.exe"
 
 VERSION_RE = re.compile(r"^\s*\d+\.\d+\.\d+\s*$")
 
@@ -69,6 +77,25 @@ def resolve_target(arg: str, cur: str) -> str:
     sys.exit(f"Invalid version/part: {arg!r} (use X.Y.Z or patch/minor/major)")
 
 
+def changelog_has(version: str) -> bool:
+    """Is there a "## X.Y.Z" heading for this version in CHANGELOG.md?"""
+    try:
+        text = CHANGELOG.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return re.search(rf"^##\s+\[?{re.escape(version)}\]?(\s|$)", text, re.M) is not None
+
+
+def wheel_has_exe() -> bool:
+    """Does the freshly built wheel carry the bundled GUI executable?"""
+    import zipfile
+    wheels = sorted((ROOT / "dist").glob("*.whl"))
+    if not wheels:
+        return False
+    with zipfile.ZipFile(wheels[-1]) as wheel:
+        return EXE_IN_WHEEL in wheel.namelist()
+
+
 def set_version(path: Path, pattern: str, new: str, label: str) -> None:
     text = path.read_text(encoding="utf-8")
     new_text, n = re.subn(pattern, lambda m: m.group(0).replace(m.group(1), new),
@@ -87,7 +114,11 @@ def main(argv=None) -> int:
     ap.add_argument("--test-pypi", action="store_true",
                     help="upload to TestPyPI instead of PyPI")
     ap.add_argument("--skip-tests", action="store_true",
-                    help="skip the offline test run")
+                    help="skip the test run")
+    ap.add_argument("--skip-changelog", action="store_true",
+                    help="release even if CHANGELOG.md has no section for it")
+    ap.add_argument("--no-exe", action="store_true",
+                    help="allow a wheel without the bundled Windows GUI exe")
     args = ap.parse_args(argv)
 
     cur = current_version()
@@ -96,14 +127,30 @@ def main(argv=None) -> int:
     if new == cur and args.version not in ("patch", "minor", "major"):
         print("WARNING: version unchanged — PyPI will reject a duplicate upload.")
 
-    # 1. offline tests
+    if not args.skip_changelog and not changelog_has(new):
+        sys.exit(f"CHANGELOG.md has no '## {new}' section. Write the release "
+                 f"notes first (or pass --skip-changelog).")
+
+    # 1. tests
     if not args.skip_tests:
+        run([sys.executable, "-m", "pytest", "-q"])
         run([sys.executable, "tests/test_offline.py"])
 
-    # 2. bump the single source of truth (pyproject reads it dynamically)
+    # 2. bump the single source of truth (pyproject reads it dynamically). From
+    #    here on a failure must not leave the tree claiming a version that was
+    #    never published, so the original text is restored.
+    original = INIT.read_text(encoding="utf-8")
     print("\nUpdating version string:")
     set_version(INIT, r'__version__\s*=\s*"([^"]+)"', new, "turbossh/__init__.py")
+    try:
+        return _build_and_publish(args, new)
+    except BaseException:
+        INIT.write_text(original, encoding="utf-8")
+        print(f"\nRelease did not complete - turbossh/__init__.py restored to {cur}.")
+        raise
 
+
+def _build_and_publish(args, new: str) -> int:
     # 3. clean previous artifacts
     for d in ("dist", "build"):
         p = ROOT / d
@@ -119,6 +166,14 @@ def main(argv=None) -> int:
     # 4. build + check
     run([sys.executable, "-m", "build"])
     run([sys.executable, "-m", "twine", "check", "dist/*"])
+
+    # The wheel is expected to carry the Windows GUI exe (it is git-ignored, so
+    # nothing else would notice it missing until users could not start the GUI).
+    if not args.no_exe and not wheel_has_exe():
+        sys.exit(f"The wheel does not contain {EXE_IN_WHEEL}. Build it with "
+                 f"`python scripts/build_exe.py --onefile`, copy "
+                 f"dist/turbossh-gui.exe to turbossh/bin/, and run again "
+                 f"(or pass --no-exe to publish without it).")
 
     if args.dry_run:
         print("\n--dry-run: built and validated, skipping upload.")

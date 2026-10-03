@@ -74,16 +74,19 @@ try {{
     }}
     $sshdCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     if (Test-Path $sshdCfg) {{
-        $cfgLines = Get-Content $sshdCfg
-        if ($cfgLines -match '^\s*#?\s*Port\s+\d+') {{ $cfgLines = $cfgLines -replace '^\s*#?\s*Port\s+\d+', 'Port {ssh_port}' }}
-        else {{ $cfgLines += 'Port {ssh_port}' }}
-        Set-Content -Path $sshdCfg -Value $cfgLines -Encoding ascii
+        # exactly ONE Port line, ahead of any Match block: drop every existing one
+        # (commented or live) first, so re-running never leaves duplicates
+        $cfgLines = @(Get-Content $sshdCfg | Where-Object {{ $_ -notmatch '^\s*#?\s*Port\s+\d+' }})
+        Set-Content -Path $sshdCfg -Value (@('Port {ssh_port}') + $cfgLines) -Encoding ascii
     }}
     Set-Service -Name sshd -StartupType Automatic
     try {{ Restart-Service sshd -ErrorAction Stop }} catch {{ Start-Service sshd }}
     if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {{
         New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort {ssh_port} | Out-Null
+    }} else {{
+        # the rule already exists (normally for 22): point it at the port sshd uses now
+        Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -LocalPort {ssh_port} -Enabled True -ErrorAction SilentlyContinue
     }}
     {extra}
     'STATUS:' + (Get-Service sshd).Status
@@ -107,6 +110,7 @@ def enable_openssh_via_winrm(
     domain: Optional[str] = None,
     winrm_port: int = 5985,
     use_ssl: bool = False,
+    verify_ssl: bool = True,
     transport: str = "ntlm",
     ssh_port: int = 22,
     set_powershell_default: bool = False,
@@ -114,6 +118,10 @@ def enable_openssh_via_winrm(
 ) -> dict:
     """
     Connect over WinRM and enable OpenSSH Server on *host*.
+
+    With ``use_ssl`` the server certificate is validated unless ``verify_ssl``
+    is False (only for a self-signed lab listener: without validation an
+    attacker on the path can read the administrator credentials).
 
     :returns: dict with keys ``ok``, ``status``, ``stdout``, ``stderr``.
     :raises WinRMError: if pywinrm is missing or the WinRM call fails.
@@ -140,7 +148,7 @@ def enable_openssh_via_winrm(
             endpoint,
             auth=(login, raw_pw),
             transport=transport,
-            server_cert_validation="ignore" if use_ssl else "validate",
+            server_cert_validation="validate" if verify_ssl else "ignore",
         )
         extra = _SET_PS_DEFAULT if set_powershell_default else ""
         script = _ENABLE_SCRIPT.format(ssh_port=ssh_port, extra=extra)
@@ -172,6 +180,37 @@ def enable_openssh_via_winrm(
 
 def winrm_available() -> bool:
     return _load_winrm() is not None
+
+
+class _SharedShell:
+    """One WinRM shell reused for many PowerShell calls.
+
+    ``Session.run_ps`` opens and closes a shell around every call — five round
+    trips each. The chunked upload makes thousands of calls, so running them all
+    in one shell (run / fetch output / clean up = three round trips) removes two
+    in five of them.
+    """
+
+    def __init__(self, session):
+        self._protocol = session.protocol
+        self._shell_id = self._protocol.open_shell()
+
+    def run_ps(self, script: str):
+        """Run a PowerShell script; returns ``(stdout, stderr, status_code)``."""
+        import base64
+        encoded = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
+        command_id = self._protocol.run_command(
+            self._shell_id, f"powershell -encodedcommand {encoded}")
+        try:
+            return self._protocol.get_command_output(self._shell_id, command_id)
+        finally:
+            self._protocol.cleanup_command(self._shell_id, command_id)
+
+    def close(self) -> None:
+        try:
+            self._protocol.close_shell(self._shell_id)
+        except Exception:
+            pass
 
 
 def _smb_copy(host, login, password, local_path, remote_winpath, log) -> bool:
@@ -260,10 +299,9 @@ try {{
     if (Test-Path $fp) {{ $ConfirmPreference='None'; & $fp -Confirm:$false | Out-Null }}
     $sshdCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     if (Test-Path $sshdCfg) {{
-        $cfgLines = Get-Content $sshdCfg
-        if ($cfgLines -match '^\s*#?\s*Port\s+\d+') {{ $cfgLines = $cfgLines -replace '^\s*#?\s*Port\s+\d+', 'Port {port}' }}
-        else {{ $cfgLines += 'Port {port}' }}
-        Set-Content -Path $sshdCfg -Value $cfgLines -Encoding ascii
+        # exactly ONE Port line, ahead of any Match block (see _ENABLE_SCRIPT)
+        $cfgLines = @(Get-Content $sshdCfg | Where-Object {{ $_ -notmatch '^\s*#?\s*Port\s+\d+' }})
+        Set-Content -Path $sshdCfg -Value (@('Port {port}') + $cfgLines) -Encoding ascii
     }}
     Set-Service -Name sshd -StartupType Automatic
     # restart every run so a changed listen-Port (sshd_config above) takes effect
@@ -274,7 +312,8 @@ try {{
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort {port} -Profile Any | Out-Null
     }} else {{
         Enable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-        Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any -ErrorAction SilentlyContinue
+        # also re-point an existing rule (normally for 22) at the chosen port
+        Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -LocalPort {port} -Enabled True -Profile Any -ErrorAction SilentlyContinue
     }}
     Remove-Item (Join-Path $env:TEMP 'turbossh_ossh') -Recurse -Force -ErrorAction SilentlyContinue
     'STATUS:' + (Get-Service sshd).Status
@@ -291,6 +330,7 @@ def enable_openssh_via_winrm_offline(
     domain: Optional[str] = None,
     winrm_port: int = 5985,
     use_ssl: bool = False,
+    verify_ssl: bool = True,
     transport: str = "ntlm",
     ssh_port: int = 22,
     chunk: int = 2200,
@@ -328,7 +368,7 @@ def enable_openssh_via_winrm_offline(
     try:
         session = winrm.Session(
             endpoint, auth=(login, raw_pw), transport=transport,
-            server_cert_validation="ignore" if use_ssl else "validate")
+            server_cert_validation="validate" if verify_ssl else "ignore")
 
         # pick the ZIP that matches the REMOTE machine's architecture
         ra = session.run_ps(
@@ -366,16 +406,28 @@ def enable_openssh_via_winrm_offline(
                  f"{len(chunks)} chunks — this is slow; SMB would be faster)…")
             session.run_ps(r"Set-Content -LiteralPath (Join-Path $env:TEMP "
                            r"'turbossh_ossh\openssh.b64') -Value '' -NoNewline; 'OK'")
-            for i, c in enumerate(chunks):
-                ps = (r"Add-Content -LiteralPath (Join-Path $env:TEMP "
-                      r"'turbossh_ossh\openssh.b64') -Value '" + c + r"' -NoNewline")
-                r = session.run_ps(ps)
-                if r.status_code != 0:
-                    raise WinRMError(
-                        "upload chunk %d failed: %s" %
-                        (i, (r.std_err or b"").decode("utf-8", "replace")[:300]))
-                if log and (i % 100 == 0 or i == len(chunks) - 1):
-                    _log(f"  uploaded {i + 1}/{len(chunks)} chunks")
+            try:
+                shell = _SharedShell(session)
+            except Exception:
+                shell = None            # fall back to a shell per chunk
+            try:
+                for i, c in enumerate(chunks):
+                    ps = (r"Add-Content -LiteralPath (Join-Path $env:TEMP "
+                          r"'turbossh_ossh\openssh.b64') -Value '" + c + r"' -NoNewline")
+                    if shell is not None:
+                        _, std_err, status = shell.run_ps(ps)
+                    else:
+                        r = session.run_ps(ps)
+                        std_err, status = r.std_err, r.status_code
+                    if status != 0:
+                        raise WinRMError(
+                            "upload chunk %d failed: %s" %
+                            (i, (std_err or b"").decode("utf-8", "replace")[:300]))
+                    if log and (i % 100 == 0 or i == len(chunks) - 1):
+                        _log(f"  uploaded {i + 1}/{len(chunks)} chunks")
+            finally:
+                if shell is not None:
+                    shell.close()
             dr = session.run_ps(_DECODE_B64)
             if "OK" not in (dr.std_out or b"").decode("utf-8", "replace"):
                 raise WinRMError("failed to reassemble the uploaded ZIP remotely")

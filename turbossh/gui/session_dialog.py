@@ -11,8 +11,9 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QLineEdit, QSpinBox, QComboBox, QCheckBox,
                              QDialogButtonBox, QGroupBox, QLabel, QRadioButton,
                              QButtonGroup, QCompleter, QScrollArea, QWidget,
-                             QPushButton, QMessageBox)
+                             QPushButton, QMessageBox, QFileDialog)
 
+from . import qtutil
 from .sessions import SessionStore
 from .widgets import HostCombo
 
@@ -141,11 +142,26 @@ class SessionDialog(QDialog):
         self.domain = QLineEdit()        # kept (hidden) for storage compatibility
         self.password = QLineEdit(); self.password.setEchoMode(QLineEdit.Password)
         self.password.setPlaceholderText("leave blank if the target needs no password / uses keys")
-        self.password.setToolTip("Password for the target. Blank is fine for key-based "
-                                 "or no-auth lab targets.")
+        self.password.setToolTip("Password for the target. Leave it blank to log in "
+                                 "with an SSH key (the key file below, your SSH agent, "
+                                 "or the keys in ~/.ssh) or to a no-password lab "
+                                 "target. For an encrypted key file, put the key's "
+                                 "passphrase here.")
         theme.attach_eye(self.password)
+        # private key (optional). Without one, a blank password still tries the
+        # SSH agent and the default keys in ~/.ssh.
+        self.key_file = QLineEdit()
+        self.key_file.setPlaceholderText("optional — private key file, e.g. ~/.ssh/id_ed25519")
+        self.key_file.setToolTip("Private key to log in with. Leave blank to use "
+                                 "your SSH agent / the default keys in ~/.ssh.")
+        key_browse = QPushButton("Browse…"); key_browse.setProperty("role", "ghost")
+        key_browse.clicked.connect(self._browse_key)
+        key_row = QHBoxLayout(); key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.addWidget(self.key_file, 1); key_row.addWidget(key_browse)
+        key_w = QWidget(); key_w.setLayout(key_row)
         for label, w in (("Host", self.host), ("Port", self.port),
-                         ("User", self.user), ("Password", self.password)):
+                         ("User", self.user), ("Password", self.password),
+                         ("Key file", key_w)):
             sf.addRow(label, w)
 
         self.ignore = QCheckBox("Ignore host key (lab / embedded)")
@@ -189,8 +205,8 @@ class SessionDialog(QDialog):
         self.ser_box = QGroupBox("Serial")
         rv = QVBoxLayout(self.ser_box)
         rv.addWidget(_hint("Pick the port and baud rate of the debug board.\n"
-                           "Continuous console output streams into the terminal; type in the "
-                           "Send box to write to the port."))
+                           "Console output streams into the terminal; click in it "
+                           "and type to write to the port."))
         rf = QFormLayout(); rv.addLayout(rf)
         self.device = QComboBox(); self.device.setEditable(True)
         self.device.setToolTip("Serial device — e.g. COM6 on Windows or /dev/ser1 on QNX/Linux.")
@@ -267,6 +283,21 @@ class SessionDialog(QDialog):
             self.jdomain.setText(s.get("jump_domain") or "")
         if not self.jpass.text():
             self.jpass.setText(s.jump_password())
+
+    def _browse_key(self):
+        import os
+        start = os.path.join(os.path.expanduser("~"), ".ssh")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Private key file", start if os.path.isdir(start) else "")
+        if path:
+            self.key_file.setText(path)
+
+    def done(self, result):
+        # A remote port scan may still be running. Park it so closing the dialog
+        # neither waits for it nor destroys its thread mid-run, and its late
+        # result is not delivered to a dialog that is gone.
+        qtutil.park_thread(getattr(self, "_scan", None))
+        super().done(result)
 
     def accept(self):
         # warn if "via jump host" is on but no jump host is configured anywhere.
@@ -487,6 +518,7 @@ class SessionDialog(QDialog):
         self.rb.get(s.get("type", "ssh"), self.rb["ssh"]).setChecked(True)
         self.host.setText(s.get("host", "")); self.port.setValue(s.get("port", 22))
         self.user.setText(s.get("user", "")); self.domain.setText(s.get("domain", ""))
+        self.key_file.setText(s.get("key_file", "") or "")
         self.ignore.setChecked(s.get("ignore_hostkey", True))
         self.legacy.setChecked(s.get("legacy", False))
         self.use_jump.setChecked(s.get("use_jump", False))
@@ -522,6 +554,7 @@ class SessionDialog(QDialog):
             "quick_cmds": self.quick_cmds.text().strip(),
             "host": self.host.text().strip(), "port": self.port.value(),
             "user": self.user.text().strip(), "domain": self.domain.text().strip(),
+            "key_file": self.key_file.text().strip(),
             "ignore_hostkey": self.ignore.isChecked(),
             "legacy": self.legacy.isChecked(),
             # jump host is offered for plain SSH sessions only

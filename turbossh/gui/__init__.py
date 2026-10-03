@@ -14,10 +14,22 @@ Structure
     settings_dialog.py - preferences (theme, fonts, jump host, machines, …)
     theme.py           - colors + Qt stylesheet (dark / light)
     log_panel.py       - colored, capped log dock
+    termscreen.py      - the terminal's screen model (no Qt): alternate
+                         screen, scrollback, fast text path
+    qtutil.py          - worker-thread / teardown helpers
+    updater.py         - "Check updates" dialog (logic in turbossh.update)
 
 Launch with `turbossh-gui` or `python -m turbossh.gui`.
 """
 
-from .app import main
+
+
+def main(*args, **kwargs):
+    """Launch the GUI. Imported lazily: importing this package for one of its
+    Qt-free modules (sessions, settings, termscreen) must not pull in PyQt5 and
+    the whole main window."""
+    from .app import main as _main
+    return _main(*args, **kwargs)
+
 
 __all__ = ["main"]

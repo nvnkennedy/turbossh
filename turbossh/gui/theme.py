@@ -17,7 +17,7 @@ TERM_BG = "#000000"       # true black terminal
 def accent_text(name: str = "dark") -> str:
     """Accent colour to use for TEXT (group titles, section labels…). The bright
     cyan is fine on dark, but needs a darker shade to be readable on light."""
-    return ACCENT if name != "light" else ACCENT_DARK
+    return ACCENT_DARK if is_light(name) else ACCENT
 
 
 LOG_COLORS = {
@@ -33,7 +33,7 @@ LOG_COLORS_LIGHT = {
 
 def log_colors(name: str = "dark") -> dict:
     """Log-level colours for the current theme (light needs darker hues)."""
-    return LOG_COLORS_LIGHT if name == "light" else LOG_COLORS
+    return LOG_COLORS_LIGHT if is_light(name) else LOG_COLORS
 
 # dark = near-black, neutral grays (no blue tint), cyan accent
 _DARK = {
@@ -47,7 +47,68 @@ _LIGHT = {
     "border": "#bcc3cb", "text": "#1d2329", "dim": "#5a636c",
     "sel": "#cdeadd", "input": "#f7f9fb", "tab": "#d4d9de", "ribbon": "#d4d9de",
 }
-THEMES = {"dark": _DARK, "light": _LIGHT}
+# More palettes on the same ten tokens — so the one stylesheet below renders all
+# of them. Each dark theme has a light counterpart the ribbon toggle switches to.
+_MIDNIGHT = {
+    "win": "#0b1020", "panel": "#111833", "raised": "#18213f",
+    "border": "#2a3558", "text": "#e3e9f7", "dim": "#8b96b3",
+    "sel": "#22305a", "input": "#0d1429", "tab": "#141c38", "ribbon": "#0c1226",
+}
+_NORD = {
+    "win": "#2e3440", "panel": "#343b49", "raised": "#3b4252",
+    "border": "#4c566a", "text": "#eceff4", "dim": "#9aa5b8",
+    "sel": "#434c5e", "input": "#2b303b", "tab": "#353c4a", "ribbon": "#2b303b",
+}
+_NORD_LIGHT = {
+    "win": "#e5e9f0", "panel": "#eceff4", "raised": "#f4f6f9",
+    "border": "#c2cad8", "text": "#2e3440", "dim": "#5b6577",
+    "sel": "#d0dcec", "input": "#f8f9fb", "tab": "#d8dee9", "ribbon": "#d8dee9",
+}
+_SOLARIZED_DARK = {
+    "win": "#002b36", "panel": "#04323d", "raised": "#073642",
+    "border": "#1c4b57", "text": "#e4e0cf", "dim": "#839496",
+    "sel": "#0d4250", "input": "#00252f", "tab": "#063540", "ribbon": "#00252f",
+}
+_SOLARIZED_LIGHT = {
+    "win": "#eee8d5", "panel": "#f4efdc", "raised": "#fdf6e3",
+    "border": "#cfc8b0", "text": "#28424a", "dim": "#657b83",
+    "sel": "#dfe5c8", "input": "#fffbf0", "tab": "#e6dfc8", "ribbon": "#e6dfc8",
+}
+_DRACULA = {
+    "win": "#21222c", "panel": "#282a36", "raised": "#303341",
+    "border": "#44475a", "text": "#f8f8f2", "dim": "#9aa0bd",
+    "sel": "#3a3d4f", "input": "#1e1f29", "tab": "#2b2d3a", "ribbon": "#1e1f29",
+}
+_PAPER = {
+    "win": "#f3f1ec", "panel": "#f8f6f1", "raised": "#fffdf8",
+    "border": "#d2cdc1", "text": "#26231d", "dim": "#6b665b",
+    "sel": "#e3ecd9", "input": "#ffffff", "tab": "#e9e5dc", "ribbon": "#e9e5dc",
+}
+THEMES = {
+    "dark": _DARK, "light": _LIGHT,
+    "midnight": _MIDNIGHT, "paper": _PAPER,
+    "nord": _NORD, "nord-light": _NORD_LIGHT,
+    "solarized-dark": _SOLARIZED_DARK, "solarized-light": _SOLARIZED_LIGHT,
+    "dracula": _DRACULA,
+}
+THEME_NAMES = list(THEMES)
+_LIGHT_THEMES = frozenset(("light", "paper", "nord-light", "solarized-light"))
+_PAIRS = {"dark": "light", "midnight": "paper", "nord": "nord-light",
+          "solarized-dark": "solarized-light", "dracula": "light"}
+_PAIRS.update({light: dark for dark, light in list(_PAIRS.items())
+               if dark != "dracula"})
+
+
+def is_light(name: str) -> bool:
+    """Whether a theme has a light background (text / icon / log colours that
+    stay readable depend on this, not on the theme's name)."""
+    return name in _LIGHT_THEMES
+
+
+def counterpart(name: str) -> str:
+    """The theme the one-click toggle switches to: each dark theme's light
+    partner and back."""
+    return _PAIRS.get(name, "light" if not is_light(name) else "dark")
 
 
 def _assets_dir():
@@ -61,7 +122,8 @@ def _light_icon_path() -> str:
     import os
     from PyQt5.QtGui import QImage, QColor
     src = os.path.join(_assets_dir(), "icon.png")
-    cache = os.path.join(os.path.expanduser("~"), ".turbossh", "cache", "icon-light.png")
+    from .. import paths
+    cache = paths.state_path("cache", "icon-light.png")
     try:
         if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(src):
             return cache
@@ -91,7 +153,7 @@ def app_icon(name: str = "dark"):
     import os
     from PyQt5.QtGui import QIcon
     assets = _assets_dir()
-    if name == "light":
+    if is_light(name):
         lp = _light_icon_path()
         if lp:
             return QIcon(lp)
@@ -100,6 +162,14 @@ def app_icon(name: str = "dark"):
         if os.path.exists(p):
             ic.addFile(p)
     return ic
+
+
+# themes whose arrow image was written during this run (stylesheet() is called
+# on every theme application; re-drawing and re-saving the PNG each time is waste)
+_ARROWS_WRITTEN: set = set()
+# rendered emoji icons, keyed by (glyph, colour): menus and ribbons ask for the
+# same handful again and again
+_ICON_CACHE: dict = {}
 
 
 def _arrow_image(name: str) -> str:
@@ -111,15 +181,19 @@ def _arrow_image(name: str) -> str:
     from PyQt5.QtGui import QPixmap, QPainter, QColor, QPolygonF
     c = THEMES.get(name, _DARK)
     try:
-        cache = os.path.join(os.path.expanduser("~"), ".turbossh", "cache")
-        os.makedirs(cache, exist_ok=True)
+        from .. import paths
+        cache = paths.state_path("cache")
         path = os.path.join(cache, f"arrow-{name}.png")
+        if name in _ARROWS_WRITTEN and os.path.exists(path):
+            return path.replace("\\", "/")     # drawn already in this run
+        os.makedirs(cache, exist_ok=True)
         pm = QPixmap(16, 16); pm.fill(Qt.transparent)
         p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen); p.setBrush(QColor(c["text"]))
         p.drawPolygon(QPolygonF([QPointF(3, 5.5), QPointF(13, 5.5), QPointF(8, 11.5)]))
         p.end()
         pm.save(path, "PNG")
+        _ARROWS_WRITTEN.add(name)
         return path.replace("\\", "/")
     except Exception:
         return ""
@@ -297,14 +371,19 @@ def emoji_icon(ch: str, color: str = None):
     they stay visible in light mode too."""
     from PyQt5.QtCore import Qt
     from PyQt5.QtGui import QPixmap, QPainter, QFont, QIcon, QColor
+    pen = _icon_pen_color(color)
+    cached = _ICON_CACHE.get((ch, pen))
+    if cached is not None:
+        return cached
     pm = QPixmap(28, 28)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
-    p.setPen(QColor(_icon_pen_color(color)))
+    p.setPen(QColor(pen))
     p.setFont(QFont("Segoe UI Emoji", 14))
     p.drawText(pm.rect(), Qt.AlignCenter, ch)
     p.end()
-    return QIcon(pm)
+    icon = _ICON_CACHE[(ch, pen)] = QIcon(pm)
+    return icon
 
 
 def split_icon(color: str = None):

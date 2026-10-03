@@ -35,6 +35,10 @@ turbossh/
 ├── pool.py            SSHPool — run across many hosts
 ├── ftp.py             plain-FTP fallback (FTPHandler)
 ├── winrm_bootstrap.py offline OpenSSH install over WinRM
+├── update.py          self-update logic (no Qt): versions, owning interpreter
+├── paths.py           the per-user state folder (TURBOSSH_HOME / ~/.turbossh)
+├── _jsonstore.py      atomic JSON writes; corrupt files copied aside
+├── _logging.py        the package logger (one console handler, opt-out)
 ├── cli.py             the `turbossh` command-line tool
 ├── setup_openssh_server.ps1   the offline OpenSSH installer (self-elevating)
 ├── openssh/           the bundled OpenSSH ZIPs (ARM64 / Win64 / Win32)
@@ -46,10 +50,20 @@ turbossh/
     ├── session_widgets.py SshSessionWidget / SerialSessionWidget
     ├── session_dialog.py  new/edit session dialog
     ├── settings*.py       persisted settings + dialog
-    ├── vt100.py           the VT100 terminal widget (pyte-backed)
+    ├── vt100.py           the terminal widget: painting, keys, selection, paste
+    ├── termscreen.py      its screen model (no Qt): pyte + alternate screen,
+    │                      scrollback, query replies, fast text path
     ├── terminal.py        ReaderThread (buffered pull model)
-    ├── sftp_browser.py    the file panel
-    ├── logs_tab.py        the live-log viewer
+    ├── qtutil.py          worker-thread / teardown helpers (park_thread, run_job)
+    ├── file_browser.py    dual-pane file browser: local pane + remote pane
+    ├── sftp_browser.py    the remote pane and its transfer queue
+    ├── transfer_log.py    transfer history model (no Qt): progress, speed, ETA
+    ├── transfer_panel.py  the Transfers table (filter, retry, report)
+    ├── remote_edit.py     edit a remote text file in place
+    ├── local_terminal.py  a local shell in a tab
+    ├── localshell.py      its process + line editor (no Qt)
+    ├── toast.py           corner notifications
+    ├── logs_tab.py        the live-log viewer (level colours, find)
     ├── theme.py           dark/light stylesheet
     └── updater.py         in-app "check for updates"
 ```

@@ -84,7 +84,8 @@ class SSHPool:
         with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             futures = {}
             for host, handler in self.handlers.items():
-                local = local_path_template.format(host=host)
+                # plain replace, not str.format: a path may contain other braces
+                local = local_path_template.replace("{host}", host)
 
                 def _job(h=handler, l=local):
                     if not h.is_connected:

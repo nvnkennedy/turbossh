@@ -11,7 +11,8 @@ import traceback
 def _fatal(message: str):
     # write a crash log next to the user's other turbossh state
     try:
-        d = os.path.join(os.path.expanduser("~"), ".turbossh")
+        d = (os.environ.get("TURBOSSH_HOME")
+             or os.path.join(os.path.expanduser("~"), ".turbossh"))
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "crash.log"), "a", encoding="utf-8") as fh:
             fh.write(message + "\n")

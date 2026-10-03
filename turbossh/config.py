@@ -39,7 +39,8 @@ class SSHConfig:
     key_passphrase: Optional[Union[str, Secret]] = None
     allow_agent: bool = True
     look_for_keys: bool = True
-    allow_empty_password: bool = True     # accounts with a blank password
+    allow_empty_password: bool = True     # when NO password is given, fall back
+                                          # to a blank-password login (lab targets)
     passwordless: bool = False            # force key/agent only
 
     # --- connection behaviour ---
@@ -74,10 +75,15 @@ class SSHConfig:
                                             # WinRM reachable, enable sshd then retry
     winrm_port: int = 5985
     winrm_use_ssl: bool = False
+    winrm_verify_ssl: bool = True           # validate the server certificate when
+                                            # winrm_use_ssl is on; set False only
+                                            # for a self-signed lab listener
     winrm_transport: str = "ntlm"           # ntlm works with domain creds, no Kerberos
 
     # --- host key policy ---
-    # "auto"   -> add unknown host keys, but reject a CHANGED key
+    # "auto"   -> accept unknown host keys; reject a CHANGED key for hosts already
+    #             in known_hosts. New keys are only remembered across runs when
+    #             ``known_hosts`` names a file (the system file is read-only here)
     # "ignore" -> accept any key incl. changed ones (lab / reimaged / DHCP hosts)
     # "reject" -> strict; only keys already in known_hosts
     # "warn"   -> warn on unknown keys

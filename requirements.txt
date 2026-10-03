@@ -1,7 +1,12 @@
-# Core (always required)
-paramiko>=3.0
+# Runtime dependencies — kept in step with [project.dependencies] in
+# pyproject.toml (that file is the source of truth; this one is for running from
+# a source checkout without installing the package).
+paramiko>=3.0     # SSH / SFTP
+scp>=0.14         # SCP-protocol transfers
+pyserial>=3.5     # serial / COM-port handler
+keyring>=23.0     # confidential password storage (OS vault)
+pywinrm>=0.4.3    # WinRM bootstrap (enable sshd on Windows without SSH)
+pyte>=0.8.1       # VT100 emulation for the GUI terminal
 
-# Optional — install what you need:
-keyring>=23.0    # confidential password storage in the OS credential vault
-scp>=0.14        # SCP-protocol transfers (SFTP push/pull works without this)
-PyQt5>=5.15      # only for the PyQt5 worker (ssh_handler.pyqt_worker)
+# Optional — the GUI:   pip install "PyQt5>=5.15"   (or: pip install "turbossh[gui]")
+# Optional — the tests: pip install pytest          (or: pip install "turbossh[test]")

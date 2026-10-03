@@ -10,11 +10,13 @@ complete, errors, prompts), send commands, and tee everything to a log file.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import logging
 from typing import Callable, Optional
 
+from . import _logging
 from .exceptions import SSHError
 from .results import OperationResult
 
@@ -64,16 +66,16 @@ class SerialHandler:
                         timeout=timeout, rtscts=rtscts, xonxoff=xonxoff)
         self._safe_default = safe
         self._log_callback = log_callback
-        self.log = logger or logging.getLogger(f"serial_handler.{port}")
-        if not self.log.handlers:
-            h = logging.StreamHandler()
-            h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-            self.log.addHandler(h)
-        self.log.setLevel(logging.WARNING if quiet else logging.INFO)
+        self._quiet = quiet
+        if logger is None:
+            _logging.ensure_console_handler()
+            logger = _logging.get_logger(f"serial.{port}")
+        self.log = logger
         self._ser = None
 
     def _emit(self, level, msg):
-        self.log.log(level, msg)
+        if not (self._quiet and level < logging.WARNING):
+            self.log.log(level, msg)
         if self._log_callback:
             try:
                 self._log_callback(f"[{logging.getLevelName(level)}] {msg}")
@@ -93,7 +95,12 @@ class SerialHandler:
     # --- open / close ---
     def open(self, *, safe=None):
         def _do():
-            self._ser = serial.Serial(self.port, self.baudrate, **self._kw)
+            try:
+                self._ser = serial.Serial(self.port, self.baudrate, **self._kw)
+            except (serial.SerialException, OSError, ValueError) as exc:
+                # pyserial's own exception is not part of our hierarchy, so
+                # `except SSHError` (and the CLI) would otherwise miss it
+                raise SerialError(f"Could not open {self.port}: {exc}") from exc
             self._emit(logging.INFO, f"Opened {self.port} @ {self.baudrate} baud.")
             return self
         return self._guard("open", _do, safe=safe)
@@ -113,18 +120,43 @@ class SerialHandler:
         return self._ser
 
     # --- write ---
+    def _write(self, payload: bytes) -> int:
+        try:
+            return self._require().write(payload)
+        except (serial.SerialException, OSError) as exc:
+            raise SerialError(f"Write to {self.port} failed: {exc}") from exc
+
     def write(self, data: str, *, safe=None):
         """Write raw text (no newline added)."""
         return self._guard("write",
-                           lambda: self._require().write(data.encode("utf-8", "replace")),
+                           lambda: self._write(data.encode("utf-8", "replace")),
                            safe=safe)
+
+    def write_bytes(self, data: bytes, *, safe=None):
+        """Write raw bytes exactly as given (terminal keystrokes, binary)."""
+        return self._guard("write_bytes", lambda: self._write(bytes(data)), safe=safe)
 
     def write_line(self, data: str, *, eol: str = "\n", safe=None):
         """Write a line (with EOL). Use eol='\\r\\n' for many embedded consoles."""
         return self._guard("write_line",
-                           lambda: self._require().write((data + eol).encode("utf-8",
-                                                                              "replace")),
+                           lambda: self._write((data + eol).encode("utf-8", "replace")),
                            safe=safe)
+
+    # --- raw read (interactive terminals) ---
+    def read_available(self, max_bytes: int = 65536) -> bytes:
+        """Return whatever has arrived, as soon as it arrives: block (up to the
+        port timeout) for the first byte only, then take what is waiting.
+
+        ``Serial.read(n)`` on its own waits for *n* bytes or the full timeout, so
+        asking for a big buffer made every keystroke echo late by that timeout.
+        Returns ``b""`` when nothing arrived in time."""
+        ser = self._require()
+        try:
+            waiting = ser.in_waiting
+            return ser.read(min(max(waiting, 1), max_bytes))
+        except (serial.SerialException, OSError) as exc:
+            raise SerialError(f"Read from {self.port} failed "
+                              f"(port closed or unplugged?): {exc}") from exc
 
     # --- streaming read (line by line, live) ---
     def iter_lines(self, *, stop_event=None, timeout: Optional[float] = None,
@@ -141,7 +173,11 @@ class SerialHandler:
                 break
             if timeout and (time.time() - start) > timeout:
                 break
-            chunk = ser.readline()           # returns b"" on read timeout
+            try:
+                chunk = ser.readline()       # returns b"" on read timeout
+            except (serial.SerialException, OSError) as exc:
+                raise SerialError(f"Read from {self.port} failed "
+                                  f"(port closed or unplugged?): {exc}") from exc
             if chunk:
                 buf += chunk
                 parts = buf.split(b"\n")
@@ -166,8 +202,11 @@ class SerialHandler:
         def _do():
             pat = re.compile(match) if isinstance(match, str) else match
             matches, count = [], 0
-            fh = open(save_to, "a" if append else "w", encoding=encoding) \
-                if save_to else None
+            fh = None
+            if save_to:
+                target = os.path.abspath(os.path.expanduser(save_to))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                fh = open(target, "a" if append else "w", encoding=encoding)
             try:
                 for line in self.iter_lines(stop_event=stop_event, timeout=timeout,
                                             encoding=encoding):

@@ -43,6 +43,7 @@ Changelog = "https://github.com/nvnkennedy/turbossh/blob/main/CHANGELOG.md"
 # building a GUI, and forcing it would bloat headless/CI installs.
 gui = ["PyQt5>=5.15"]
 all = ["PyQt5>=5.15"]
+test = ["pytest>=7.0"]       # the test suite (no network / device / display needed)
 
 [project.scripts]
 turbossh = "turbossh.cli:main"
@@ -62,6 +63,15 @@ version = { attr = "turbossh.__version__" }
 [tool.setuptools.package-data]
 turbossh = ["*.ps1", "*.md", "py.typed", "openssh/*.zip", "assets/*.ico",
             "assets/*.png", "bin/*.exe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# test_offline.py is the original stand-alone script (module-level asserts, and
+# it switches logging off globally); it is run directly, not collected.
+addopts = "--ignore=tests/test_offline.py"
+# Paramiko's own server threads (the loopback test server) complain when a client
+# hangs up mid-request, e.g. a cancelled transfer; that is the test working.
+filterwarnings = ["ignore::pytest.PytestUnhandledThreadExceptionWarning"]
 
 [tool.ruff]
 # Keep line length lenient — this codebase favours dense, commented lines.

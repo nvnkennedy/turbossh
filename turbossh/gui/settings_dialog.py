@@ -120,7 +120,7 @@ class SettingsDialog(QDialog):
     # ---- pages ----
     def _page_appearance(self):
         w = QWidget(); f = QFormLayout(w)
-        self.theme = QComboBox(); self.theme.addItems(["dark", "light"])
+        self.theme = QComboBox(); self.theme.addItems(theme.THEME_NAMES)
         self.theme.setCurrentText(self.cfg.get("theme", "dark"))
         self.theme.currentTextChanged.connect(self._apply_theme_live)   # LIVE
         self.font = QFontComboBox()
@@ -139,7 +139,9 @@ class SettingsDialog(QDialog):
         f.addRow("Keyword colouring", self.highlight)
         f.addRow("", _wrap("Tints plain words like 'error', 'warning' and "
                            "'success' in the terminal — on top of the server's "
-                           "own colours, never replacing them. Applies to new output."))
+                           "own colours, never replacing them. Font, scrollback and "
+                           "colouring apply to sessions opened from now on "
+                           "(Ctrl + mouse wheel zooms an open terminal)."))
         return w
 
     def _page_defaults(self):

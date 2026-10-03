@@ -11,14 +11,19 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Library + CLI suite. It needs no network and no real sshd: tests/sshserver.py
+    # is a loopback SSH/SFTP server. GUI tests skip here (no PyQt5 installed) and
+    # run in the `gui` job.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        # 3.8 runs the published wheel fine, but building needs setuptools>=77
-        # (PEP 639 license), which itself requires Python >=3.9 — so CI builds/tests
-        # on 3.9+.
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        # Windows is the platform the app is used on; Linux keeps the POSIX paths
+        # honest. Building needs setuptools>=77 (PEP 639 license), i.e. 3.9+ —
+        # 3.8 is covered from source by the `py38` job below.
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -28,12 +33,52 @@ jobs:
       - name: Install package + tooling
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          pip install -e ".[test]"
           pip install ruff
       - name: Lint (ruff)
-        run: ruff check turbossh
-      - name: Offline tests
+        run: ruff check turbossh tests scripts
+      - name: Tests
+        run: python -m pytest -q -rs
+      - name: Legacy offline script
         run: python tests/test_offline.py
+
+  gui:
+    # The PyQt5 GUI, headless (Qt's offscreen platform; conftest selects it).
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package + GUI extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui,test]"
+      # Fail loudly if PyQt5 is missing: otherwise every GUI test would "pass" by
+      # being skipped.
+      - name: PyQt5 must import
+        run: python -c "import PyQt5.QtWidgets, pyte; print('PyQt5 ok')"
+      - name: Tests (GUI included)
+        run: python -m pytest -q -rs
+
+  py38:
+    # requires-python says 3.8. The wheel is built on 3.9+, so 3.8 is checked by
+    # running the suite straight from the source tree (conftest puts the repo on
+    # sys.path) with the runtime dependencies installed by hand.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Tests (from source)
+        run: python -m pytest -q -rs
 
   types:
     runs-on: ubuntu-latest

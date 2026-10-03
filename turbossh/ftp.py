@@ -12,6 +12,7 @@ import logging
 from ftplib import FTP, FTP_TLS, error_perm, all_errors
 from typing import Callable, Optional
 
+from . import _logging
 from .config import FTPConfig
 from .credentials import Secret, mask
 from .results import TransferResult, OperationResult
@@ -32,12 +33,10 @@ class FTPHandler:
         self.config = config
         self._safe_default = safe
         self._log_callback = log_callback
-        self.log = logger or logging.getLogger(f"ftp_handler.{config.host}")
-        if not self.log.handlers:
-            h = logging.StreamHandler()
-            h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-            self.log.addHandler(h)
-            self.log.setLevel(logging.INFO)
+        if logger is None:
+            _logging.ensure_console_handler()
+            logger = _logging.get_logger(f"ftp.{config.host}")
+        self.log = logger
         self._ftp: Optional[FTP] = None
 
     def _emit(self, level, msg):

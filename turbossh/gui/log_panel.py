@@ -101,8 +101,12 @@ class LogPanel(QGroupBox):
                 cur.insertText(ts + " ", tfmt)       # timestamp prefix (first line)
             cur.insertText(line, fmt)
         cur.insertText("\n")
-        self.view.setTextCursor(cur)
-        self.view.ensureCursorVisible()
+        # follow new lines only if the user is at the bottom — don't yank the
+        # view away from something they scrolled up to read
+        bar = self.view.verticalScrollBar()
+        if bar.value() >= bar.maximum() - 4:
+            self.view.setTextCursor(cur)
+            self.view.ensureCursorVisible()
 
     def _on_filter(self):
         self._min_rank = self.level_filter.currentData() or 0
@@ -118,6 +122,10 @@ class LogPanel(QGroupBox):
     def _save(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save log", "session.log")
         if path:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(self.view.toPlainText())
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(self.view.toPlainText())
+            except OSError as exc:
+                self.append(f"[ERROR] Could not save the log to {path}: {exc}")
+                return
             self.append(f"[OK] Log saved to {path}")
