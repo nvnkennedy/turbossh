@@ -253,11 +253,11 @@ def test_camera_commands(run, ssh_server, tmp_path, monkeypatch):
     assert json.loads(run("camera-list", "--json")[1]) == []
 
     # remote grab: the fake host reports "ok" as its TEMP folder; put the file
-    # the remote ffmpeg would have written there
+    # the remote ffmpeg would have written there. The command builds the Windows
+    # path ok\turbossh_grab.jpg, and pull() turns backslashes into "/" before it
+    # asks SFTP — so on every platform the file is ok/turbossh_grab.jpg.
     (ssh_server.root / "ok").mkdir()
-    (ssh_server.root / "ok\\turbossh_grab.jpg").write_bytes(b"\xff\xd8jpeg\xff\xd9") \
-        if os.name != "nt" else \
-        (ssh_server.root / "ok" / "turbossh_grab.jpg").write_bytes(b"\xff\xd8jpeg\xff\xd9")
+    (ssh_server.root / "ok" / "turbossh_grab.jpg").write_bytes(b"\xff\xd8jpeg\xff\xd9")
     out_file = tmp_path / "shot.jpg"
     code, out, err = run("camera-grab", "--camera", "Cam", "--out", out_file, "--force")
     assert code == 0, err
