@@ -49,18 +49,18 @@ class HomeTab(QWidget):
         lay.addLayout(head)
 
         # --- quick-action cards ---
-        grid = QGridLayout(); grid.setSpacing(10)
-        cards = [
-            ("🖥", "New session", "SSH or serial", self._win.new_session),
-            ("📷", "Camera", "Local or RDP webcam", self._win.open_camera_panel),
-            ("🖧", "Set up SSH server", "Install OpenSSH", self._win.setup_ssh_server),
-            ("⚙", "Settings", "Theme · machines · font", self._win.show_settings),
-            ("⬆", "Check updates", "Latest from PyPI", self._win.check_updates),
-            ("❓", "Documentation", "Guides & reference", self._win._open_docs),
-        ]
-        for i, (emo, label, desc, slot) in enumerate(cards):
-            grid.addWidget(self._card(emo, label, desc, slot), i // 3, i % 3)
-        lay.addLayout(grid)
+        self._grid = QGridLayout(); self._grid.setSpacing(10)
+        win = self._win
+        self._cards = [
+            (key, self._card(emo, label, desc, slot)) for key, emo, label, desc, slot in (
+                ("session", "🖥", "New session", "SSH or serial", win.new_session),
+                ("camera", "📷", "Camera", "Local or RDP webcam", win.open_camera_panel),
+                ("server", "🖧", "Set up SSH server", "Install OpenSSH", win.setup_ssh_server),
+                ("settings", "⚙", "Settings", "Theme · machines · font", win.show_settings),
+                ("updates", "⬆", "Check updates", "Latest from PyPI", win.check_updates),
+                ("docs", "❓", "Documentation", "Guides & reference", win._open_docs),
+            )]
+        lay.addLayout(self._grid)
 
         # --- saved sessions (double-click to connect) ---
         sh = QLabel("Saved sessions")
@@ -77,7 +77,10 @@ class HomeTab(QWidget):
         self.refresh()
 
     def _card(self, emo, label, desc, slot):
-        b = QPushButton(f"{emo}  {label}\n{desc}" if desc else f"{emo}  {label}")
+        text = f"{emo}  {label}\n{desc}" if desc else f"{emo}  {label}"
+        # "&" marks a keyboard accelerator on a button: "Guides & reference"
+        # used to show as "Guides  reference"
+        b = QPushButton(text.replace("&", "&&"), self)
         b.setProperty("role", "ghost")
         b.setMinimumHeight(54)
         b.setCursor(Qt.PointingHandCursor)
@@ -85,8 +88,22 @@ class HomeTab(QWidget):
         b.clicked.connect(lambda _=False, s=slot: s())
         return b
 
+    def _place_cards(self):
+        """Lay out the cards, with no hole where a switched-off one would be."""
+        hidden = self._win.hidden_home_cards()
+        cell = 0
+        for key, card in self._cards:
+            self._grid.removeWidget(card)
+            if key in hidden:
+                card.hide()
+                continue
+            self._grid.addWidget(card, cell // 3, cell % 3)
+            card.show()
+            cell += 1
+
     def refresh(self):
-        """(Re)load the saved-session list — call when sessions change."""
+        """Bring the cards and the saved-session list up to date."""
+        self._place_cards()
         self.sessions.clear()
         for s in self._store.sessions:
             t = s.get("type")

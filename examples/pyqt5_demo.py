@@ -4,30 +4,27 @@ Minimal PyQt5 demo for turbossh — fill in host/credentials, Connect, Run.
     pip install "turbossh[gui]"          # or: pip install PyQt5
     python examples/pyqt5_demo.py
 
-Shows the intended GUI pattern: SSHWorker (safe mode) lives in a QThread, the
-GUI never blocks or crashes on an SSH error, and every log line (secret-masked)
-streams into the log pane.
+Shows the intended GUI pattern for using the library from your own widgets: a
+safe-mode SSHHandler, every blocking call on a worker thread, so the GUI never
+blocks or crashes on an SSH error. To embed the whole TurboSSH GUI instead, see
+examples/embed_demo.py.
 """
 
 import sys
-from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QWidget, QGridLayout, QLabel,
                              QLineEdit, QPushButton, QTextEdit, QSpinBox)
 
-from turbossh import SSHConfig
-from turbossh.pyqt_worker import SSHWorker
+from turbossh import SSHConfig, SSHHandler
+from turbossh.gui.qtutil import close_jobs, run_job
 
 
 class Demo(QWidget):
-    request_connect = pyqtSignal()
-    request_run = pyqtSignal(str)
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("turbossh PyQt5 demo")
         self.resize(640, 480)
-        self.worker = None
-        self.thread = None
+        self.ssh = None
+        self.jobs = set()          # worker threads; close_jobs() parks them on exit
 
         g = QGridLayout(self)
         self.host = QLineEdit("127.0.0.1")
@@ -52,7 +49,7 @@ class Demo(QWidget):
         g.addWidget(self.log, 5, 0, 1, 4)
 
         self.btn_connect.clicked.connect(self.on_connect)
-        self.btn_run.clicked.connect(lambda: self.request_run.emit(self.command.text()))
+        self.btn_run.clicked.connect(self.on_run)
 
     def on_connect(self):
         cfg = SSHConfig(
@@ -63,21 +60,20 @@ class Demo(QWidget):
             password=self.password.text(),   # wrapped in a Secret internally
             connect_timeout=10, max_retries=2,
         )
-        self.thread = QThread()
-        self.worker = SSHWorker(cfg)
-        self.worker.moveToThread(self.thread)
-
-        self.worker.log.connect(self.log.append)
-        self.worker.connected.connect(self.on_connected)
-        self.worker.command_done.connect(self.on_command_done)
-        self.worker.error.connect(lambda msg: self.log.append(f"<b>ERROR:</b> {msg}"))
-        self.request_connect.connect(self.worker.connect_host)
-        self.request_run.connect(self.worker.run_command)
-
-        self.thread.start()
+        self.ssh = SSHHandler(cfg, safe=True, quiet=True)   # results, never exceptions
         self.btn_connect.setEnabled(False)
         self.log.append("Connecting…")
-        self.request_connect.emit()
+        run_job(self.jobs, self.ssh.connect,
+                on_done=lambda result: self.on_connected(bool(result)),
+                on_fail=self.on_error)
+
+    def on_run(self):
+        command = self.command.text()
+        run_job(self.jobs, lambda: self.ssh.run(command),
+                on_done=self.on_command_done, on_fail=self.on_error)
+
+    def on_error(self, message: str):
+        self.log.append(f"<b>ERROR:</b> {message}")
 
     def on_connected(self, ok: bool):
         self.log.append("Connected." if ok else "Connect failed.")
@@ -85,6 +81,7 @@ class Demo(QWidget):
         self.btn_connect.setEnabled(not ok)
 
     def on_command_done(self, result):
+        result = getattr(result, "value", result)      # safe mode wraps the result
         if hasattr(result, "stdout"):
             self.log.append(f"$ {result.command}  (exit {result.exit_code})")
             if result.stdout:
@@ -93,6 +90,12 @@ class Demo(QWidget):
                 self.log.append(f"<i>{result.stderr.rstrip()}</i>")
         else:
             self.log.append(f"Result: {result}")
+
+    def closeEvent(self, event):
+        close_jobs(self.jobs)
+        if self.ssh is not None:
+            self.ssh.disconnect()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":

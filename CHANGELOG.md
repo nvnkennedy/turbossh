@@ -2,6 +2,92 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.0.0 — 2026-11-10
+
+Two things: the Camera is now there only when you want it, and the whole GUI
+can live inside another application — written in anything — and be driven from
+it. Plus fixes found while reviewing the code around both.
+
+### Changed — please read when upgrading
+- **The Camera is off until you ask for it.** There is no Camera button, menu
+  entry or Home card by default. Tick **View → Camera** (or Settings → Camera):
+  a Camera tab opens, and the button, menu entry and Home card stay until you
+  untick it. Unticking closes the Camera tabs, which stops streams and
+  recordings and releases the device, and asks first if one is streaming. The
+  choice is remembered (`camera_enabled` in settings.json).
+- **Opening a Camera tab downloads nothing.** On a machine without ffmpeg it used
+  to start the ~160 MB download straight away; now the tab says what Scan
+  cameras will do, and the download starts when you click it.
+
+### Added
+- **TurboSSH inside any application.** `turbossh-gui --embed <window handle>
+  --control stdio` (the bundled exe takes the same options) runs the whole GUI
+  inside a window of another program — C# WinForms / WPF, C++, Electron, Java,
+  Tk, wxPython, PySide6 … — fills it, follows its size, and takes the keyboard
+  when clicked. The host drives it with JSON lines on stdin / stdout: open SSH,
+  serial and local sessions, type into them, read the screen, run commands over
+  their connection, theme, Camera, geometry, shutdown; and gets events when a
+  session opens, connects, drops, fails or closes. It matches the host window's
+  DPI awareness so it fits exactly whether the host is DPI-aware or not, takes
+  the keyboard when clicked (and gives it back), never makes the host's UI
+  thread wait, never stalls if the host reads slowly, and closes its sessions
+  cleanly when the host sends `shutdown`, closes the pipe, or destroys the window.
+  - **`turbossh.embed_client.TurboSSHProcess`** — a Qt-free Python client.
+  - Complete host examples: **examples/embed_host_tk.py** (Tk) and
+    **examples/embed_host_winforms.cs** (C# WinForms, builds with the C#
+    compiler in Windows). Tested on Windows with Tk, PyQt5 and WinForms hosts,
+    from Python and from the exe.
+  - `turbossh gui` takes the same options (`--embed`, `--control`, `--hide`,
+    `--theme`, `--camera`).
+- **`TurboSSHWidget`** — the entire GUI as a `QWidget` for your own PyQt5
+  application: `from turbossh.gui import TurboSSHWidget`. It keeps to itself:
+  its stylesheet, icons and shortcuts stay inside the widget, it never quits the
+  application, it offers neither Exit nor self-update, and it shuts its
+  sessions down when the application quits or the widget is deleted.
+  - Open sessions from code — `connect_ssh()`, `open_serial()`,
+    `open_serial_over_ssh()`, `open_saved()`, `open_local_terminal()`,
+    `open_camera()` — and get an `EmbeddedSession` back: `connected`,
+    `disconnected`, `failed` and `closed` signals, `send()` / `send_line()`,
+    `screen_text()`, `activate()`, `close()`, and the live `handler` to run
+    commands over the same connection. Connections opened from code are not
+    saved anywhere, and check host keys as the library does unless you pass
+    `ignore_host_key=True` (for reimaged lab devices).
+  - Choose what shows around the tabs (menu bar, ribbon, sidebar, log dock,
+    status bar, Home), whether the Camera is the user's choice or yours, and the
+    theme — or `theme="inherit"` to take the host's look.
+  - Put TurboSSH's commands on your toolbar (`action("session")` …) and its menus
+    in your menu bar (`menus()`); follow `session_opened`, `session_closed`,
+    `current_session_changed`, `log_message`, `theme_changed`.
+  - **EMBEDDING.md** is the reference (a test checks every public name is in it),
+    and **examples/embed_demo.py** a complete host application.
+
+### Fixed
+- **A crash when closing a tab.** The connection is closed on a background
+  thread after the tab is gone, and it logged into the deleted tab: an access
+  violation, not an error message. The same could happen when "Save all output"
+  or a Camera recording finished after its tab was closed. A toast whose window
+  had gone raised an error when it timed out.
+- The Camera's Remote source with a blank password sent an empty password and
+  turned key lookup off, so key logins could not work (sessions were fixed in
+  1.7.0; the Camera was missed). A blank field now means "use my keys / agent".
+- A remote camera scan that failed after connecting (for example while pushing
+  ffmpeg) left that SSH connection open.
+- A Camera tab in the background kept rescaling every frame 33 times a second.
+- A Camera tab no longer forces the window to ~1300 px wide: the picture options
+  have a row of their own, and a long status message is clipped (the tooltip has
+  it all) instead of widening the tab.
+- In split view, Save output / Copy / Paste did nothing unless a pane had the
+  focus: they picked the Home tile, which has no terminal.
+- Each Settings dialog stayed in memory after it closed, and so did a background
+  worker that finished at the moment its tab closed.
+- The status bar said "Connecting to …" with no target for a local serial port.
+- The Home tab's Documentation card read "Guides  reference": the "&" was taken
+  for a keyboard accelerator.
+- `examples/pyqt5_demo.py` imported a module removed in 1.3, so it failed at
+  start. It now uses the library directly.
+- Examples in the READMEs, the homepage and a GUI placeholder use neutral
+  host names, logins and addresses.
+
 ## 1.7.0 — 2026-10-04
 
 A review-driven hardening pass across the library, CLI and GUI, plus the

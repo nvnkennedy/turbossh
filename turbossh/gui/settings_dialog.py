@@ -84,6 +84,10 @@ class SettingsDialog(QDialog):
         self._machines = list(self.cfg.get("machines") or [])
         self._orig_theme = self.cfg.get("theme", "dark")
         self._win = parent
+        # what the application embedding us has decided, or does not apply there
+        self._embedded = getattr(parent, "embedded", False)
+        self._theme_locked = getattr(parent, "theme_locked", False)
+        self._camera_locked = getattr(parent, "camera_locked", False)
 
         outer = QVBoxLayout(self)
         body = QHBoxLayout(); outer.addLayout(body, 1)
@@ -98,7 +102,8 @@ class SettingsDialog(QDialog):
         self._add_page("Jump host", self._page_jump())
         self._add_page("Saved machines", self._page_machines())
         self._add_page("Camera", self._page_camera())
-        self._add_page("Startup", self._page_startup())
+        if not self._embedded:          # first-run shortcuts / docs are the app's own
+            self._add_page("Startup", self._page_startup())
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.nav.setCurrentRow(0)
 
@@ -121,8 +126,11 @@ class SettingsDialog(QDialog):
     def _page_appearance(self):
         w = QWidget(); f = QFormLayout(w)
         self.theme = QComboBox(); self.theme.addItems(theme.THEME_NAMES)
-        self.theme.setCurrentText(self.cfg.get("theme", "dark"))
+        self.theme.setCurrentText(theme.current_name())
         self.theme.currentTextChanged.connect(self._apply_theme_live)   # LIVE
+        if self._theme_locked:
+            self.theme.setEnabled(False)
+            self.theme.setToolTip("Set by the application TurboSSH is embedded in.")
         self.font = QFontComboBox()
         self.font.setCurrentFont(QFont(self.cfg.get("term_font", "Cascadia Mono")))
         self.font_size = QSpinBox(); self.font_size.setRange(7, 28)
@@ -177,6 +185,14 @@ class SettingsDialog(QDialog):
 
     def _page_camera(self):
         w = QWidget(); f = QFormLayout(w)
+        self.camera_on = None
+        if not self._camera_locked:
+            self.camera_on = QCheckBox("Show the Camera in the ribbon, File menu and Home tab")
+            self.camera_on.setChecked(bool(self.cfg.get("camera_enabled")))
+            f.addRow(self.camera_on)
+            f.addRow(_wrap("Off by default: nothing camera-related appears or runs "
+                           "until you turn it on. View → Camera does the same. "
+                           "Turning it off closes any Camera tabs."))
         self.ffmpeg_path = QLineEdit(self.cfg.get("ffmpeg_path", ""))
         self.ffmpeg_path.setPlaceholderText("optional: path to ffmpeg.exe")
         f.addRow("ffmpeg path", self.ffmpeg_path)
@@ -202,7 +218,8 @@ class SettingsDialog(QDialog):
                 return
             except Exception:
                 pass
-        QApplication.instance().setStyleSheet(theme.stylesheet(name))
+        if not self._embedded:          # hosted, the application's look is the host's
+            QApplication.instance().setStyleSheet(theme.stylesheet(name))
 
     # ---- machines ----
     def _update_manage_label(self):
@@ -216,18 +233,23 @@ class SettingsDialog(QDialog):
 
     def result_settings(self) -> dict:
         settings_mod.set_jump_password(self.jpass.text())     # password -> OS vault
-        return {
+        result = {
             "machines": self._machines,
-            "theme": self.theme.currentText(),
             "term_font": self.font.currentFont().family(),
             "term_font_size": self.font_size.value(),
             "term_scrollback": self.scrollback.value(),
             "highlight_keywords": self.highlight.isChecked(),
             "default_baud": self.baud.value(),
-            "open_docs_first_run": self.docs.isChecked(),
-            "make_shortcut_first_run": self.shortcut.isChecked(),
             "jump_host": self.jhost.text().strip(),
             "jump_user": self.juser.text().strip(),
             "jump_domain": self.jdomain.text().strip(),
             "ffmpeg_path": self.ffmpeg_path.text().strip(),
         }
+        if not self._theme_locked:
+            result["theme"] = self.theme.currentText()
+        if self.camera_on is not None:
+            result["camera_enabled"] = self.camera_on.isChecked()
+        if not self._embedded:
+            result["open_docs_first_run"] = self.docs.isChecked()
+            result["make_shortcut_first_run"] = self.shortcut.isChecked()
+        return result

@@ -34,7 +34,9 @@ the GUI**, and **on the command line**.
 - [Port forwarding](#port-forwarding) ·
   [Installing an SSH server](#installing-an-ssh-server) ·
   [Credentials](#credentials)
-- [The GUI tour](#the-gui-tour) · [CLI reference](#cli-reference) ·
+- [The GUI tour](#the-gui-tour) ·
+  [Embedding the GUI](#embedding-the-gui-in-your-own-application) ·
+  [CLI reference](#cli-reference) ·
   [Results & errors](#results--errors)
 - [Architecture](ARCHITECTURE.md) · [Changelog](CHANGELOG.md)
 
@@ -92,8 +94,8 @@ cfg = SSHConfig(host="10.0.0.5", username="root", password="…")
 
 # through a jump host: laptop -> RDP box -> target
 cfg = SSHConfig(
-    host="adelegg-mopf", username="root",
-    jump_host=SSHConfig(host="10.232.9.120", username="EU\\nkennedy", password="…"),
+    host="target-ecu", username="root",
+    jump_host=SSHConfig(host="10.0.0.20", username="CORP\\myuser", password="…"),
 )
 
 # an old ECU that only speaks legacy ciphers/kex
@@ -303,7 +305,7 @@ For a fully interactive, character-by-character session there's `serial_bridge()
 **On the command line.**
 
 ```bash
-turbossh serial-ssh --host 10.232.9.120 --user "EU\\nkennedy" \
+turbossh serial-ssh --host 10.0.0.20 --user "CORP\\myuser" \
     --device COM4 --baud 115200 --save console.log
 #   --send "reboot"      write a line first
 #   --match "login:"     flag matching lines
@@ -337,10 +339,13 @@ turbossh scan-ports --host H --user U
 ## Camera
 
 Watch any camera — **on your own machine** or **on a remote machine** — live in
-TurboSSH. It's **opt-in**: turn it on in **Settings → Enable camera** and a
-**📷 Camera** button appears in the ribbon (it stays hidden otherwise).
+TurboSSH. It's **there when you want it** and invisible otherwise: tick
+**View → Camera** and a Camera tab opens, with a **📷 Camera** button in the
+ribbon (and File menu, and Home tab) from then on. Untick it and the tabs, the
+button and the menu entries are gone again; nothing camera-related runs while it
+is off. The choice is remembered, and **Settings → Camera** has the same switch.
 
-**In the GUI.** The Camera button opens a panel with the view front-and-centre:
+**In the GUI.** The Camera tab puts the view front-and-centre:
 1. Pick a **Source** — *Local (this PC)* (the default, no connecting) or
    *Remote (RDP / Windows machine)*, where you enter the machine's host/login
    (pre-filled from Settings → Jump host).
@@ -356,8 +361,9 @@ ffmpeg from a previous run is holding it — TurboSSH asks whether to force that
 holder closed and try again (Yes / No), so you don't have to hunt it down.
 
 ffmpeg isn't bundled in the pip wheel (it would blow past PyPI's size limit), so
-the first time you use the camera it's fetched once from a public GitHub build,
-cached, and (for a remote source) pushed to that machine. For a fully offline
+it's fetched once from a public GitHub build — when you first click **Scan
+cameras**, never just because the tab opened — cached, and (for a remote source)
+pushed to that machine. For a fully offline
 setup, point **Settings → ffmpeg path** at a local `ffmpeg.exe`.
 
 **In a script** (the remote path):
@@ -436,7 +442,7 @@ and a local-admin account on it) — pushes the bundled OpenSSH over WinRM and
 installs it there:
 
 ```bash
-turbossh install-ssh-remote --host 10.232.9.120 --user "EU\\nkennedy"
+turbossh install-ssh-remote --host 10.0.0.20 --user "CORP\\myuser"
 ```
 
 Or in the GUI: the **SSH server** button → **A remote machine (WinRM)**.
@@ -446,7 +452,7 @@ Or in the GUI: the **SSH server** button → **A remote machine (WinRM)**.
 ```python
 from turbossh import enable_openssh_via_winrm_offline
 enable_openssh_via_winrm_offline(
-    "10.232.9.120", "EU\\nkennedy", "password",
+    "10.0.0.20", "CORP\\myuser", "password",
     openssh_dir="…/turbossh/openssh", log=print)
 ```
 
@@ -461,9 +467,9 @@ Passwords belong in the OS vault, not in a script.
 ```python
 from turbossh import CredentialStore, SSHHandler, SSHConfig
 
-CredentialStore("my_lab").set("EU\\nkennedy", "the-password")   # store once
-pw = CredentialStore("my_lab").get("EU\\nkennedy")              # later
-ssh = SSHHandler(SSHConfig(host="…", username="nkennedy", password=pw))
+CredentialStore("my_lab").set("CORP\\myuser", "the-password")   # store once
+pw = CredentialStore("my_lab").get("CORP\\myuser")              # later
+ssh = SSHHandler(SSHConfig(host="…", username="myuser", password=pw))
 ```
 
 Passwords are wrapped in a `Secret` that masks itself in logs and reprs, so they
@@ -482,8 +488,8 @@ plaintext on disk. Show/hide them with the eye icon in the dialog.
 **On the command line.**
 
 ```bash
-turbossh store-credential --user nkennedy --domain EU --host H --service my_lab
-turbossh run --host H --user nkennedy --domain EU --use-stored --service my_lab uname -a
+turbossh store-credential --user myuser --domain CORP --host H --service my_lab
+turbossh run --host H --user myuser --domain CORP --use-stored --service my_lab uname -a
 ```
 
 ---
@@ -523,6 +529,62 @@ turbossh-gui
 - Nine themes (dark, light, midnight, paper, nord, nord-light, solarized-dark,
   solarized-light, dracula); a desktop and Start-menu shortcut on first run.
 
+## Embedding the GUI in your own application
+
+The whole GUI can live inside another application and be driven from it —
+whatever that application is written in. It looks and works exactly like the
+desktop app, because it is the desktop app, running as a guest.
+
+**Any toolkit, any language** (C# WinForms / WPF, C++, Electron, Java, Tk,
+wxPython, PySide6 …): start TurboSSH inside one of your windows and talk to it
+over JSON lines on its stdin / stdout.
+
+```text
+turbossh-gui.exe --embed <window handle> --control stdio
+```
+
+It fills that window and follows its size; you send `{"id": 1, "cmd":
+"connect_ssh", "args": {…}}` and receive events such as `session_connected`.
+From Python there is a ready-made client, no Qt needed:
+
+```python
+from turbossh.embed_client import TurboSSHProcess
+
+gui = TurboSSHProcess.launch(parent=frame.winfo_id())     # a Tk frame, a wx panel …
+session = gui.connect_ssh("10.0.0.5", username="root", password="…")
+gui.wait_for("session_connected", session)
+gui.send_line(session, "uname -a")
+```
+
+Tested on Windows with Tk, PyQt5 and C# WinForms hosts, using both the Python
+package and the bundled exe; [examples/embed_host_tk.py](examples/embed_host_tk.py)
+and [examples/embed_host_winforms.cs](examples/embed_host_winforms.cs) are complete
+host applications.
+
+**PyQt5 applications** can also take the whole GUI as a plain `QWidget`, in
+their own process:
+
+```python
+from turbossh.gui import TurboSSHWidget
+
+turbo = TurboSSHWidget(parent=self, log_dock=False)
+tabs.addTab(turbo, "SSH")
+
+session = turbo.connect_ssh("10.0.0.5", username="root", password="…")
+session.connected.connect(lambda: session.send_line("uname -a"))
+```
+
+It behaves like a native part of the host: its theme stays inside the widget (or
+it takes the host's look with `theme="inherit"`), its shortcuts only work while
+the focus is in it, it never quits the application, and it closes its
+connections by itself when the application quits or the widget is deleted. You
+choose which parts show (menu bar, ribbon, sidebar, log dock, status bar), can
+put its commands on your own toolbar and its menus in your own menu bar, and get
+signals for every session that opens, connects, drops or closes.
+
+[EMBEDDING.md](EMBEDDING.md) is the full reference, and
+[examples/embed_demo.py](examples/embed_demo.py) a complete host application.
+
 ## CLI reference
 
 The full reference — every command, every option, exit codes — is in
@@ -557,6 +619,7 @@ turbossh diagnose --host H                         # is the SSH port reachable?
 turbossh check-update
 
 turbossh-gui          # the GUI
+turbossh-gui --embed <window handle> --control stdio   # the GUI inside another app
 turbossh-setup        # install OpenSSH Server on THIS machine (offline)
 turbossh-shortcut     # (re)create the desktop / Start-menu shortcut
 turbossh-docs         # open the documentation

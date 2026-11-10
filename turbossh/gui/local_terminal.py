@@ -15,6 +15,7 @@ from .localshell import LineEditor, LocalShell, available_shells
 class LocalTerminalWidget(QWidget):
     """A local shell in a tab. Same contract as the session widgets:
     ``close_session()`` shuts it down without blocking."""
+    session_kind = "local"
     log = pyqtSignal(str)
 
     def __init__(self, parent=None):

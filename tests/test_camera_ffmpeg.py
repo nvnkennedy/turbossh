@@ -214,6 +214,7 @@ def test_process_reader_ends_when_the_process_exits():
 @pytest.fixture()
 def panel(qapp, monkeypatch):
     from turbossh.gui import camera_widget
+    monkeypatch.setattr(ffmpeg_tools, "cached_ffmpeg", lambda: sys.executable)
     monkeypatch.setattr(ffmpeg_tools, "ensure_local_ffmpeg",
                         lambda log=None, cancel=None: sys.executable)
     monkeypatch.setattr(ffmpeg_tools, "list_local_cameras", lambda ff: ["Cam A"])

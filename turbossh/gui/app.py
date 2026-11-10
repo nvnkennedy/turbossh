@@ -176,7 +176,14 @@ def _first_run_tasks():
         pass
 
 
-def main():
+def main(argv=None):
+    """The desktop app; with --embed / --control, TurboSSH for another application
+    (see control.py). ``argv`` defaults to the process's own arguments."""
+    from . import options
+    args = options.parse(sys.argv[1:] if argv is None else argv)
+    if options.is_hosted(args):
+        from .control import run_hosted
+        return run_hosted(args)
     # When launched from a shortcut (or elevated) the working directory is often
     # System32, so cwd-relative saves (snapshots, "save output", recordings) would
     # try to write there and fail. Move to the user's Documents/home so everything
@@ -196,7 +203,7 @@ def main():
                 "TurboSSH.Terminal.1")
         except Exception:
             pass
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0]] + list(args.qt_args))
     app.setApplicationName("TurboSSH")
     # apply the saved theme + its matching app/taskbar icon (dark = original
     # artwork, light = generated light-tile variant)

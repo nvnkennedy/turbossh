@@ -47,14 +47,25 @@ def config_from_session(s: dict, password: str, jump_password: str) -> SSHConfig
     )
 
 
-def _engine_log(signal, name: str):
+class _EngineLog:
     """A log_callback that forwards the handler's own log lines (connect, each
     command, errors) to the GUI log. They used to go to stderr only, which a
-    windowed app does not have. DEBUG chatter is left out."""
-    def forward(message: str):
+    windowed app does not have. DEBUG chatter is left out.
+
+    The handler logs from other threads, and still logs while it is disconnected
+    on a teardown thread after its tab is gone; ``close()`` (from close_session)
+    stops that before the widget is deleted — emitting into it then crashed."""
+
+    def __init__(self, signal, name: str):
+        self._gate = qtutil.SignalGate(signal)
+        self._name = name
+
+    def __call__(self, message: str) -> None:
         if not message.startswith("[DEBUG]"):
-            signal.emit(f"{message}  ({name})")
-    return forward
+            self._gate.emit(f"{message}  ({self._name})")
+
+    def close(self) -> None:
+        self._gate.close()
 
 
 def _close_handler(handler):
@@ -101,6 +112,7 @@ class _SshConnectThread(QThread):
 
 
 class SshSessionWidget(QWidget):
+    session_kind = "ssh"
     log = pyqtSignal(str)
     connected = pyqtSignal(bool, str)        # ok, message  -> main window status
     failed = pyqtSignal(str)                 # error message -> main window status
@@ -168,6 +180,7 @@ class SshSessionWidget(QWidget):
         lay.addWidget(self.inner, 1)
 
         self._cfg = config_from_session(session, password, jump_password)
+        self._engine_log = _EngineLog(self.log, session.get("name", ""))
         self._user_closed = False          # set in close_session -> no auto-reconnect
         self._reconnecting = False
         self._reconnect_until = 0.0
@@ -175,8 +188,7 @@ class SshSessionWidget(QWidget):
         self._connect()
 
     def _connect(self):
-        self._ct = _SshConnectThread(
-            self._cfg, _engine_log(self.log, self.session.get("name", "")))
+        self._ct = _SshConnectThread(self._cfg, self._engine_log)
         self._ct.ok.connect(self._on_connected)
         self._ct.fail.connect(self._on_reconnect_fail if self._reconnecting
                               else self._on_fail)
@@ -388,6 +400,7 @@ class SshSessionWidget(QWidget):
         if self._closed:
             return
         self._closed = True
+        self._engine_log.close()          # the handler outlives us on a teardown thread
         self._user_closed = True          # stop any auto-reconnect
         self._reconnecting = False
         # a connect still in flight: let it finish, then close what it opened
@@ -469,6 +482,7 @@ class _SerialSshConnectThread(QThread):
 
 
 class SerialSessionWidget(QWidget):
+    session_kind = "serial"
     log = pyqtSignal(str)
     connected = pyqtSignal(bool, str)
     failed = pyqtSignal(str)
@@ -486,6 +500,7 @@ class SerialSessionWidget(QWidget):
         self.bridge_chan = None        # raw SSH channel for native serial-over-SSH
         self._jobs: set = set()        # worker threads (bridge open)
         self._closed = False
+        self._engine_log = _EngineLog(self.log, session.get("name", ""))
 
         lay = QVBoxLayout(self); lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
         self.status = QLabel("Opening…")
@@ -519,8 +534,7 @@ class SerialSessionWidget(QWidget):
         if self.via_ssh:
             cfg = config_from_session(session, password, jump_password)
             self._ct = _SerialSshConnectThread(
-                cfg, session.get("device", "/dev/ser1"),
-                _engine_log(self.log, session.get("name", "")))
+                cfg, session.get("device", "/dev/ser1"), self._engine_log)
             self._ct.ok.connect(self._on_ssh_ok)
             self._ct.fail.connect(self._on_fail)
             self._ct.start()
@@ -731,6 +745,7 @@ class SerialSessionWidget(QWidget):
         if self._closed:
             return
         self._closed = True
+        self._engine_log.close()          # the handler outlives us on a teardown thread
         # an open still in flight: let it finish, then close what it opened
         qtutil.park_thread(self._ct, orphan={"ok": lambda h, *_: _close_handler(h)})
         qtutil.close_jobs(self._jobs)

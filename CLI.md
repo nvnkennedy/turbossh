@@ -478,7 +478,25 @@ turbossh sessions --json
 
 ### `turbossh gui`
 
-Open the graphical app. Same as the `turbossh-gui` entry point.
+Open the graphical app. Same as the `turbossh-gui` entry point (and the bundled
+`turbossh-gui.exe`, which takes the same options).
+
+The options make it run inside another application, whatever its UI toolkit
+([EMBEDDING.md](EMBEDDING.md) has the protocol and examples):
+
+| Option | Meaning |
+|---|---|
+| `--embed WINDOW` | native handle of the window to live in (an HWND on Windows, decimal or `0x…`); TurboSSH fills it and follows its size |
+| `--control stdio` | take commands and send events as JSON lines on stdin / stdout |
+| `--hide PARTS` | comma-separated parts not to show: `menu_bar`, `ribbon`, `sidebar`, `log_dock`, `status_bar`, `home` |
+| `--theme NAME` | a theme name, or `inherit` for no TurboSSH styling |
+| `--camera on\|off` | decide the Camera instead of the user's View → Camera |
+
+`--hide`, `--theme` and `--camera` need `--embed` or `--control`.
+
+```bash
+turbossh-gui --embed 0x1A2B3C --control stdio --hide log_dock
+```
 
 ### `turbossh docs`
 

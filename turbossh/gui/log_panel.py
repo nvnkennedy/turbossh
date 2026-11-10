@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 import webbrowser
 
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
 from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QPushButton,
                              QPlainTextEdit, QFileDialog, QComboBox, QLabel)
@@ -22,6 +23,8 @@ _FILTERS = [("All", 0), ("Info and up", 1), ("Warnings and up", 2), ("Errors onl
 
 
 class LogPanel(QGroupBox):
+    appended = pyqtSignal(str)          # every line, for an embedding application
+
     def __init__(self, parent=None):
         super().__init__("Log", parent)
         lay = QVBoxLayout(self)
@@ -33,8 +36,7 @@ class LogPanel(QGroupBox):
         self._entries = []          # (rank, level, text) for re-rendering on filter
         self._min_rank = 0
         try:
-            from . import settings as _s
-            self._colors = theme.log_colors(_s.get("theme") or "dark")
+            self._colors = theme.log_colors(theme.current_name())
         except Exception:
             self._colors = theme.LOG_COLORS
 
@@ -79,6 +81,7 @@ class LogPanel(QGroupBox):
             del self._entries[:10000]
         if rank >= self._min_rank:
             self._render(level, text, ts)
+        self.appended.emit(text)
 
     def set_theme(self, name: str):
         """Re-colour the log for a new app theme (light needs darker hues)."""

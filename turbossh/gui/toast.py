@@ -66,8 +66,12 @@ class ToastHost(QObject):
         toast.show()
         toast.raise_()
         self._layout()
-        seconds = KINDS[toast.kind][2]
-        QTimer.singleShot(int(seconds * 1000), lambda t=toast: self.dismiss(t))
+        # owned by the toast, so it dies with it: a free single-shot timer outlives
+        # a window deleted while the application carries on (an embedding host)
+        expiry = QTimer(toast)
+        expiry.setSingleShot(True)
+        expiry.timeout.connect(lambda t=toast: self.dismiss(t))
+        expiry.start(int(KINDS[toast.kind][2] * 1000))
         return toast
 
     def dismiss(self, toast) -> None:

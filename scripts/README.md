@@ -64,8 +64,8 @@ with SSHHandler(cfg, quiet=True) as ssh:
 
 ### Connect — via RDP (laptop → RDP machine → target)
 ```python
-rdp = SSHConfig(host="10.232.9.22", domain="CORP", username="user", password="pw")
-target = SSHConfig(host="10.120.1.91", username="root", password="pw",
+rdp = SSHConfig(host="10.0.0.22", domain="CORP", username="user", password="pw")
+target = SSHConfig(host="10.0.1.91", username="root", password="pw",
                    jump_host=rdp, host_key_policy="ignore")
 with SSHHandler(target, quiet=True) as ssh:
     print(ssh.run("uname -a").text)

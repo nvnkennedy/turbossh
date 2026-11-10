@@ -1,6 +1,7 @@
 """TurboSSH themes — a clean BLACK dark theme (default, neutral grays, no blue
 tint) and a soft, not-glaring light theme. Applied at the QApplication level so
-every window and dialog is styled. Accent is a clean cyan-teal with an
+every window and dialog is styled — or, when TurboSSH is embedded in another
+application, only to its own widget tree. Accent is a clean cyan-teal with an
 automotive coral redline. Styling matches TurboADB for a consistent toolkit."""
 
 from __future__ import annotations
@@ -109,6 +110,32 @@ def counterpart(name: str) -> str:
     """The theme the one-click toggle switches to: each dark theme's light
     partner and back."""
     return _PAIRS.get(name, "light" if not is_light(name) else "dark")
+
+
+# A theme chosen by the application TurboSSH is embedded in. It applies for this
+# process only and is never written to settings.json (the user's own choice for
+# the desktop app stays as it was).
+_active = None
+
+
+def set_active(name) -> None:
+    """Use *name* instead of the saved theme; ``None`` goes back to the saved one."""
+    global _active
+    _active = name
+
+
+def current_name() -> str:
+    """The theme in force: the embedding application's choice, else the saved one."""
+    if _active:
+        return _active
+    from . import settings as _s
+    return _s.get("theme") or "dark"
+
+
+def closest_to_palette(palette) -> str:
+    """"dark" or "light", whichever suits a Qt palette. Used when the host's own
+    styling is kept, so icon and log colours stay readable on it."""
+    return "light" if palette.window().color().lightness() > 127 else "dark"
 
 
 def _assets_dir():
@@ -359,8 +386,7 @@ def _icon_pen_color(color):
     if color:
         return color
     try:
-        from . import settings as _s
-        return accent_text(_s.get("theme") or "dark")
+        return accent_text(current_name())
     except Exception:
         return ACCENT
 

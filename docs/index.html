@@ -384,7 +384,7 @@ turbossh pull <span class="o">--host</span> H <span class="o">--user</span> root
     <div class="cmd-head"><span class="cn">turbossh serial-ssh</span><span class="badge ssh">SSH</span></div>
     <p class="cmd-d">Monitor a serial port that is plugged into the <b>remote</b> host,
       tunnelled over SSH — the headline trick for COM ports on an RDP jump box.</p>
-    <pre>turbossh serial-ssh <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span> \
+    <pre>turbossh serial-ssh <span class="o">--host</span> rdpbox <span class="o">--domain</span> CORP <span class="o">--user</span> me <span class="o">--password</span> \
    <span class="o">--device</span> COM4 <span class="o">--baud</span> 115200 <span class="o">--send</span> <span class="s">"reboot"</span> <span class="o">--save</span> uart.log</pre>
     <p class="opts"><b>Args:</b> <code>--device</code> (remote port, e.g.
       <code>COM4</code> or <code>/dev/ser1</code>) &nbsp;·&nbsp; <code>--baud</code>
@@ -397,7 +397,7 @@ turbossh pull <span class="o">--host</span> H <span class="o">--user</span> root
     <div class="cmd-head"><span class="cn">turbossh scan-ports</span><span class="badge ssh">SSH</span></div>
     <p class="cmd-d">List the serial ports on the <b>remote</b> host over SSH, with friendly
       device names — so you know what to pass to <code>serial-ssh --device</code>.</p>
-    <pre>turbossh scan-ports <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span></pre>
+    <pre>turbossh scan-ports <span class="o">--host</span> rdpbox <span class="o">--domain</span> CORP <span class="o">--user</span> me <span class="o">--password</span></pre>
     <p class="opts"><b>Args:</b> the <a href="#flags">common connection flags</a>.</p>
   </div>
 
@@ -411,7 +411,7 @@ turbossh pull <span class="o">--host</span> H <span class="o">--user</span> root
     <pre><span class="c"># this PC</span>
 turbossh camera-list
 <span class="c"># a remote RDP box</span>
-turbossh camera-list <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span></pre>
+turbossh camera-list <span class="o">--host</span> rdpbox <span class="o">--domain</span> CORP <span class="o">--user</span> me <span class="o">--password</span></pre>
     <p class="opts"><b>Args:</b> <code>--ffmpeg</code> (local ffmpeg path) &nbsp;·&nbsp;
       <code>--remote-ffmpeg</code> &nbsp;·&nbsp; plus the <a href="#flags">common flags</a>
       when using <code>--host</code>.</p>
@@ -424,7 +424,7 @@ turbossh camera-list <span class="o">--host</span> rdpbox <span class="o">--doma
     <pre><span class="c"># single snapshot from a local camera</span>
 turbossh camera-grab <span class="o">--camera</span> <span class="s">"Logitech C615"</span> <span class="o">--out</span> shot.jpg
 <span class="c"># 10-second 720p clip from a remote camera</span>
-turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> me <span class="o">--password</span> \
+turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--domain</span> CORP <span class="o">--user</span> me <span class="o">--password</span> \
    <span class="o">--camera</span> <span class="s">"USB Camera"</span> <span class="o">--out</span> clip.mp4 <span class="o">--seconds</span> 10 <span class="o">--width</span> 1280 <span class="o">--fps</span> 30</pre>
     <p class="opts"><b>Args:</b> <code>--camera NAME</code> (from
       <code>camera-list</code>) &nbsp;·&nbsp; <code>--out FILE</code> &nbsp;·&nbsp;
@@ -449,7 +449,7 @@ turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--doma
     <div class="cmd-head"><span class="cn">turbossh install-ssh-remote</span><span class="badge win">WinRM</span></div>
     <p class="cmd-d">Push the bundled OpenSSH to a <b>remote</b> Windows host over WinRM and
       install it there — no downloads on the target.</p>
-    <pre>turbossh install-ssh-remote <span class="o">--host</span> rdpbox <span class="o">--domain</span> EU <span class="o">--user</span> Administrator</pre>
+    <pre>turbossh install-ssh-remote <span class="o">--host</span> rdpbox <span class="o">--domain</span> CORP <span class="o">--user</span> Administrator</pre>
     <p class="opts"><b>Args:</b> <code>--host</code> &nbsp;·&nbsp; <code>--user</code>
       (a local admin on the target) &nbsp;·&nbsp; <code>--domain</code> &nbsp;·&nbsp;
       <code>--ssh-port</code> &nbsp;·&nbsp; <code>--winrm-port</code>.</p>
@@ -486,7 +486,7 @@ turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--doma
     <tr><td><code>--host</code></td><td>Target host or IP (required).</td></tr>
     <tr><td><code>--port</code></td><td>SSH port (default 22).</td></tr>
     <tr><td><code>--user</code></td><td>Username (required).</td></tr>
-    <tr><td><code>--domain</code></td><td>Windows domain, e.g. <code>EU</code> for an <code>EU\me</code> login.</td></tr>
+    <tr><td><code>--domain</code></td><td>Windows domain, e.g. <code>CORP</code> for an <code>CORP\me</code> login.</td></tr>
     <tr><td><code>--key</code></td><td>Path to a private-key file.</td></tr>
     <tr><td><code>--password</code></td><td>Prompt for the password (hidden input).</td></tr>
     <tr><td><code>--use-stored</code></td><td>Read the password from the OS vault instead of prompting.</td></tr>
@@ -518,8 +518,9 @@ turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--doma
     <div>
       <div class="feat" style="margin-bottom:22px">
         <h3>In the desktop app</h3>
-        <p class="d">Open the Camera panel from the ribbon <b>📷</b> button or the
-          File menu, then:</p>
+        <p class="d">The Camera is there when you want it: tick <b>View → Camera</b>
+          and a Camera tab opens, with a <b>📷</b> ribbon button from then on. Untick
+          it and every trace of it is gone again. In the Camera tab:</p>
         <ol style="color:var(--dim); font-size:15px; line-height:1.8; padding-left:20px">
           <li>Pick a <b>source</b> — <i>Local</i> (this PC) or <i>Remote</i>
             (choose a saved RDP machine; host/user prefill from your jump host).</li>
@@ -585,6 +586,15 @@ turbossh camera-grab <span class="o">--host</span> rdpbox <span class="o">--user
         <div class="card"><h3>⚡ Quick commands &amp; 🔁 auto-reconnect</h3><p>Per-session
           buttons for the commands you run constantly (mount, reset, …); dropped
           SSH sessions reconnect on their own, then on <code>Ctrl-R</code>.</p></div>
+        <div class="card"><h3>🧩 Embeddable in any application</h3><p>Put the
+          whole app inside a window of your own program — C# WinForms / WPF, C++,
+          Electron, Java, Tk, PySide6 …:
+          <code>turbossh-gui.exe --embed &lt;window handle&gt; --control stdio</code>
+          fills that window, and you drive it with JSON lines on its stdin / stdout
+          (open sessions, type, read the screen, run commands, get connected /
+          dropped events). PyQt5 tools can also take it as a widget:
+          <code>from turbossh.gui import TurboSSHWidget</code>. See
+          <a href="https://github.com/nvnkennedy/turbossh/blob/main/EMBEDDING.md">EMBEDDING.md</a>.</p></div>
       </div>
     </div>
     <div>
@@ -619,7 +629,7 @@ app: self-test <span class="g">passed</span> — system <span class="g">ready</s
 cfg = SSHConfig(
     host=<span class="s">"target"</span>, username=<span class="s">"root"</span>,
     jump_host=SSHConfig(host=<span class="s">"rdpbox"</span>,
-        username=<span class="s">"EU\\me"</span>, password=<span class="s">"…"</span>))
+        username=<span class="s">"CORP\\me"</span>, password=<span class="s">"…"</span>))
 
 <span class="k">with</span> SSHHandler(cfg) <span class="k">as</span> ssh:
     r = ssh.run(<span class="s">"systemctl is-active sshd"</span>)

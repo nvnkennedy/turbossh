@@ -18,10 +18,13 @@ Structure
                          screen, scrollback, fast text path
     qtutil.py          - worker-thread / teardown helpers
     updater.py         - "Check updates" dialog (logic in turbossh.update)
+    embed.py           - TurboSSHWidget: the whole GUI inside another application
 
-Launch with `turbossh-gui` or `python -m turbossh.gui`.
+Launch with `turbossh-gui` or `python -m turbossh.gui`. To put it inside your own
+PyQt5 application: `from turbossh.gui import TurboSSHWidget` (see EMBEDDING.md).
 """
 
+_EMBED_API = ("TurboSSHWidget", "EmbeddedSession")
 
 
 def main(*args, **kwargs):
@@ -32,4 +35,11 @@ def main(*args, **kwargs):
     return _main(*args, **kwargs)
 
 
-__all__ = ["main"]
+def __getattr__(name):          # lazy for the same reason as main()
+    if name in _EMBED_API:
+        from . import embed
+        return getattr(embed, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["main", *_EMBED_API]

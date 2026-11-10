@@ -198,6 +198,7 @@ class _RemotePrep(QThread):
         self.cfg = cfg
 
     def run(self):
+        h = None
         try:
             local = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit)
             h = SSHHandler(self.cfg, safe=True)
@@ -218,6 +219,11 @@ class _RemotePrep(QThread):
                         (getattr(probe, "stderr", "") or "")).strip()
             self.done.emit(h, remote, cams, diag)
         except Exception as exc:
+            if h is not None:            # nobody will ever get this connection
+                try:
+                    h.disconnect()
+                except Exception:
+                    pass
             self.fail.emit(f"{type(exc).__name__}: {exc}")
 
 
@@ -294,6 +300,7 @@ class _RemoteStart(QThread):
 
 
 class CameraPanel(QWidget):
+    session_kind = "camera"
     log = pyqtSignal(str)
     _rec_done = pyqtSignal(str, bool, str)      # path, saved?, ffmpeg's last words
 
@@ -317,6 +324,8 @@ class CameraPanel(QWidget):
         self._stream_gen = 0            # which start a delayed check belongs to
         self._closing = False
         self._rec_done.connect(self._on_rec_done)
+        # the recording finalizer can finish after this tab is gone
+        self._rec_gate = qtutil.SignalGate(self._rec_done)
 
         lay = QVBoxLayout(self)
 
@@ -330,14 +339,17 @@ class CameraPanel(QWidget):
         top.addWidget(self.source)
         top.addWidget(QLabel("Camera:"))
         self.camera = QComboBox(); top.addWidget(self.camera, 2)
-        top.addWidget(QLabel("Quality:"))
+        # picture options on a row of their own: on one row the panel needed
+        # ~1040 px, which forced the whole window (or a host's page) that wide
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Quality:"))
         self.res = QComboBox(); self.res.addItems(list(_RES.keys()))
         self.res.setCurrentText("720p (1280×720)")
-        top.addWidget(self.res)
+        opts.addWidget(self.res)
         self.fps = QComboBox(); self.fps.addItems(["15", "20", "25", "30"])
         self.fps.setCurrentText("25")
-        top.addWidget(self.fps)
-        top.addWidget(QLabel("View:"))
+        opts.addWidget(self.fps)
+        opts.addWidget(QLabel("View:"))
         self.view_mode = QComboBox()
         self.view_mode.addItem("Fill (no bars)", "fill")
         self.view_mode.addItem("Fit (whole frame)", "fit")
@@ -347,7 +359,8 @@ class CameraPanel(QWidget):
                                   "shape doesn't match.\nStretch = fill exactly "
                                   "(slight distortion).")
         self.view_mode.currentIndexChanged.connect(lambda *_: self._repaint_now())
-        top.addWidget(self.view_mode)
+        opts.addWidget(self.view_mode)
+        opts.addStretch(1)
         self.refresh_btn = QPushButton("🔍 Scan cameras"); self.refresh_btn.setProperty("role", "ghost")
         self.refresh_btn.setToolTip("Scan this source for available cameras.")
         self.refresh_btn.clicked.connect(self._refresh)
@@ -362,6 +375,7 @@ class CameraPanel(QWidget):
         self.res.setMinimumWidth(95); self.fps.setMinimumWidth(55)
         self.view_mode.setMinimumWidth(95)
         lay.addLayout(top)
+        lay.addLayout(opts)
 
         # --- remote connection row (hidden unless Source = Remote) ---
         self.remote_row = QWidget()
@@ -416,6 +430,9 @@ class CameraPanel(QWidget):
         row.addWidget(self.fps_lbl)
         row.addStretch(1)
         self.status = QLabel("")
+        # may be clipped when narrow (the tooltip has it all): a long message
+        # must not decide how wide the window has to be
+        self.status.setMinimumWidth(120)
         row.addWidget(self.status)
         self._set_status("Pick a source and camera, then Start.", "idle")
         self.link = QLabel(""); self.link.setOpenExternalLinks(True)
@@ -429,7 +446,22 @@ class CameraPanel(QWidget):
         self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
         self._timer.start(30)
 
-        QTimer.singleShot(0, self._refresh)
+        QTimer.singleShot(0, self._auto_scan)
+
+    def is_streaming(self) -> bool:
+        return self.reader is not None
+
+    def _auto_scan(self):
+        """List local cameras without being asked only when that costs nothing.
+        With no ffmpeg on this machine a scan means a ~160 MB download, which
+        must not start just because the tab was opened: Scan cameras asks for it."""
+        if self._closing:
+            return
+        if ffmpeg_tools.cached_ffmpeg():
+            self._refresh()
+        else:
+            self._set_status("Click Scan cameras to set up ffmpeg "
+                             "(one-time download, ~160 MB).", "info")
 
     # ---- status toast (coloured pill) ----
     _STATUS = {
@@ -449,6 +481,7 @@ class CameraPanel(QWidget):
             self.status.setStyleSheet(f"color:{fg}; background:{bg}; padding:2px 10px;"
                                       f"border-radius:9px; font-weight:600;")
         self.status.setText(text)
+        self.status.setToolTip(text)
 
     # ---- one-time ffmpeg setup popup ----
     def _on_progress(self, msg):
@@ -508,7 +541,7 @@ class CameraPanel(QWidget):
         if remote:
             self._set_status("Enter the RDP machine's details above, then Scan cameras.", "idle")
         else:
-            self._refresh()                      # local auto-lists (no creds needed)
+            self._auto_scan()                    # local needs no credentials
 
     def _machine_picked(self, *_):
         """When a saved machine is chosen from the RDP host drop-down, fill in its
@@ -565,10 +598,13 @@ class CameraPanel(QWidget):
                 self._set_status("Enter the RDP machine's host above.", "warn")
                 self.refresh_btn.setEnabled(True)
                 return
+            # a blank field means "use my keys / agent"; "" would send an empty
+            # password and switch key lookup off (see config_from_session)
             cfg = SSHConfig(host=host, port=22,
                             username=self.r_user.text().strip() or None,
                             domain=self.r_domain.text().strip() or None,
-                            password=self.r_pass.text(), host_key_policy="ignore")
+                            password=self.r_pass.text() or None,
+                            host_key_policy="ignore")
             self._set_status(f"Connecting to {host} and finding cameras…", "info")
             self._start_prep(_RemotePrep(cfg), self._remote_ready)
 
@@ -814,7 +850,8 @@ class CameraPanel(QWidget):
         if self.reader is not None and self.reader.ended:
             self._on_stream_ended()
             return
-        if self._paused or self.reader is None:
+        # a tab nobody is looking at does no scaling (recording runs on the reader)
+        if self._paused or self.reader is None or not self.isVisible():
             return
         n = self.reader.frames
         if n == self._last_paint:            # no new frame -> don't rescale again
@@ -950,10 +987,11 @@ class CameraPanel(QWidget):
         proc, self._rec_proc = self._rec_proc, None
         if proc is None:
             return                       # not recording -> nothing to save (no spam)
-        self.rec_btn.setText("⏺ Record")
+        if not self._closing:            # the button may be gone already
+            self.rec_btn.setText("⏺ Record")
         path, self._rec_path = self._rec_path, None   # clear so we report it once
         errors, self._rec_err = self._rec_err, None
-        done = self._rec_done
+        done = self._rec_gate
 
         def finalize():
             # Off the GUI thread: ffmpeg needs a moment to flush the remaining
@@ -984,10 +1022,7 @@ class CameraPanel(QWidget):
                 errors.close()
             except Exception:
                 pass
-            try:
-                done.emit(path or "", ok, detail)
-            except RuntimeError:
-                pass                     # the panel is gone; nothing to tell
+            done.emit(path or "", ok, detail)    # a no-op once the panel is gone
         qtutil.run_teardown(finalize, "record-finalize")
 
     def _on_rec_done(self, path, ok, detail):
@@ -1104,6 +1139,7 @@ class CameraPanel(QWidget):
         if self._closing:
             return
         self._closing = True
+        self._rec_gate.close()
         self._close_dl_dialog()
         try:
             self._timer.stop()

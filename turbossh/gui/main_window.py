@@ -1,10 +1,15 @@
 """tabbed multi-session main window: ribbon toolbar, Quick-connect + session-tree
 sidebar, tabbed sessions (VT100 SSH terminals + SFTP browser, serial consoles,
-RDP launch), MultiExec broadcast, and a dark log dock."""
+RDP launch), MultiExec broadcast, and a dark log dock.
+
+The same window runs as the desktop app or, with ``WindowOptions(embedded=True)``,
+as a child widget of another application (see :mod:`turbossh.gui.embed`)."""
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from typing import Optional
 
 from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QKeySequence
@@ -27,6 +32,27 @@ from .settings_dialog import SettingsDialog
 ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                          "assets", "icon.ico")
 
+INHERIT_THEME = "inherit"       # WindowOptions.theme: keep the host's own styling
+
+
+@dataclass(frozen=True)
+class WindowOptions:
+    """How a :class:`MainWindow` is hosted. The defaults are the desktop app.
+
+    ``embedded`` makes it a child widget that leaves the application alone: the
+    stylesheet, window icon and keyboard shortcuts stay inside it, closing it
+    never quits, and it offers neither Exit nor a self-update.
+    """
+    embedded: bool = False
+    menu_bar: bool = True
+    ribbon: bool = True
+    sidebar: bool = True
+    log_dock: bool = True
+    status_bar: bool = True
+    home: bool = True
+    camera: Optional[bool] = None   # None: the user's own View → Camera choice
+    theme: Optional[str] = None     # None: the saved theme; a name; INHERIT_THEME
+
 
 class _RemoteInstallDialog(QDialog):
     """Collects the WinRM details for installing OpenSSH on a remote machine."""
@@ -43,7 +69,7 @@ class _RemoteInstallDialog(QDialog):
                      "local-admin account on that machine.")
         msg.setWordWrap(True); lay.addWidget(msg)
         form = QFormLayout(); lay.addLayout(form)
-        self.host = QLineEdit(); self.host.setPlaceholderText("RDP machine IP, e.g. 10.232.9.120")
+        self.host = QLineEdit(); self.host.setPlaceholderText("RDP machine IP, e.g. 10.0.0.20")
         self.user = QLineEdit(); self.user.setPlaceholderText("a local-admin user on that machine")
         self.domain = QLineEdit(); self.domain.setPlaceholderText("Windows domain (optional)")
         self.password = QLineEdit(); self.password.setEchoMode(QLineEdit.Password)
@@ -88,24 +114,44 @@ class _RemoteInstallThread(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("TurboSSH — SSH / Serial / SFTP / RDP terminal")
-        if os.path.exists(ICON_PATH):
-            self.setWindowIcon(QIcon(ICON_PATH))
-        self.resize(1200, 780)
+    # for an embedding application (see embed.py)
+    session_opened = pyqtSignal(object, str)    # page widget, name
+    session_closed = pyqtSignal(object)         # page widget
+    theme_changed = pyqtSignal(str)
+    camera_enabled_changed = pyqtSignal(bool)
+
+    def __init__(self, parent=None, options: Optional[WindowOptions] = None):
+        super().__init__(parent)
+        self.options = options or WindowOptions()
+        self.embedded = self.options.embedded
+        if self.embedded:
+            # QMainWindow's constructor forces Qt.Window; this makes it an
+            # ordinary child of whatever the host puts it in.
+            self.setWindowFlags(Qt.Widget)
+        else:
+            self.setWindowTitle("TurboSSH — SSH / Serial / SFTP / RDP terminal")
+            if os.path.exists(ICON_PATH):
+                self.setWindowIcon(QIcon(ICON_PATH))
+            self.resize(1200, 780)
+        self._camera_forced = self.options.camera
+        self._set_theme_mode(self.options.theme)
         # theme is applied app-wide in app.main(); set here too for safety
-        from . import settings as settings_mod
-        QApplication.instance().setStyleSheet(theme.stylesheet(settings_mod.get("theme")))
+        self._apply_stylesheet(theme.current_name())
 
         self.store = SessionStore()
         self._tiled = False
         self._tiled_widget = None
+        self.named_actions = {}          # stable name -> QAction, for embedders
         self._build_menubar()
         self._build_ribbon()
         self._build_sidebar()
         self._build_center()
         self._build_log_dock()
+        if self.embedded:
+            self._scope_menu_shortcuts()
+            for dock in (self._sidebar_dock, self._log_dock):
+                # a dock floating off on its own would leave the host's window
+                dock.setFeatures(dock.features() & ~QDockWidget.DockWidgetFloatable)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("TurboSSH ready — create or open a session")
@@ -121,8 +167,72 @@ class MainWindow(QMainWindow):
         self.statusBar().insertPermanentWidget(0, self._summary)
         self._home = None
         self.refresh_sessions()
-        self.open_home()        # MobaXterm-style welcome screen at startup
+        if self.options.home:
+            self.open_home()    # MobaXterm-style welcome screen at startup
+        self._apply_camera_visibility()
+        if self.embedded:
+            o = self.options
+            self.set_chrome(menu_bar=o.menu_bar, ribbon=o.ribbon, sidebar=o.sidebar,
+                            log_dock=o.log_dock, status_bar=o.status_bar)
         QTimer.singleShot(0, self._report_store_problems)
+
+    def _set_theme_mode(self, choice):
+        """``None``: the user's saved theme. A name: that theme, chosen by the
+        embedding application for this run only (theme_locked). INHERIT_THEME: no
+        stylesheet of ours; icon / log colours follow the host's palette."""
+        self.theme_locked = choice is not None
+        self._inherit_style = choice == INHERIT_THEME
+        if self._inherit_style:
+            theme.set_active(theme.closest_to_palette(self.palette()))
+        elif choice:
+            theme.set_active(choice)
+
+    def current_theme(self) -> str:
+        return INHERIT_THEME if self._inherit_style else theme.current_name()
+
+    def set_theme(self, name):
+        """Switch theme now: a theme name or INHERIT_THEME. Saved as the user's
+        choice unless the embedding application decides the theme."""
+        if name != INHERIT_THEME and name not in theme.THEME_NAMES:
+            raise ValueError(f"unknown theme {name!r}")
+        if self.theme_locked or name == INHERIT_THEME:
+            self._set_theme_mode(name)
+        else:
+            from . import settings as _s
+            _s.save({"theme": name})
+        if self._inherit_style:
+            self.setStyleSheet("")
+        self._theme_act.setVisible(not self.theme_locked)
+        self.apply_theme(theme.current_name())
+
+    def _apply_stylesheet(self, name):
+        """App-wide when this window IS the application. Hosted, only this widget
+        tree (dialogs and menus inherit it from their parent), or nothing at all
+        when the host's own styling is to be kept."""
+        if not self.embedded:
+            QApplication.instance().setStyleSheet(theme.stylesheet(name))
+        elif not self._inherit_style:
+            self.setStyleSheet(theme.stylesheet(name))
+
+    def _scope_menu_shortcuts(self):
+        """Hosted, a shortcut must only work while the keyboard is inside TurboSSH;
+        the default (window) context would steal the host's Ctrl+S and friends, and
+        where both define a key Qt fires neither. That context needs the action on
+        a widget holding the focus, and a menu's own widgets never do."""
+        for entry in self.menuBar().actions():
+            for action in entry.menu().actions():
+                if not action.shortcut().isEmpty():
+                    action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+                    self.addAction(action)
+
+    def set_chrome(self, *, menu_bar=None, ribbon=None, sidebar=None, log_dock=None,
+                   status_bar=None):
+        """Show or hide the parts around the tabs; ``None`` leaves one as it is."""
+        for value, part in ((menu_bar, self.menuBar()), (ribbon, self._ribbon),
+                            (sidebar, self._sidebar_dock), (log_dock, self._log_dock),
+                            (status_bar, self.statusBar())):
+            if value is not None:
+                part.setVisible(bool(value))
 
     def _report_store_problems(self):
         """Say so when sessions.json / settings.json could not be read. The file
@@ -152,15 +262,16 @@ class MainWindow(QMainWindow):
                          QKeySequence("Ctrl+N"))
         m_file.addAction(ic("💻"), "Local terminal", self.open_local_terminal,
                          QKeySequence("Ctrl+Shift+L"))
-        m_file.addAction(ic("📷"), "Camera…", self.open_camera_panel)
+        self._camera_menu_act = m_file.addAction(ic("📷"), "Camera…", self.open_camera_panel)
         m_file.addAction(ic("💾"), "Save terminal output…", self._save_current_output,
                          QKeySequence("Ctrl+S"))
         m_file.addSeparator()
         m_file.addAction(ic("🖧"), "Set up SSH server on this PC…",
                          self.setup_ssh_server)
-        m_file.addSeparator()
-        m_file.addAction(ic("⏻", "#f06e60"), "Exit", self.close,
-                         QKeySequence("Ctrl+Q"))
+        if not self.embedded:           # leaving is the host's business
+            m_file.addSeparator()
+            m_file.addAction(ic("⏻", "#f06e60"), "Exit", self.close,
+                             QKeySequence("Ctrl+Q"))
 
         m_edit = mb.addMenu("&Edit")
         m_edit.addAction(ic("📋"), "Copy", self._term_copy,
@@ -176,6 +287,11 @@ class MainWindow(QMainWindow):
         m_view.addAction(ic("📜"), "Logs", lambda: self._show_inner("Logs"))
         m_view.addAction(ic("🔲"), "Split / unsplit", self.toggle_split)
         m_view.addAction(ic("🧾"), "Show / hide log dock", self.toggle_log)
+        m_view.addSeparator()
+        self._camera_toggle_act = m_view.addAction(ic("📷"), "Camera")
+        self._camera_toggle_act.setCheckable(True)
+        self._camera_toggle_act.triggered.connect(self._on_camera_toggled)
+        self._camera_toggle_act.setVisible(not self.camera_locked)
 
         m_session = mb.addMenu("&Session")
         m_session.addAction(ic("▶"), "Open / Connect", self.open_selected)
@@ -183,16 +299,19 @@ class MainWindow(QMainWindow):
         m_session.addAction(ic("🗑"), "Delete", self.delete_session)
 
         m_help = mb.addMenu("&Help")
-        m_help.addAction(ic("⬆"), "Check for updates…", self.check_updates)
+        if not self.embedded:           # updating would close and relaunch the host
+            m_help.addAction(ic("⬆"), "Check for updates…", self.check_updates)
         m_help.addAction(ic("❓"), "Documentation", self._open_docs)
 
     # --- menu helpers that act on the current session's terminal ---
     def _current_session_widget(self):
         """The session the user is working in: the current tab — or, in split
         view (where the tab bar is empty, so every menu action used to do
-        nothing), the pane that holds the keyboard focus, else the first pane."""
+        nothing), the pane that holds the keyboard focus, else the first pane
+        that is a session (the Home tab is tiled too, but has no terminal)."""
         if getattr(self, "_tiled", False):
-            panes = [w for (w, _title) in getattr(self, "_tiled_items", [])]
+            panes = [w for (w, _title) in getattr(self, "_tiled_items", [])
+                     if hasattr(w, "close_session")]
             focus = QApplication.focusWidget()
             while focus is not None:
                 if focus in panes:
@@ -389,25 +508,29 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         # Edit / Delete intentionally NOT here — they live in the session
         # right-click menu (and the Session menu), keeping the ribbon clean.
+        # The first column is the action's stable public name (embed.py: action()).
         items = [
-            ("🖥", "Session", self.new_session),
-            ("💻", "Local", self.open_local_terminal),
-            ("📷", "Camera", self.open_camera_panel),
-            ("📁", "SFTP", lambda: self._show_inner("SFTP")),
-            ("📜", "Logs", lambda: self._show_inner("Logs")),
-            ("split", "Split", self.toggle_split),         # custom-drawn icon
-            ("📋", "Log dock", self.toggle_log),
-            ("server", "SSH server", self.setup_ssh_server),  # custom-drawn icon
-            ("⬆", "Check updates", self.check_updates),
-            ("⚙", "Settings", self.show_settings),
-            ("❓", "Help", self._open_docs),
+            ("session", "🖥", "Session", self.new_session),
+            ("local", "💻", "Local", self.open_local_terminal),
+            ("camera", "📷", "Camera", self.open_camera_panel),
+            ("sftp", "📁", "SFTP", lambda: self._show_inner("SFTP")),
+            ("logs", "📜", "Logs", lambda: self._show_inner("Logs")),
+            ("split", "split", "Split", self.toggle_split),   # custom-drawn icon
+            ("log_dock", "📋", "Log dock", self.toggle_log),
+            ("ssh_server", "server", "SSH server", self.setup_ssh_server),  # custom-drawn
+            ("updates", "⬆", "Check updates", self.check_updates),
+            ("settings", "⚙", "Settings", self.show_settings),
+            ("help", "❓", "Help", self._open_docs),
         ]
         self._ribbon_actions = []        # (action, emoji) for re-theming icons
-        for emoji, label, slot in items:
+        for key, emoji, label, slot in items:
+            if key == "updates" and self.embedded:
+                continue                 # updating would close and relaunch the host
             act = QAction(self._ribbon_icon(emoji), label, self)
             act.triggered.connect(slot)
             tb.addAction(act)
             self._ribbon_actions.append((act, emoji))
+            self.named_actions[key] = act
         from PyQt5.QtWidgets import QSizePolicy
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -416,6 +539,7 @@ class MainWindow(QMainWindow):
         self._theme_act = QAction(self._theme_icon(), "Theme", self)
         self._theme_act.setToolTip("Toggle light / dark theme")
         self._theme_act.triggered.connect(self._toggle_theme)
+        self._theme_act.setVisible(not self.theme_locked)
         tb.addAction(self._theme_act)
         # Compact (icons only) <-> Standard (icons + text) toggle
         self._density_act = QAction(theme.emoji_icon("🗜"), "Compact", self)
@@ -423,12 +547,13 @@ class MainWindow(QMainWindow):
                                      "(icons + text) — compact frees screen space")
         self._density_act.triggered.connect(self._toggle_ribbon_density)
         tb.addAction(self._density_act)
-        exit_act = QAction(theme.emoji_icon("⏻", "#f06e60"), "Exit", self)
-        exit_act.triggered.connect(self.close)
-        tb.addAction(exit_act)
-        btn = tb.widgetForAction(exit_act)
-        if btn is not None:
-            btn.setStyleSheet("color:#f06e60; font-weight:700;")
+        if not self.embedded:
+            exit_act = QAction(theme.emoji_icon("⏻", "#f06e60"), "Exit", self)
+            exit_act.triggered.connect(self.close)
+            tb.addAction(exit_act)
+            btn = tb.widgetForAction(exit_act)
+            if btn is not None:
+                btn.setStyleSheet("color:#f06e60; font-weight:700;")
         self._apply_ribbon_density()
 
     def _apply_ribbon_density(self):
@@ -454,14 +579,12 @@ class MainWindow(QMainWindow):
         return theme.emoji_icon(emoji)
 
     def _theme_icon(self):
-        from . import settings as _s
-        cur = _s.get("theme") or "dark"
-        return theme.emoji_icon("☀" if theme.is_light(cur) else "🌙")
+        return theme.emoji_icon("☀" if theme.is_light(theme.current_name()) else "🌙")
 
     def _toggle_theme(self):
         """Ribbon one-click theme switch — persists + applies everywhere instantly."""
         from . import settings as _s
-        new = theme.counterpart(_s.get("theme") or "dark")
+        new = theme.counterpart(theme.current_name())
         cfg = _s.load(); cfg["theme"] = new; _s.save(cfg)
         self.apply_theme(new)
         self.log_panel.append(f"[OK] theme switched to {new}")
@@ -469,7 +592,7 @@ class MainWindow(QMainWindow):
     def apply_theme(self, name):
         """Apply a theme everywhere IMMEDIATELY: stylesheet, log colours, the
         theme-tinted ribbon icons, and the window/taskbar icon."""
-        QApplication.instance().setStyleSheet(theme.stylesheet(name))
+        self._apply_stylesheet(name)
         try:
             self.log_panel.set_theme(name)
         except Exception:
@@ -482,17 +605,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_density_act"):
             self._density_act.setIcon(theme.emoji_icon("🗜"))
         self._apply_app_icon(name)
+        self.theme_changed.emit(name)
 
     def _apply_app_icon(self, name=None):
         """Set the window + taskbar icon to the current theme's variant (dark =
-        original artwork, light = generated light-tile variant)."""
+        original artwork, light = generated light-tile variant). Hosted, those
+        icons are the host's."""
         if name is None:
-            from . import settings as _s
-            name = _s.get("theme") or "dark"
-        ic = theme.app_icon(name)
-        if ic is not None and not ic.isNull():
-            self.setWindowIcon(ic)
-            QApplication.instance().setWindowIcon(ic)
+            name = theme.current_name()
+        if not self.embedded:
+            ic = theme.app_icon(name)
+            if ic is not None and not ic.isNull():
+                self.setWindowIcon(ic)
+                QApplication.instance().setWindowIcon(ic)
         if hasattr(self, "_theme_act"):
             self._theme_act.setIcon(self._theme_icon())
 
@@ -566,7 +691,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCornerWidget(tabmenu, Qt.TopLeftCorner)
         self.setCentralWidget(self.tabs)
 
-    def _host_session_widget(self, w, title, make_current=True):
+    def _host_session_widget(self, w, title, make_current=True, name=None):
         """Add a session/camera widget either to the tab bar or, when the split
         (tiled) view is active, into the grid — otherwise a session opened while
         split connected but appeared nowhere (self.tabs is detached while tiled)."""
@@ -578,6 +703,16 @@ class MainWindow(QMainWindow):
             if make_current:
                 self.tabs.setCurrentIndex(idx)
         self._update_summary()
+        self.session_opened.emit(w, name or title)
+
+    def activate_session_widget(self, w):
+        """Bring a session to the front and give it the keyboard."""
+        index = self.tabs.indexOf(w)
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
+        term = getattr(w, "term", None)
+        if term is not None:
+            term.setFocus()
 
     def open_home(self):
         """Show (or focus) the Home / welcome tab."""
@@ -658,12 +793,13 @@ class MainWindow(QMainWindow):
         # neither. The Ctrl+Shift variants are the ones that work while a
         # terminal has the keyboard: it keeps plain Ctrl+W / Ctrl+T / Ctrl+N /
         # Ctrl+S / Ctrl+Q for the shell (see Vt100Terminal.event).
+        context = Qt.WidgetWithChildrenShortcut if self.embedded else Qt.WindowShortcut
         for seq, slot in (("Ctrl+T", self.new_session),
                           ("Ctrl+Shift+T", self.new_session),
                           ("Ctrl+W", self._close_current_tab),
                           ("Ctrl+Shift+W", self._close_current_tab),
                           ("Ctrl+Return", self.open_selected), ("F1", self._open_docs)):
-            QShortcut(QKeySequence(seq), self, activated=slot)
+            QShortcut(QKeySequence(seq), self, activated=slot, context=context)
 
     # ---- sessions ----
     def refresh_sessions(self):
@@ -775,14 +911,81 @@ class MainWindow(QMainWindow):
         from .local_terminal import LocalTerminalWidget
         panel = LocalTerminalWidget()
         panel.log.connect(self.log_panel.append)
-        self._host_session_widget(panel, "💻 Local")
+        self._host_session_widget(panel, "💻 Local", name="Local")
+        return panel
 
     def open_camera_panel(self, *_):
         """Open the Camera viewer in its own tab (Local/Remote, not a session)."""
         from .camera_widget import CameraPanel
         panel = CameraPanel(self.store)
         panel.log.connect(self.log_panel.append)
-        self._host_session_widget(panel, "📷 Camera")
+        self._host_session_widget(panel, "📷 Camera", name="Camera")
+        return panel
+
+    # ---- the Camera is optional: on only when somebody wants it ----
+    @property
+    def camera_locked(self) -> bool:
+        """True when the embedding application decides, not the user."""
+        return self._camera_forced is not None
+
+    def camera_enabled(self) -> bool:
+        if self.camera_locked:
+            return self._camera_forced
+        from . import settings as _s
+        return bool(_s.get("camera_enabled"))
+
+    def set_camera_enabled(self, enabled):
+        """Show or hide every way into the Camera. Hiding it closes its tabs,
+        which stops any stream and recording and releases the device. Remembered
+        unless the embedding application decides."""
+        enabled = bool(enabled)
+        changed = enabled != self.camera_enabled()
+        if self.camera_locked:
+            self._camera_forced = enabled
+        elif changed:
+            from . import settings as _s
+            _s.save({"camera_enabled": enabled})
+        if not enabled:
+            for panel in self._camera_panels():
+                self._close_session_widget(panel)
+        self._apply_camera_visibility()
+        if changed:
+            self.camera_enabled_changed.emit(enabled)
+
+    def _camera_panels(self):
+        return [w for w in self._all_sessions()
+                if getattr(w, "session_kind", None) == "camera"]
+
+    def _apply_camera_visibility(self):
+        enabled = self.camera_enabled()
+        self._camera_menu_act.setVisible(enabled)
+        self.named_actions["camera"].setVisible(enabled)
+        self._camera_toggle_act.setChecked(enabled)
+        self._refresh_home()
+
+    def hidden_home_cards(self) -> set:
+        """Which Home tab cards do not apply right now."""
+        hidden = set()
+        if not self.camera_enabled():
+            hidden.add("camera")
+        if self.embedded:
+            hidden.add("updates")
+        return hidden
+
+    def _on_camera_toggled(self, checked):
+        """View → Camera: on shows the Camera and opens it; off puts it away."""
+        if not checked:
+            streaming = [w for w in self._camera_panels() if w.is_streaming()]
+            if streaming and QMessageBox.question(
+                    self, "Camera",
+                    f"{len(streaming)} Camera tab(s) are streaming. Hiding the Camera "
+                    f"stops them and ends any recording.\n\nHide it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                self._camera_toggle_act.setChecked(True)
+                return
+        self.set_camera_enabled(checked)
+        if checked:
+            self.open_camera_panel()
 
     def edit_session(self):
         name = self._selected_name()
@@ -823,11 +1026,16 @@ class MainWindow(QMainWindow):
         """Open a saved session by name (used by the sidebar AND the Home tab)."""
         s = self.store.get(name)
         if not s:
-            return
+            return None
+        return self.open_session_config(s, SessionStore.password(name) or "",
+                                        SessionStore.jump_password(name) or "")
+
+    def open_session_config(self, s, pw="", jpw=""):
+        """Open a session from its description, saved or not. Returns its page, or
+        None when the user chose not to take over a serial port already open."""
+        name = s.get("name")
         # lazy import (loads paramiko on first connect, not at window startup)
         from .session_widgets import SshSessionWidget, SerialSessionWidget
-        pw = SessionStore.password(name) or ""
-        jpw = SessionStore.jump_password(name) or ""
         kind = s.get("type")
         # a serial port can't be shared — if it's already open, offer to reopen
         if kind == "serial":
@@ -840,7 +1048,7 @@ class MainWindow(QMainWindow):
                         "Close it and open this one?",
                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                     if resp != QMessageBox.Yes:
-                        return
+                        return None
                     self._close_session_widget(tw)
                     break
         w = SerialSessionWidget(s, pw, jpw) if kind == "serial" \
@@ -856,9 +1064,12 @@ class MainWindow(QMainWindow):
             w.notify.connect(lambda text, kind: self.notify(text, kind, log=False))
         icon = s.get("icon") or ("📡" if (kind == "serial" and s.get("via_ssh"))
                                  else "🔌" if kind == "serial" else "🖥")
-        self._host_session_widget(w, f"{icon} {name}")
+        self._host_session_widget(w, f"{icon} {name}", name=name)
         self.log_panel.append(f"Opening '{name}'…")
-        self.statusBar().showMessage(f"Connecting to {s.get('host')}…")
+        # a local serial port has no host (this used to say "Connecting to …")
+        target = s.get("device") if kind == "serial" and not s.get("via_ssh") else s.get("host")
+        self.statusBar().showMessage(f"Connecting to {target}…")
+        return w
 
     def notify(self, text, kind="info", log=True):
         """Tell the user something that needs no answer: a toast in the corner,
@@ -947,8 +1158,7 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(cell); v.setContentsMargins(3, 3, 3, 3); v.setSpacing(2)
         bar = QHBoxLayout(); bar.setContentsMargins(0, 0, 0, 0)
         cap = QLabel("  " + title)
-        from . import settings as _s
-        palette = _t.THEMES.get(_s.get("theme") or "dark", _t.THEMES["dark"])
+        palette = _t.THEMES.get(_t.current_name(), _t.THEMES["dark"])
         cap.setStyleSheet(f"background:{palette['ribbon']};"
                           f"color:{_t.ACCENT};padding:4px;border-radius:5px;"
                           f"font-weight:600;")
@@ -981,12 +1191,18 @@ class MainWindow(QMainWindow):
 
     def show_settings(self):
         dlg = SettingsDialog(self)
-        if dlg.exec_() == dlg.Accepted:
+        accepted = dlg.exec_() == dlg.Accepted
+        dlg.deleteLater()               # a parented dialog is otherwise kept forever
+        if accepted:
             from . import settings as settings_mod
             cfg = dlg.result_settings()
+            camera = cfg.pop("camera_enabled", None)
             settings_mod.save(cfg)
-            self.apply_theme(cfg["theme"])      # full immediate update everywhere
-            self.log_panel.append(f"[OK] Settings saved — theme: {cfg['theme']}")
+            name = theme.current_name()
+            self.apply_theme(name)              # full immediate update everywhere
+            if camera is not None:
+                self.set_camera_enabled(camera)
+            self.log_panel.append(f"[OK] Settings saved — theme: {name}")
 
     def _dispose(self, w):
         """Shut a tab's widget down and DELETE it. Removing the tab only hides the
@@ -1004,6 +1220,8 @@ class MainWindow(QMainWindow):
         w.setParent(None)
         w.deleteLater()
         self._update_summary()
+        if hasattr(w, "close_session"):
+            self.session_closed.emit(w)
 
     def _close_tab(self, index):
         w = self.tabs.widget(index)
@@ -1055,7 +1273,27 @@ class MainWindow(QMainWindow):
         # only real sessions (Home/welcome tab has no close_session)
         return [w for w in widgets if w is not None and hasattr(w, "close_session")]
 
+    def stop_background_work(self):
+        """Workers this window started must not be destroyed while running, and
+        its polling timer must not outlive the window."""
+        for attr in ("_remote_install", "_update_thread"):
+            qtutil.park_thread(getattr(self, attr, None))
+        timer = getattr(self, "_sshd_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def shut_down(self):
+        """Close every session and stop all background work: no questions, no
+        waiting, and the application keeps running. Safe to call twice."""
+        for w in self._all_sessions():
+            self._close_session_widget(w)
+        self.stop_background_work()
+
     def closeEvent(self, event):
+        if self.embedded:               # the host owns the process and the decision
+            self.shut_down()
+            event.accept()
+            return
         sessions = self._all_sessions()
         if sessions:
             resp = QMessageBox.question(
@@ -1074,9 +1312,7 @@ class MainWindow(QMainWindow):
                     w.close_session()
             except Exception:
                 pass
-        # workers this window started must not be destroyed while running
-        for attr in ("_remote_install", "_update_thread"):
-            qtutil.park_thread(getattr(self, attr, None))
+        self.stop_background_work()
         # close_session hands the slow part (releasing a remote COM port or
         # camera, disconnecting) to background threads so tabs close instantly;
         # give those a moment to finish, or the remote port stays locked.

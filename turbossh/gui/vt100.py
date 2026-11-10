@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QFileDialog, QMenu,
                              QMessageBox, QScrollBar, QToolTip, QWidget)
 
 from .. import paths
+from .qtutil import SignalGate
 from .termscreen import TermScreen
 
 # 16-color ANSI palette (xterm-ish), on a dark background. The terminal is ALWAYS
@@ -171,6 +172,8 @@ class Vt100Terminal(QWidget):
         self._selecting = False
         self._anchor = (0, 0)
         self._saved.connect(self._on_saved)
+        # the save runs on a thread that can finish after this widget is deleted
+        self._saved_gate = SignalGate(self._saved)
 
     # ---- wiring -----------------------------------------------------------
     def set_source(self, pull_fn, dropped_fn=None):
@@ -891,9 +894,9 @@ class Vt100Terminal(QWidget):
                                 wrote = wrote or bool(text.strip())
                 if not wrote:                        # no capture: what is on screen
                     out.write(fallback)
-            self._saved.emit(path, "")
+            self._saved_gate.emit(path, "")
         except Exception as exc:
-            self._saved.emit(path, f"{type(exc).__name__}: {exc}")
+            self._saved_gate.emit(path, f"{type(exc).__name__}: {exc}")
 
     def _on_saved(self, path, error):
         if error:
@@ -931,6 +934,7 @@ class Vt100Terminal(QWidget):
 
     def cleanup(self):
         """Close + delete the disk capture (call when the session closes)."""
+        self._saved_gate.close()
         try:
             self._resize_timer.stop(); self._timer.stop()
         except Exception:

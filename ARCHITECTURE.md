@@ -47,6 +47,11 @@ turbossh/
 └── gui/               the PyQt5 application
     ├── app.py             QApplication setup, theme, crash hook, shortcuts
     ├── main_window.py     ribbon, menu bar, sidebar, tabs, log dock
+    ├── embed.py           TurboSSHWidget / EmbeddedSession: the public API for
+    │                      hosting the whole GUI inside another PyQt5 application
+    ├── control.py         --embed / --control: the GUI as a guest of ANY
+    │                      application (native reparenting + JSON-lines channel)
+    ├── options.py         the GUI's command-line options (no Qt)
     ├── session_widgets.py SshSessionWidget / SerialSessionWidget
     ├── session_dialog.py  new/edit session dialog
     ├── settings*.py       persisted settings + dialog
@@ -102,6 +107,67 @@ screen immediately instead of trickling out for seconds.
 Scrollback is pyte's `HistoryScreen` (≈16 KB/line, so it's capped — 10k lines by
 default, configurable). The *full* session is teed to a file on disk as it
 streams, which is what **Save all output** reads — that part is unbounded.
+
+## GUI: one window, two hosts
+
+`MainWindow` is both the desktop app and, with `WindowOptions(embedded=True)`, a
+child widget inside someone else's application. `embed.TurboSSHWidget` wraps it
+in that mode and is the only supported way in (EMBEDDING.md is its reference).
+What changes when it is hosted is everything that is application-wide in Qt:
+
+- **Stylesheet.** `_apply_stylesheet` sets it on the window itself, not on the
+  `QApplication`; dialogs and menus inherit it because they are parented to the
+  window (`qtutil.owner_window` finds it, since `widget.window()` would be the
+  host's). `theme.set_active` holds a host-chosen theme that is never saved.
+- **Shortcuts.** Window-context shortcuts would take keys from the whole host
+  window, and a key both define fires neither. Hosted, they are
+  `WidgetWithChildrenShortcut`, and menu actions are also added to the window,
+  because that context only matches widgets that can hold the focus.
+- **Closing.** Nothing hosted quits the application or offers Exit or the
+  self-update (which closes and relaunches the process).
+- **Lifetime.** A child widget gets no `closeEvent` when the host closes, and
+  its sessions own running QThreads, which Qt aborts the process for if one is
+  destroyed. So `embed._LIVE` holds every widget until it is shut down, and the
+  shutdown is triggered by `aboutToQuit`, by the widget's `destroyed` signal
+  (deleteLater, a deleted parent), or by an explicit `shutdown()`.
+- **Signals from plain threads.** Teardown threads outlive their tab: the
+  handler logs while it disconnects, a save or a recording finishes later.
+  Emitting into a widget Qt has deleted is an access violation, not an
+  exception, so those threads emit through a `qtutil.SignalGate` that the widget
+  closes in `close_session` / `cleanup`.
+
+For applications that are not PyQt5 (another toolkit, another language, or a
+PySide6 / PyQt6 program that cannot load PyQt5 next to its own Qt), `control.py`
+runs the same `TurboSSHWidget` in a process of its own:
+
+- **`--embed HANDLE`**: Qt's `QWindow.fromWinId` wraps the host's native window
+  and becomes the parent of TurboSSH's window (Qt turns it into a `WS_CHILD`). A
+  50 ms timer keeps it the size of the parent's client area and notices when
+  the parent is destroyed. Its UI thread joins the host window's thread input
+  (`AttachThreadInput`) — the keyboard goes to the focus window of the
+  foreground thread's input state, and `SetFocus` fails across separate ones —
+  and a click inside calls `SetFocus` (a child window does not get the keyboard
+  by itself). Before Qt starts, it takes on the parent
+  window's DPI awareness (`-platform windows:dpiawareness=N`): across DPI
+  contexts Windows rescales child coordinates, and an unaware host saw TurboSSH
+  25 % too large at 125 % scaling.
+- **`--control stdio`**: a reader thread turns stdin lines into a Qt signal; the
+  GUI thread dispatches `cmd_*` methods and writes one JSON line per answer or
+  event. Standard output is then pointed at standard error so a stray `print`
+  cannot corrupt the channel.
+- **No cross-process deadlock.** The two processes share an input queue (Windows
+  attaches them for a cross-process parent / child), so a focus change in one
+  can send a message the other's UI thread must answer. So every request is
+  answered before any UI work happens, nothing waits on the host, the window
+  has `WS_EX_NOPARENTNOTIFY`, and the Python client waits with
+  `PeekMessage(PM_QS_SENDMESSAGE)` so a host blocking in a call still answers.
+- `turbossh/embed_client.py` is the Qt-free client: it starts the process
+  (`python -m turbossh.gui`, or the bundled exe) and speaks the protocol.
+
+The Camera is optional in both hosts: off by default (`camera_enabled`), and
+while off there is no Camera action, menu entry or Home card, and
+`camera_widget` (which pulls in the SSH stack) is never imported. Opening a
+Camera tab does not fetch ffmpeg either; only Scan cameras does.
 
 ## Serial over SSH
 

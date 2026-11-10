@@ -27,6 +27,9 @@ DEFAULTS = {
     # teed to disk, so "Save all output" is unlimited regardless of this value.
     "term_scrollback": 10000,
     "default_baud": 115200,
+    # Camera is off until asked for (View → Camera). While off there is no Camera
+    # button, menu entry or Home card, and nothing camera-related runs.
+    "camera_enabled": False,
     # Camera (remote webcam over SSH via ffmpeg). ffmpeg_path is an optional local
     # ffmpeg.exe to use instead of the auto-fetched one (fully offline).
     "ffmpeg_path": "",

@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QStyle, QApplication, QSizePolicy)
 
 from . import transfer_log as tl
-from .qtutil import run_job, close_jobs, park_thread, run_teardown
+from .qtutil import run_job, close_jobs, owner_window, park_thread, run_teardown
 
 _COLUMNS = ("Name", "Size", "Modified", "Permissions")
 # what a drag out of the remote list carries: the names of the dragged entries,
@@ -685,7 +685,7 @@ class SftpBrowser(QWidget):
             return None
         from .remote_edit import RemoteEditDialog
         dialog = RemoteEditDialog(self._remote, posixpath.join(self.cwd, entries[0].name),
-                                  self.window())
+                                  owner_window(self))
         self._editors = [d for d in self._editors if d.isVisible()] + [dialog]
         dialog.show()
         return dialog

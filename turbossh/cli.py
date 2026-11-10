@@ -350,7 +350,7 @@ def launch_gui(argv=None) -> int:
         # outside the try: a missing module INSIDE the GUI is a real error to
         # show, not a reason to fall through to "the GUI needs PyQt5"
         from .gui.app import main as gui_main
-        return gui_main()
+        return gui_main(argv)
     exe = _gui_exe_path()
     if os.name == "nt" and os.path.exists(exe):
         args = list(argv) if argv is not None else sys.argv[1:]
@@ -739,7 +739,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--json", action="store_true",
                        help="emit machine-readable JSON")
 
-    sub.add_parser("gui", help="open the graphical app (same as turbossh-gui)")
+    from .gui.options import add_gui_options
+    add_gui_options(sub.add_parser(
+        "gui", help="open the graphical app (same as turbossh-gui), or run it "
+                    "inside another application with --embed / --control"))
     sub.add_parser("docs", help="open the documentation (same as turbossh-docs)")
     sub.add_parser("shortcut", help="create Desktop / Start-Menu shortcuts "
                                     "(same as turbossh-shortcut; Windows)")
@@ -754,7 +757,9 @@ def _main(argv=None) -> int:
         print(f"turbossh {__version__}")
         return 0
     if args.cmd == "gui":
-        return launch_gui([])
+        from .gui import options as gui_options
+        gui_options.validate(build_parser(), args)
+        return launch_gui(gui_options.to_argv(args))
     if args.cmd == "docs":
         return open_docs([])
     if args.cmd == "shortcut":

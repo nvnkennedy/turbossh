@@ -19,6 +19,43 @@ import threading
 import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtWidgets import QMainWindow
+
+
+class SignalGate:
+    """Lets a plain Python thread emit a widget's signal until the widget closes.
+
+    Emitting a signal of a widget Qt has already deleted crashes the process with
+    an access violation, not an exception. A thread that can outlive its widget —
+    a teardown that logs while it disconnects, a save or a recording that finishes
+    later — emits through a gate, and the widget closes the gate before it goes.
+    The lock means no emit is still running once ``close()`` has returned."""
+
+    def __init__(self, signal):
+        self._signal = signal
+        self._lock = threading.RLock()   # re-entrant: a direct slot may close it
+
+    def emit(self, *args) -> bool:
+        with self._lock:
+            if self._signal is None:
+                return False
+            self._signal.emit(*args)
+            return True
+
+    def close(self) -> None:
+        with self._lock:
+            self._signal = None
+
+
+def owner_window(widget):
+    """The TurboSSH window *widget* lives in. ``widget.window()`` is the top-level
+    window, which is someone else's when TurboSSH is embedded: a dialog parented
+    there would lose the theme, which only reaches TurboSSH's own widgets."""
+    current = widget
+    while current is not None and not isinstance(current, QMainWindow):
+        current = current.parentWidget()
+    return current if current is not None else widget.window()
+
 
 # signal names our worker threads use for results; park_thread silences these
 _RESULT_SIGNALS = ("ok", "fail", "done", "failed", "progress", "closed",
@@ -56,6 +93,10 @@ def park_thread(thread, orphan: dict | None = None) -> None:
             signal.connect(callback)
     _PARKED.add(thread)
     thread.finished.connect(lambda t=thread: _PARKED.discard(t))
+    if thread.isFinished():
+        # it ended between isRunning() and connect(): finished() has already
+        # been emitted, and it would otherwise stay parked for good
+        _PARKED.discard(thread)
 
 
 class FunctionThread(QThread):

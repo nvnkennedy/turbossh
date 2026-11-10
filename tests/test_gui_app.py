@@ -71,7 +71,9 @@ def test_ssh_session_connects_types_and_closes(qapp, ssh_server):
     assert wait_until(lambda: "hello-from-test" in screen_text(widget.term))
     big = b"x" * 100_000                              # > one SSH packet
     widget._send(big + b"END")
-    assert wait_until(lambda: "END" in screen_text(widget.term))
+    # joined without newlines: "END" can straddle a wrap ("…E" / "ND"), where
+    # it falls depending on the terminal's width, i.e. on the font size setting
+    assert wait_until(lambda: "END" in "".join(widget.term.screen.display))
 
     # the engine's own log lines reach the GUI log now
     assert any("Connected to" in line for line in logged)
@@ -85,6 +87,43 @@ def test_ssh_session_connects_types_and_closes(qapp, ssh_server):
     assert not handler.is_connected
     widget.deleteLater()
     QTest.qWait(100)
+
+
+def test_a_closed_tab_gets_no_more_log_lines_from_its_connection(qapp, ssh_server):
+    """The handler is disconnected on a teardown thread and logs while it does;
+    emitting into the tab after Qt deleted it crashed the process."""
+    import logging
+    from turbossh.gui import qtutil
+    from turbossh.gui.session_widgets import SshSessionWidget
+    widget = SshSessionWidget(_session(ssh_server.port), "good", "")
+    assert wait_until(lambda: widget.status.text().startswith("Connected"))
+    lines = []
+    widget.log.connect(lines.append)
+    handler = widget.handler
+    handler._emit(logging.INFO, "while open")
+    assert lines and "while open" in lines[-1]
+    widget.close_session()
+    count = len(lines)
+    handler._emit(logging.WARNING, "after close")     # what the teardown thread does
+    QApplication.processEvents()
+    assert len(lines) == count
+    assert qtutil.wait_for_teardowns(10)
+    widget.deleteLater()
+
+
+def test_a_save_that_finishes_after_the_terminal_closed_reports_nothing(qapp, tmp_path):
+    from turbossh.gui.vt100 import Vt100Terminal
+    term = Vt100Terminal(send_fn=lambda data: None)
+    reports = []
+    term._saved.connect(lambda *a: reports.append(a))
+    term._save_worker(None, str(tmp_path / "a.txt"), "on screen")
+    QApplication.processEvents()
+    assert len(reports) == 1
+    term.cleanup()
+    term._save_worker(None, str(tmp_path / "b.txt"), "on screen")
+    QApplication.processEvents()
+    assert len(reports) == 1
+    term.deleteLater()
 
 
 def test_failed_connect_is_reported_in_the_tab(qapp, ssh_server):
