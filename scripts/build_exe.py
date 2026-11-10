@@ -42,6 +42,7 @@ def main(argv=None) -> int:
             (ROOT / "turbossh" / "assets" / "icon.png", "turbossh/assets"),
             (ROOT / "turbossh" / "setup_openssh_server.ps1", "turbossh"),
             (ROOT / "turbossh" / "README.md", "turbossh"),
+            (ROOT / "LICENSE", "turbossh"),          # GPL v3: the text goes with it
             (ROOT / "turbossh" / "openssh", "turbossh/openssh"),
         ]
         sep = ";" if os.name == "nt" else ":"

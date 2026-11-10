@@ -16,6 +16,13 @@ Both give you the same commands (open sessions, type into them, read the screen,
 run commands over their connection, theme, Camera …) and the same events (opened,
 connected, dropped, failed, closed).
 
+**Licensing.** TurboSSH is licensed under the GNU GPL v3 (see LICENSE). In the
+first way TurboSSH stays a separate program that your application starts and
+talks to over a pipe; the second loads it into your program's own process
+(which PyQt5, being GPL v3 itself, already does). Which obligations follow for an
+application you distribute depends on that difference; check the GPL's terms
+for your case.
+
 # Part 1 — Any application: the TurboSSH process
 
 ```text

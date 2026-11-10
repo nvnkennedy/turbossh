@@ -9,6 +9,10 @@ can live inside another application — written in anything — and be driven fr
 it. Plus fixes found while reviewing the code around both.
 
 ### Changed — please read when upgrading
+- **License: GNU GPL v3 (GPL-3.0-only), was MIT.** From 2.0.0 on, TurboSSH —
+  library, CLI, GUI and the bundled exe — is distributed under the GNU General
+  Public License version 3; the exe carries the license text. Releases up to
+  1.7.0 were published under MIT and stay under it.
 - **The Camera is off until you ask for it.** There is no Camera button, menu
   entry or Home card by default. Tick **View → Camera** (or Settings → Camera):
   a Camera tab opens, and the button, menu entry and Home card stay until you

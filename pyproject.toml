@@ -10,7 +10,7 @@ dynamic = ["version"]
 description = "SSH / serial / SFTP toolkit for automotive & embedded work — a Python library, a CLI, and a PyQt5 GUI with a real VT100 terminal. Native serial-over-RDP and offline OpenSSH install included."
 readme = "README.md"
 requires-python = ">=3.8"
-license = "MIT"
+license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "TurboSSH contributors" }]
 keywords = ["ssh", "sftp", "scp", "serial", "paramiko", "automation", "pyqt5",

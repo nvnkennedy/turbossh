@@ -21,6 +21,7 @@ datas = [
     (os.path.join(PKG, "assets", "icon.png"), "turbossh/assets"),
     (os.path.join(PKG, "setup_openssh_server.ps1"), "turbossh"),
     (os.path.join(PKG, "README.md"), "turbossh"),
+    (os.path.join(ROOT, "LICENSE"), "turbossh"),      # GPL v3: the text goes with it
     (os.path.join(PKG, "openssh"), "turbossh/openssh"),
 ]
 

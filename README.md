@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/turbossh.svg)](https://pypi.org/project/turbossh/)
 [![Python](https://img.shields.io/pypi/pyversions/turbossh.svg)](https://pypi.org/project/turbossh/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 SSH, serial, and SFTP for people who work on embedded and automotive boxes all
 day. One toolkit, three ways to drive it: a **Python library** for your test
@@ -659,4 +659,13 @@ def test_target_boots_clean(rdp_box, target):
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Copyright (C) 2026 TurboSSH contributors
+
+TurboSSH is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License version 3 (GPL-3.0-only) as published by
+the Free Software Foundation. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for
+the full text.
+
+Releases up to 1.7.0 were published under the MIT license and stay under it.
