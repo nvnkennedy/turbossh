@@ -297,15 +297,17 @@ def test_shutdown_answers_then_closes_and_quits(bridge, monkeypatch, ssh_server)
 
 # ------------------------------------------------------------------ the reference
 def test_every_command_event_and_client_method_is_in_the_reference():
-    """EMBEDDING.md is the contract for hosts in other languages: it cannot drift."""
+    """EMBEDDING.md is the contract for hosts in other languages: it cannot drift.
+    Read from the source, not imported: this check also runs where PyQt5 is not
+    installed (the library and Python 3.8 CI jobs)."""
     import re
     from turbossh.embed_client import TurboSSHProcess
-    from turbossh.gui import control
     with open(os.path.join(ROOT, "EMBEDDING.md"), encoding="utf-8") as fh:
         text = fh.read()
-    commands = [n[4:] for n in vars(control.ControlBridge) if n.startswith("cmd_")]
-    with open(control.__file__, encoding="utf-8") as fh:
-        events = set(re.findall(r'send_event\("([a-z_]+)"', fh.read()))
+    with open(os.path.join(ROOT, "turbossh", "gui", "control.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    commands = re.findall(r"^    def cmd_([a-z_]+)\(", source, flags=re.M)
+    events = set(re.findall(r'send_event\("([a-z_]+)"', source))
     methods = [n for n, v in vars(TurboSSHProcess).items()
                if not n.startswith("_") and (callable(v) or isinstance(v, (property, classmethod)))]
     assert len(commands) > 30 and len(events) > 10

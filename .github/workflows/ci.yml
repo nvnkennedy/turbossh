@@ -24,6 +24,14 @@ jobs:
         # 3.8 is covered from source by the `py38` job below.
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.9", "3.11", "3.13"]
+        # ubuntu-latest became Ubuntu 26.04, for which setup-python has no 3.9
+        # build: test 3.9 on Linux on 24.04 instead.
+        exclude:
+          - os: ubuntu-latest
+            python-version: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.9"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
