@@ -268,8 +268,9 @@ def test_the_editor_opens_only_regular_files_and_reads_a_bounded_amount(monkeypa
     with pytest.raises(remote_edit.NotEditable, match="too large"):
         remote_edit.read_remote_text(Server(), "/var/log/grows")
     assert asked == [1001], "read to the end instead of to the limit"
+    # (a file of no stated type opens: test_fixes_round2_files)
     for mode, word in ((0o020666, "character device"), (0o010644, "named pipe"),
-                       (0o060660, "block device"), (0, "unknown type")):
+                       (0o060660, "block device")):
         Attr.st_mode = mode
         with pytest.raises(remote_edit.NotEditable, match=word):
             remote_edit.read_remote_text(Server(), "/dev/thing")
@@ -595,7 +596,7 @@ def test_a_delete_that_cannot_use_the_recycle_bin_asks_first(qapp, tmp_path, mon
 
     def no_bin(path):
         threads.append(threading.current_thread() is threading.main_thread())
-        return False
+        return False, ""                 # PyQt5's static form: (ok, path in the bin)
     monkeypatch.setattr(QFile, "moveToTrash", staticmethod(no_bin))
     monkeypatch.setattr(QMessageBox, "question",
                         lambda *a, **k: (asked.append(a[2]), QMessageBox.No)[1])
@@ -667,6 +668,7 @@ def test_a_request_that_times_out_drops_its_client(ssh):
 
 def test_cancel_frees_a_transfer_stuck_on_a_dead_link(remote, tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "_ABORT_AFTER", 0.2)
+    monkeypatch.setattr(sb, "_STALL_AFTER", 0.5)         # nothing ever moved
 
     def dead_link(sftp, remote_path, local, callback=None):
         while not sftp.get_channel().closed:             # no data, no callback

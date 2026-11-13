@@ -59,8 +59,13 @@ _CLOSE_WAIT = 2.0        # s a closing browser lets a busy worker finish before
 _SFTP_TIMEOUT = 30.0     # s of silence from the server before a request fails;
                          # without it a dead link said "Loading…" until TCP gave
                          # up (which can take a quarter of an hour)
-_ABORT_AFTER = 2.0       # s a cancelled transfer gets to stop by itself before
-                         # its client is closed under it (dead link: never)
+_ABORT_AFTER = 2.0       # s between looks at a cancelled transfer still running
+_STALL_AFTER = 8.0       # s without a block moved before a cancelled transfer
+                         # counts as stuck (dead link) and its client is closed
+                         # under it — a live one is still settling what it had
+                         # in flight, and closing it then left its temp file
+_IN_FLIGHT = 2 * 1024 * 1024     # bytes a cancel may still wait for: the SSH
+                                 # channel window — seconds on a slow VPN
 _STAT_WINDOW = 64        # link stats in flight at once
 _FILL_CHUNK = 2000       # listing rows added per turn of the event loop
 _MAX_LINK_HOPS = 8       # symlinked folders followed inside one download
@@ -334,7 +339,13 @@ def _part_name(name) -> str:
 def resolve_remote_link(sftp, path):
     """``(path, attr)``: *path* with symlinks followed — replacing a linked file
     must replace what it points at, not turn the link into a file — and the
-    lstat of what is there (None if nothing is)."""
+    lstat of what is there (None if nothing is).
+
+    A link is resolved by the server (realpath): a relative target is relative
+    to where the link really is, and taken as text, "../x" in a symlinked
+    folder pointed somewhere else — an upload made a new file there, and an
+    editor save said the file had been deleted. Only a server that cannot
+    resolve it gets the link's target joined on as text."""
     for _hop in range(_MAX_LINK_HOPS):
         try:
             attr = sftp.lstat(path)
@@ -344,6 +355,15 @@ def resolve_remote_link(sftp, path):
             return path, None
         if _attr_type(attr) != stat.S_IFLNK:
             return path, attr
+        try:
+            real = sftp.normalize(path)
+        except socket.timeout:
+            raise
+        except (IOError, paramiko.SFTPError):    # no realpath, or a strange answer
+            real = ""
+        if real and real != path:        # checked on the next hop: it may be a
+            path = real                  # link still (a server that only tidies)
+            continue
         target = sftp.readlink(path)
         if not target:
             return path, attr
@@ -592,6 +612,11 @@ class _TransferThread(QThread):
         self._before = 0                 # bytes of the files already finished
         self._here = self._size = 0      # bytes done / size of the current file
         self._files = 0
+        # signs of life, read by the GUI thread after a cancel: when a block
+        # last moved, and how fast they were moving (bytes/s, 0 = not known)
+        self.heard = time.monotonic()
+        self.pace = 0.0
+        self._mark = (self.heard, 0)     # (time, bytes) the pace is measured from
 
     def cancel(self):
         self._cancel.set()
@@ -599,6 +624,24 @@ class _TransferThread(QThread):
     @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()
+
+    def stalled(self, now=None) -> bool:
+        """Has nothing moved for longer than a live link would need? After a
+        cancel the transfer still waits for what it had in flight — up to
+        _IN_FLIGHT bytes at the pace it was going — and only a dead link takes
+        longer. Never longer than _SFTP_TIMEOUT, when a request fails anyway."""
+        now = time.monotonic() if now is None else now
+        pace = self.pace
+        wait = _STALL_AFTER + (_IN_FLIGHT / pace if pace > 0 else 0.0)
+        return now - self.heard >= min(wait, _SFTP_TIMEOUT)
+
+    def abort(self):
+        """Close the client under this (stalled) transfer: the request it is
+        stuck in fails at once. Cheap, for the GUI thread."""
+        link = self._link
+        client = link.current()
+        if client is not None:
+            link.discard(client)
 
     def run(self):
         started = time.monotonic()
@@ -745,6 +788,7 @@ class _TransferThread(QThread):
             raise _Cancelled()
 
     def _on_file(self, remote):
+        self._alive(self._before + self._here)
         self._check()
         if self._file:                   # the previous file is complete
             self._before += self._here
@@ -754,9 +798,21 @@ class _TransferThread(QThread):
         self._report(0, force=True)
 
     def _on_bytes(self, done, total):
+        # before the check: the block a cancel lands on shows the link is alive
+        self._alive(self._before + done)
         self._check()
         self._here, self._size = done, total
         self._report(int(done * 100 / total) if total else 0)
+
+    def _alive(self, moved):
+        """A block moved (*moved*: bytes in all so far): note when, and the
+        pace over the last second or so."""
+        now = time.monotonic()
+        self.heard = now
+        since, base = self._mark
+        if now - since >= 1.0:
+            self.pace = max(0, moved - base) / (now - since)
+            self._mark = (now, moved)
 
     def _report(self, percent, force=False):
         now = time.monotonic()
@@ -919,7 +975,7 @@ class SftpBrowser(QWidget):
         self._xfer = _OwnSftp(handler)       # transfers
         self._queue = deque()            # _Job items waiting their turn
         self._transfer = None            # the _TransferThread moving one now
-        self._stuck = None               # (cancelled transfer, its client)
+        self._stopping = None            # the cancelled transfer watched by _abort_stuck
         self._file, self._percent = "", 0
         self._busy = ""                  # what the list is waiting for; "" = idle
         self._message = ""               # last error / result, until the next action
@@ -936,6 +992,8 @@ class SftpBrowser(QWidget):
         self._fill_timer.setSingleShot(True)
         self._fill_timer.setInterval(0)
         self._fill_timer.timeout.connect(self._fill_more)
+        self._stop_timer = QTimer(self)  # looks at a cancelled transfer until it stops
+        self._stop_timer.timeout.connect(self._abort_stuck)
         self._build_ui()
         self._list(".")
 
@@ -1207,7 +1265,7 @@ class SftpBrowser(QWidget):
         if self.local_target is not None and entries:
             m.addAction("Download to the local pane", self.download_to_local_pane)
         m.addAction("Download…", self._download)
-        if len(entries) == 1 and not kind_problem(entries[0].ftype, unknown_ok=False):
+        if len(entries) == 1 and not kind_problem(entries[0].ftype):
             m.addAction("Edit / view…", self.edit_selected)
         m.addSeparator()
         m.addAction("Upload files…", self._upload)
@@ -1233,13 +1291,14 @@ class SftpBrowser(QWidget):
         return self._editors
 
     def edit_selected(self):
-        """Open the selected remote text file in an editor window. Only a regular
-        file: a device or a FIFO never ends or never answers."""
+        """Open the selected remote text file in an editor window. Not a device
+        or a FIFO: one never ends, the other never answers. A file the server
+        gives no type for opens (as in 2.0.0): the read is bounded anyway."""
         entries = self._selection()
         if len(entries) != 1 or entries[0].is_dir or self._closing:
             return None
         entry = entries[0]
-        problem = kind_problem(entry.ftype, unknown_ok=False)
+        problem = kind_problem(entry.ftype)
         if problem:
             self._notice(f"{entry.name} {problem} — it cannot be opened in the "
                          f"editor", "[WARN] ")
@@ -1404,28 +1463,36 @@ class SftpBrowser(QWidget):
     def cancel_transfer(self) -> bool:
         """Abort the transfer in flight (its callback raises on the next block)
         and drop the queued ones. Only the transfer's temporary file goes; what
-        it was going to replace stays as it was."""
+        it was going to replace stays as it was. It wins over a reconnect that
+        was about to start the transfer again."""
         if self._closing or self._transfer is None:
             return False
         self._queue.clear()
         self.transfers.cancel_queued()
         t = self._transfer
+        t.restart = False
         t.cancel()
-        self._stuck = (t, self._xfer.current())
-        QTimer.singleShot(int(_ABORT_AFTER * 1000), self._abort_stuck)
+        self._stopping = t
+        if not self._stop_timer.isActive():
+            self._stop_timer.start(int(_ABORT_AFTER * 1000))
         self.cancel_btn.setEnabled(False)
         self._show_transfer()
         return True
 
     def _abort_stuck(self):
-        """A cancelled transfer stops at its next block of data — never, on a
-        dead link. Still running after a moment? Close its client under it."""
-        stuck, self._stuck = self._stuck, None
-        if self._closing or stuck is None:
+        """A cancelled transfer stops at its next block of data, then waits for
+        what it still had in flight — seconds on a slow link, for ever on a
+        dead one. Look every _ABORT_AFTER s; once it has stalled (nothing moved
+        for longer than a live link needs) close its client under it. A live
+        one is left to finish: closing it mid-way left its temp file behind."""
+        t = self._stopping
+        if (self._closing or t is None or t is not self._transfer
+                or not t.isRunning()):   # it stopped (by itself or not)
+            self._stopping = None
+            self._stop_timer.stop()
             return
-        t, client = stuck
-        if t is self._transfer and client is not None and t.isRunning():
-            self._xfer.discard(client)
+        if t.stalled():
+            t.abort()
 
     def _enqueue(self, job) -> bool:
         if self._closing:
@@ -1653,8 +1720,9 @@ class SftpBrowser(QWidget):
         this after it reconnected). The transfer queue and history and the open
         editors stay; the SFTP links are re-made on *handler* and the old ones
         closed on a teardown thread; a transfer that was moving starts again (it
-        never wrote into its destination, so that is safe); whatever else was in
-        flight is dropped, and the current folder is listed again."""
+        never wrote into its destination, so that is safe) — unless the user
+        had cancelled it; whatever else was in flight is dropped, and the
+        current folder is listed again."""
         if self._closing or handler is None:
             return
         self.handler = handler
@@ -1673,9 +1741,10 @@ class SftpBrowser(QWidget):
             self._set_busy("")
         for editor in self._live_editors():
             editor.rebind(self._remote)
-        if self._transfer is not None:
-            self._transfer.restart = True
-            self._transfer.cancel()      # comes back via stopped / failed
+        t = self._transfer
+        if t is not None and not t.cancelled:    # a cancelled one stays cancelled
+            t.restart = True
+            t.cancel()                   # comes back via stopped / failed
             self._show_transfer()
         self._list(self.cwd, self._current_name())
 
@@ -1691,6 +1760,7 @@ class SftpBrowser(QWidget):
             return
         self._closing = True
         self._fill_timer.stop()
+        self._stop_timer.stop()
         self._queue.clear()
         self.transfers.cancel_queued()
         for editor in self._live_editors():

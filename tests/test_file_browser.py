@@ -234,7 +234,8 @@ def test_local_pane_actions(browser, monkeypatch):
     # no recycle bin in a test: it asks, and deletes for good only on a Yes
     from PyQt5.QtCore import QFile
     from PyQt5.QtWidgets import QMessageBox
-    monkeypatch.setattr(QFile, "moveToTrash", staticmethod(lambda path: False))
+    # what PyQt5's static form returns for a failure: (False, '') — a true tuple
+    monkeypatch.setattr(QFile, "moveToTrash", staticmethod(lambda path: (False, "")))
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
     gone = []
     pane.deleted.connect(gone.append)

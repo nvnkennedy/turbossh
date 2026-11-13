@@ -79,13 +79,14 @@ def read_remote_text(sftp, path) -> Loaded:
     """Read a remote text file for editing (on a worker thread).
 
     Line endings are normalised to ``\\n`` and *newline* remembers what the
-    file used, so saving does not rewrite every line of a CRLF file. Only a
-    regular file is read, and never more than MAX_EDIT_BYTES + 1 bytes: the size
-    of a device or a FIFO is 0, and reading one to its end filled the memory
-    (/dev/zero) or never came back (a FIFO, /dev/ser1)."""
+    file used, so saving does not rewrite every line of a CRLF file. No device
+    or FIFO is read, and never more than MAX_EDIT_BYTES + 1 bytes: the size of
+    a device or a FIFO is 0, and reading one to its end filled the memory
+    (/dev/zero) or never came back (a FIFO, /dev/ser1). A file the server
+    gives no type for is read — that bound is what keeps it safe."""
     info = sftp.stat(path)
     name = posixpath.basename(path)
-    problem = kind_problem(_attr_type(info), unknown_ok=False)
+    problem = kind_problem(_attr_type(info))
     if problem:
         raise NotEditable(f"{name} {problem} — only a regular file can be opened "
                           f"here.")

@@ -51,6 +51,16 @@ def _com():
             ole32.CoUninitialize()
 
 
+def _moved_to_trash(path) -> bool:
+    """``QFile.moveToTrash(path)``. PyQt5's static form returns ``(ok, path in
+    the recycle bin)`` — and a tuple is always true, ``(False, '')`` included,
+    so every failed move counted as done. A plain bool is taken as it is."""
+    result = QFile.moveToTrash(path)
+    if isinstance(result, tuple):
+        result = result[0] if result else False
+    return bool(result)
+
+
 def _trash(paths):
     """``(moved, left)``: *paths* sent to the recycle bin, and ``[(path, why)]``
     of those that could not be (worker thread)."""
@@ -58,7 +68,7 @@ def _trash(paths):
     with _com():
         for path in paths:
             try:
-                if QFile.moveToTrash(path):
+                if _moved_to_trash(path):
                     moved += 1
                     continue
             except Exception:
