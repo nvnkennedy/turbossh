@@ -953,15 +953,14 @@ def test_the_probe_keeps_the_camera_name_inside_its_quotes(qapp):
             pass
 
     class Transport:
-        def open_session(self):
+        def open_session(self, timeout=None):
             return Channel()
 
-    class Client:
-        def get_transport(self):
-            return Transport()
+    class Handler:                          # what SSHHandler offers the probe
+        transport = Transport()
 
-    class Handler:
-        _client = Client()
+        def _cmd_line(self, line):          # cmd.exe default shell: unchanged
+            return line
     probe = _RemoteProbe(Handler(), "C:\\t\\ffmpeg.exe", 'Cam "1" %TEMP% $x`y')
     probe.run()
     assert 'video="Cam 1 TEMP xy"' in sent[0]
