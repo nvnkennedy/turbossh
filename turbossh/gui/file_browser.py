@@ -5,12 +5,14 @@ Move files with the two arrow buttons, by dragging between the panes (or in from
 Explorer), or from the context menus. The remote pane is :class:`SftpBrowser`,
 which owns the transfer queue; this module adds the local pane and ties the two
 together. Nothing here blocks the GUI thread: the local listing is Qt's own
-asynchronous file-system model, and everything remote runs on the remote pane's
-worker threads.
+asynchronous file-system model, a saved start folder (maybe on a share that is
+gone) is checked on a worker, deleting runs on a worker, and everything remote
+runs on the remote pane's worker threads.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 
@@ -21,34 +23,103 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileSystemModel,
                              QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut,
                              QSplitter, QTreeView, QVBoxLayout, QWidget)
 
-from .sftp_browser import REMOTE_MIME, SftpBrowser
+from .qtutil import close_jobs, run_job
+from .sftp_browser import REMOTE_MIME, REMOTE_SOURCE_MIME, SftpBrowser
 from .transfer_log import TransferLog
 from .transfer_panel import TransferPanel
+
+_HAS_TRASH = hasattr(QFile, "moveToTrash")       # Qt 5.15+
+
+
+@contextlib.contextmanager
+def _com():
+    """The recycle bin is a shell (COM) operation, and COM has to be set up on
+    the thread that runs it — a worker thread here. Harmless if Qt does it too."""
+    ole32 = None
+    if os.name == "nt":
+        try:
+            import ctypes
+            ole32 = ctypes.windll.ole32
+            if ole32.CoInitializeEx(None, 0x2) < 0:      # COINIT_APARTMENTTHREADED
+                ole32 = None             # set up differently already: leave it be
+        except Exception:
+            ole32 = None
+    try:
+        yield
+    finally:
+        if ole32 is not None:
+            ole32.CoUninitialize()
+
+
+def _trash(paths):
+    """``(moved, left)``: *paths* sent to the recycle bin, and ``[(path, why)]``
+    of those that could not be (worker thread)."""
+    moved, left = 0, []
+    with _com():
+        for path in paths:
+            try:
+                if QFile.moveToTrash(path):
+                    moved += 1
+                    continue
+            except Exception:
+                pass
+            left.append((path, "not on a drive with a recycle bin (a network share?), "
+                               "or the recycle bin refused it"))
+    return moved, left
+
+
+def _remove_for_good(paths):
+    """``(removed, errors)``: *paths* deleted permanently (worker thread)."""
+    removed, errors = 0, []
+    for path in paths:
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError as exc:
+            errors.append(f"{os.path.basename(path)}: {exc}")
+    return removed, errors
+
+
+def _names(paths, limit=5) -> str:
+    more = f" and {len(paths) - limit} more" if len(paths) > limit else ""
+    return ", ".join(os.path.basename(p) for p in paths[:limit]) + more
 
 
 class _LocalView(QTreeView):
     """The local listing. Rows can be dragged out (onto the remote pane, or into
-    Explorer); what it accepts is ONLY a drag from the remote pane, which means
-    "download here". Local-to-local drops are refused, so files are never moved
-    around on disk by a slip of the mouse."""
+    Explorer); what it accepts is ONLY a drag from its own remote pane, which
+    means "download here". Local-to-local drops are refused, so files are never
+    moved around on disk by a slip of the mouse — and so are rows dragged from
+    another session's remote pane: their names would be looked up in THIS
+    pane's remote folder, and a different file downloaded."""
     remote_dropped = pyqtSignal(list)    # names of remote entries dropped here
+    refused = pyqtSignal(str)            # why a drag from elsewhere is not taken
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.accepts = None              # callable -> the REMOTE_SOURCE_MIME we take
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
 
-    def _remote_names(self, event) -> list:
-        mime = event.mimeData()
+    def remote_names(self, mime):
+        """``(names, refused)`` of a drag: the remote names it carries if it
+        comes from this pane's own remote pane (and folder), else ``[]`` — with
+        *refused* True when it is remote rows from somewhere else."""
         if not mime.hasFormat(REMOTE_MIME):
-            return []
+            return [], False
+        source = bytes(mime.data(REMOTE_SOURCE_MIME)).decode("utf-8", "replace")
+        if self.accepts is None or not source or source != self.accepts():
+            return [], True
         text = bytes(mime.data(REMOTE_MIME)).decode("utf-8", "replace")
-        return [name for name in text.split("\n") if name]
+        return [name for name in text.split("\n") if name], False
 
     def _take(self, event) -> list:
-        names = self._remote_names(event)
+        names, _refused = self.remote_names(event.mimeData())
         if names:
             event.setDropAction(Qt.CopyAction)
             event.accept()
@@ -57,6 +128,9 @@ class _LocalView(QTreeView):
         return names
 
     def dragEnterEvent(self, event):
+        if self.remote_names(event.mimeData())[1]:
+            self.refused.emit("Those remote files belong to another session's file "
+                              "browser — drop them on the local pane next to it.")
         self._take(event)
 
     def dragMoveEvent(self, event):
@@ -72,10 +146,14 @@ class LocalPane(QWidget):
     """This PC. ``cwd`` is the folder shown ("" = the list of drives)."""
     upload_requested = pyqtSignal(list)  # local paths to send to the remote pane
     message = pyqtSignal(str)
+    deleted = pyqtSignal(int)            # a delete finished: how many items went
 
     def __init__(self, start_dir: str = "", parent=None):
         super().__init__(parent)
         self.cwd = ""
+        self._jobs = set()               # start-folder check, deletes
+        self._moved = False              # navigated since the pane opened
+        self._deleting = False
         self.model = QFileSystemModel(self)
         # read-only: the model then refuses drops and in-place edits; renames and
         # deletes go through the explicit actions below, with confirmation
@@ -125,18 +203,35 @@ class LocalPane(QWidget):
                            ("Delete", self.delete_selected), ("F2", self.rename_selected)):
             QShortcut(QKeySequence(keys), self.view, activated=slot,
                       context=Qt.WidgetWithChildrenShortcut)
-        self.navigate(start_dir if start_dir and os.path.isdir(start_dir)
-                      else os.path.expanduser("~"))
+        # Start at home. The folder saved last time may be on a share that is
+        # gone, and asking Windows about it here hung the window for the SMB
+        # timeout (on every reconnect, too): look on a worker, then go there.
+        self.navigate(os.path.expanduser("~"))
+        self._moved = False
+        start = os.path.abspath(os.path.expanduser(start_dir.strip())) if start_dir else ""
+        if start and os.path.normcase(start) != os.path.normcase(self.cwd):
+            run_job(self._jobs, lambda: os.path.isdir(start),
+                    lambda ok: self._saved_folder(start, ok))
+
+    def _saved_folder(self, path, ok):
+        if ok and not self._moved:       # the user has not gone elsewhere meanwhile
+            self.navigate(path, checked=True)
+
+    def close_pane(self):
+        """Drop the workers' results (the owner deletes the pane next)."""
+        close_jobs(self._jobs)
 
     # ---- navigation ----
-    def navigate(self, path: str) -> bool:
+    def navigate(self, path: str, checked: bool = False) -> bool:
+        """Show *path* ("" = the drives). *checked*: it is known to be a folder."""
         path = (path or "").strip()
         if path:
             path = os.path.abspath(os.path.expanduser(path))
-            if not os.path.isdir(path):
+            if not checked and not os.path.isdir(path):
                 self._say(f"Not a folder: {path}")
                 self.path.setText(self.cwd)
                 return False
+        self._moved = True
         self.cwd = path
         self.view.setRootIndex(self.model.setRootPath(path))
         self.path.setText(path)
@@ -245,35 +340,65 @@ class LocalPane(QWidget):
         if ok and new.strip() and new != old:
             self.do_rename(paths[0], new)
 
-    def do_delete(self, paths) -> int:
-        """Send *paths* to the recycle bin (Qt 5.15+); only where there is no
-        recycle bin are they removed for good. Returns how many went."""
-        gone = 0
-        for path in paths:
-            try:
-                if hasattr(QFile, "moveToTrash") and QFile.moveToTrash(path):
-                    gone += 1
-                    continue
-                if os.path.isdir(path) and not os.path.islink(path):
-                    shutil.rmtree(path)
-                else:
-                    os.remove(path)
-                gone += 1
-            except OSError as exc:
-                self._say(f"Could not delete {os.path.basename(path)}: {exc}")
-        return gone
+    def do_delete(self, paths) -> bool:
+        """Send *paths* to the recycle bin, on a worker thread (a big folder or a
+        slow disk must not freeze the window). Whatever cannot go there is
+        deleted for good only if the user says so: the question they answered
+        promised the recycle bin, and a failed move used to fall through to a
+        permanent delete without a word. ``deleted(count)`` follows. False if a
+        delete is still running."""
+        paths = list(paths)
+        if self._deleting or not paths:
+            return False
+        self._deleting = True
+        if not _HAS_TRASH:               # the question already said "permanently"
+            self._say(f"Deleting {_names(paths)}…")
+            run_job(self._jobs, lambda: _remove_for_good(paths),
+                    lambda result: self._removed(0, result), self._delete_failed)
+        else:
+            self._say(f"Moving {_names(paths)} to the recycle bin…")
+            run_job(self._jobs, lambda: _trash(paths), self._trashed, self._delete_failed)
+        return True
+
+    def _trashed(self, result):
+        moved, left = result
+        if not left:
+            self._delete_done(moved, "")
+            return
+        paths = [path for path, _why in left]
+        answer = QMessageBox.question(
+            self, "Not moved to the recycle bin",
+            f"{len(paths)} item(s) could not be moved to the recycle bin:\n"
+            f"{_names(paths)}\n\nThey are {left[0][1]}.\n\nDelete them permanently "
+            f"instead? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self._delete_done(moved, f"Not deleted (still there): {_names(paths)}")
+            return
+        run_job(self._jobs, lambda: _remove_for_good(paths),
+                lambda result: self._removed(moved, result), self._delete_failed)
+
+    def _removed(self, moved, result):
+        removed, errors = result
+        self._delete_done(moved + removed,
+                          ("Could not delete " + "; ".join(errors[:3])) if errors else "")
+
+    def _delete_failed(self, msg):
+        self._delete_done(0, f"Could not delete: {msg}")
+
+    def _delete_done(self, count, problem):
+        self._deleting = False
+        self._say(problem)
+        self.deleted.emit(count)
 
     def delete_selected(self):
         paths = self.selection_paths()
         if not paths:
             return
-        names = ", ".join(os.path.basename(p) for p in paths[:5])
-        more = f" and {len(paths) - 5} more" if len(paths) > 5 else ""
-        where = ("moved to the recycle bin" if hasattr(QFile, "moveToTrash")
-                 else "deleted permanently")
+        where = "moved to the recycle bin" if _HAS_TRASH else "deleted permanently"
         answer = QMessageBox.question(
             self, "Delete",
-            f"Delete {len(paths)} local item(s)?\n{names}{more}\n\nThey are {where}.")
+            f"Delete {len(paths)} local item(s)?\n{_names(paths)}\n\nThey are {where}.")
         if answer == QMessageBox.Yes:
             self.do_delete(paths)
 
@@ -326,6 +451,9 @@ class FileBrowser(QWidget):
 
         self.local.upload_requested.connect(self.upload)
         self.local.view.remote_dropped.connect(self._download_names)
+        # the local pane takes drops of THIS remote pane's rows only
+        self.local.view.accepts = lambda: self.remote.tree.source
+        self.local.view.refused.connect(self.local._say)
 
     # ---- the two directions ----
     def upload(self, paths=None) -> int:
@@ -355,6 +483,14 @@ class FileBrowser(QWidget):
     def busy(self) -> bool:
         return self.remote.busy
 
+    def rebind(self, handler) -> None:
+        """The session reconnected with a new *handler*: carry on over it instead
+        of being rebuilt. The transfer queue and history, the open editors (with
+        their unsaved changes) and the local pane stay as they are; the remote
+        pane's SFTP links move to *handler* and its folder is listed again
+        (:meth:`SftpBrowser.rebind`)."""
+        self.remote.rebind(handler)
+
     def close_browser(self):
         """Stop everything (the owner deletes the widget next). Safe to call twice."""
         try:
@@ -363,5 +499,6 @@ class FileBrowser(QWidget):
                 settings.save({"local_browser_dir": self.local.cwd})
         except Exception:
             pass
+        self.local.close_pane()
         self.panel.close_panel()
         self.remote.close_browser()

@@ -28,6 +28,8 @@ from .. import paths
 from ..core import parse_dshow_devices
 
 # BtbN's FFmpeg-Builds "latest" release — a stable, public Windows build URL.
+# It is rebuilt continuously, so it cannot carry a SHA-256 in the code; TLS is
+# what vouches for it. A site that wants more pins its own (PIN_ENV / Settings).
 _FFMPEG_URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
                "ffmpeg-master-latest-win64-gpl.zip")
 REMOTE_MARKER = "turbossh_cam"        # the dir/marker webcam_release matches on
@@ -113,6 +115,25 @@ def _cache_ok(exe: str) -> bool:
     return not pin or pin == record[0]
 
 
+def _which(name: str) -> str | None:
+    """*name* on PATH — and only on PATH. ``shutil.which`` on Windows looks in
+    the current directory first (even when given a path list), so an
+    ffmpeg.exe planted in whatever folder TurboSSH was started from would be
+    run. A relative PATH entry ("", ".") means the current directory too."""
+    exts = ("",)
+    if os.name == "nt" and not os.path.splitext(name)[1]:
+        exts = (".exe",)
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not folder or not os.path.isabs(folder):
+            continue
+        for ext in exts:
+            path = os.path.join(folder, name + ext)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
 def cached_ffmpeg() -> str | None:
     """Return an ffmpeg we can use without downloading: an explicit Settings
     path, our cache (only if it is complete), or an ffmpeg already on PATH."""
@@ -126,7 +147,7 @@ def cached_ffmpeg() -> str | None:
     p = os.path.join(_cache_dir(), "ffmpeg.exe")
     if _cache_ok(p):
         return p
-    return shutil.which("ffmpeg") or None   # already installed system-wide?
+    return _which("ffmpeg")              # already installed system-wide?
 
 
 def _check(cancel, deadline: float) -> None:
@@ -331,11 +352,13 @@ def _replace_remote(ssh, part: str, dest: str) -> None:
 
 
 def ensure_remote_ffmpeg(ssh, local_ffmpeg: str, log=lambda m: None, *,
-                         remote_dir: str | None = None) -> str:
+                         remote_dir: str | None = None, cancel=None) -> str:
     """Make sure ffmpeg is on the remote host (push it via SFTP if missing or
     incomplete) and return the remote path. Pushed under a dir containing
     REMOTE_MARKER so webcam_release can find/kill only our process;
-    ``remote_dir`` overrides that folder.
+    ``remote_dir`` overrides that folder. ``cancel`` (a ``threading.Event``)
+    stops the ~160 MB upload: a Camera tab that was closed, or switched to
+    another source, used to leave it running to the end.
 
     NOTE: every SSH call here passes ``safe=False`` so we get RAW results (a real
     stat from ``stat``, a CommandResult with ``.text`` from ``run``). The handler
@@ -343,6 +366,11 @@ def ensure_remote_ffmpeg(ssh, local_ffmpeg: str, log=lambda m: None, *,
     OperationResult that is *truthy on success regardless of the value* — which
     made ``if ssh.exists(...)`` always true, so ffmpeg was never actually uploaded
     and the remote camera could never be listed."""
+    def check(*_progress):               # also the upload's progress callback
+        if cancel is not None and cancel.is_set():
+            raise _Aborted("The ffmpeg upload was cancelled.")
+
+    check()
     if remote_dir is None:
         res = ssh.run('powershell -NoProfile -Command "$env:TEMP"', safe=False, timeout=20)
         lines = (getattr(res, "text", "") or "").strip().splitlines()
@@ -361,7 +389,15 @@ def ensure_remote_ffmpeg(ssh, local_ffmpeg: str, log=lambda m: None, *,
     except Exception:
         pass
     part = remote_exe + ".part"
-    ssh.push(local_ffmpeg, part, safe=False)
+    check()
+    try:
+        ssh.push(local_ffmpeg, part, safe=False, callback=check)
+    except BaseException:
+        try:
+            ssh.remove(part, safe=False)     # what a cancel or a failure left
+        except Exception:
+            pass
+        raise
     got = _remote_size(ssh, part)
     if got != want:
         try:

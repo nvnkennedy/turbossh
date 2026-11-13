@@ -231,10 +231,15 @@ def test_local_pane_actions(browser, monkeypatch):
     assert pane.do_rename(str(local / "note.txt"), "renamed.txt")
     assert (local / "renamed.txt").read_text() == "note"
 
-    # no recycle bin in a test: fall through to plain removal of the temp files
+    # no recycle bin in a test: it asks, and deletes for good only on a Yes
     from PyQt5.QtCore import QFile
+    from PyQt5.QtWidgets import QMessageBox
     monkeypatch.setattr(QFile, "moveToTrash", staticmethod(lambda path: False))
-    assert pane.do_delete([str(local / "renamed.txt"), str(local / "folder")]) == 2
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    gone = []
+    pane.deleted.connect(gone.append)
+    assert pane.do_delete([str(local / "renamed.txt"), str(local / "folder")])
+    assert wait_until(lambda: gone == [2])
     assert not (local / "renamed.txt").exists() and not (local / "folder").exists()
 
     assert pane.navigate(str(local / "nope")) is False and pane.cwd == str(local)

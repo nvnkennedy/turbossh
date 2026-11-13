@@ -6,18 +6,28 @@ worker threads through ONE SFTP client of the browser's own; transfers are queue
 and moved one at a time by a worker thread with a second client, so a large file
 never holds up browsing. The session's shared ``handler.sftp()`` is never used:
 Paramiko can hand one thread's reply to another when two threads share a client,
-and the thread that lost its reply then waits forever."""
+and the thread that lost its reply then waits forever.
+
+A transfer never writes into the file it replaces: it writes a temporary file
+next to it and renames that into place once complete, so a cancel or a dropped
+link leaves the original as it was."""
 
 from __future__ import annotations
 
 import os
+import re
+import socket
 import stat
 import time
+import uuid
 import posixpath
 import threading
 from collections import deque, namedtuple
 
-from PyQt5.QtCore import QMimeData, QThread, pyqtSignal, Qt
+import paramiko
+from paramiko.ssh_exception import SSHException
+from PyQt5.QtCore import (QItemSelectionModel, QMimeData, QThread, QTimer,
+                          pyqtSignal, Qt)
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTreeWidget, QTreeWidgetItem, QFileDialog,
@@ -25,17 +35,37 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QAbstractItemView, QHeaderView, QShortcut, QMenu,
                              QStyle, QApplication, QSizePolicy)
 
+from ..results import TransferResult
 from . import transfer_log as tl
 from .qtutil import run_job, close_jobs, owner_window, park_thread, run_teardown
 
+try:
+    from PyQt5 import sip
+except ImportError:                      # PyQt5 < 5.11 ships it on its own
+    import sip
+
 _COLUMNS = ("Name", "Size", "Modified", "Permissions")
 # what a drag out of the remote list carries: the names of the dragged entries,
-# one per line (the local pane turns a drop of this into downloads)
+# one per line (the local pane turns a drop of this into downloads)...
 REMOTE_MIME = "application/x-turbossh-remote"
+# ...and where they are: "<browser token>\n<folder>". The names mean nothing
+# without it — in split view, ECU B's rows dropped on ECU A's local pane were
+# looked up in A's folder, and A's file of that name was downloaded.
+REMOTE_SOURCE_MIME = "application/x-turbossh-remote-source"
 _PROGRESS_EVERY = 0.1    # s between progress signals: a fast link calls back
                          # thousands of times a second, a label needs ~10
 _CLOSE_WAIT = 2.0        # s a closing browser lets a busy worker finish before
                          # its SFTP client is closed under it
+_SFTP_TIMEOUT = 30.0     # s of silence from the server before a request fails;
+                         # without it a dead link said "Loading…" until TCP gave
+                         # up (which can take a quarter of an hour)
+_ABORT_AFTER = 2.0       # s a cancelled transfer gets to stop by itself before
+                         # its client is closed under it (dead link: never)
+_STAT_WINDOW = 64        # link stats in flight at once
+_FILL_CHUNK = 2000       # listing rows added per turn of the event loop
+_MAX_LINK_HOPS = 8       # symlinked folders followed inside one download
+_PART = ".turbossh-part"     # suffix of a file still being written
+_WINDOWS = os.name == "nt"   # this PC's file names follow Windows' rules
 
 
 # --------------------------------------------------------------------------- #
@@ -54,9 +84,77 @@ def _attr_is_dir(attr) -> bool:
     return _attr_type(attr) == stat.S_IFDIR
 
 
-# is_dir is the type AFTER following a symlink; mode stays the entry's own, so
-# the Permissions column still shows a link as one ("lrwxrwxrwx")
-_Entry = namedtuple("_Entry", "name is_dir is_link size mtime mode")
+_KINDS = {stat.S_IFDIR: "a folder", stat.S_IFCHR: "a character device",
+          stat.S_IFBLK: "a block device", stat.S_IFIFO: "a named pipe (FIFO)",
+          stat.S_IFSOCK: "a socket", stat.S_IFLNK: "a broken link"}
+
+
+def kind_problem(ftype, unknown_ok=True) -> str:
+    """Why an entry of type *ftype* cannot be read as a file ("" if it can):
+    "is a character device". A device or a FIFO has no end (/dev/zero filled
+    the memory) or blocks for ever (a FIFO, /dev/ser1). *unknown_ok*: a server
+    that sends no file type at all is taken at its word that it is a file."""
+    if ftype == stat.S_IFREG or (ftype == 0 and unknown_ok):
+        return ""
+    if ftype == 0:
+        return "is of an unknown type (the server did not say it is a file)"
+    return "is " + _KINDS.get(ftype, "not a regular file")
+
+
+# is_dir / ftype describe the entry AFTER following a symlink; mode stays the
+# entry's own, so the Permissions column still shows a link as one ("lrwxrwxrwx")
+_Entry = namedtuple("_Entry", "name is_dir is_link size mtime mode ftype")
+
+
+class _Replies:
+    """Collects replies to pipelined requests, the way Paramiko's own read-ahead
+    does (it calls ``_async_response`` with each one)."""
+
+    def __init__(self):
+        self.got = {}
+
+    def _async_response(self, t, msg, num):
+        self.got[num] = (t, msg)
+
+
+def _stat_pipelined(sftp, paths):
+    from paramiko.sftp import CMD_ATTRS, CMD_STAT
+    from paramiko.sftp_attr import SFTPAttributes
+    replies, results, pending, sent = _Replies(), [None] * len(paths), {}, 0
+    while sent < len(paths) or pending:
+        while sent < len(paths) and len(pending) < _STAT_WINDOW:
+            pending[sftp._async_request(replies, CMD_STAT, paths[sent])] = sent
+            sent += 1
+        sftp._read_response()            # one reply: handed to `replies`
+        for num in [n for n in pending if n in replies.got]:
+            t, msg = replies.got.pop(num)
+            index = pending.pop(num)
+            if t == CMD_ATTRS:           # else a status: the link is dangling
+                results[index] = SFTPAttributes._from_msg(msg)
+    return results
+
+
+def _stat_many(sftp, paths) -> list:
+    """``stat()`` of every path (None where it failed). The requests go out
+    together, so a folder full of links costs about one round trip, not one per
+    link — over a VPN, /dev or a lib folder took minutes one by one. Paramiko
+    has no public API for it: where its internals differ, one at a time."""
+    if not paths:
+        return []
+    if hasattr(sftp, "_async_request") and hasattr(sftp, "_read_response"):
+        try:
+            return _stat_pipelined(sftp, paths)
+        except (AttributeError, TypeError, ImportError):
+            pass                         # not the Paramiko this was written for
+    results = []
+    for path in paths:
+        try:
+            results.append(sftp.stat(path))
+        except socket.timeout:
+            raise                        # the link: not this one path
+        except IOError:
+            results.append(None)
+    return results
 
 
 def _list_dir(sftp, path):
@@ -64,22 +162,24 @@ def _list_dir(sftp, path):
     name ignoring case. Runs on a worker thread."""
     try:
         path = sftp.normalize(path)
+    except socket.timeout:
+        raise
     except Exception:
         pass                             # the listing below reports a bad path
+    attrs = sftp.listdir_attr(path)
+    # a link's own mode says nothing about what it points at: a stat tells a
+    # linked folder (which can be entered) from a linked file
+    links = [a.filename for a in attrs if _attr_type(a) == stat.S_IFLNK]
+    targets = dict(zip(links, _stat_many(sftp, [posixpath.join(path, n) for n in links])))
     entries = []
-    for attr in sftp.listdir_attr(path):
-        is_link, target = _attr_type(attr) == stat.S_IFLNK, attr
-        if is_link:
-            # a link's own mode says nothing about what it points at: one stat
-            # tells a linked folder (which can be entered) from a linked file
-            try:
-                target = sftp.stat(posixpath.join(path, attr.filename))
-            except Exception:
-                pass                     # dangling: listed as a file
-        entries.append(_Entry(attr.filename, _attr_is_dir(target), is_link,
+    for attr in attrs:
+        target = targets.get(attr.filename) or attr      # dangling: the link itself
+        ftype = _attr_type(target)
+        entries.append(_Entry(attr.filename, ftype == stat.S_IFDIR,
+                              attr.filename in targets,
                               getattr(target, "st_size", None),
                               getattr(target, "st_mtime", None),
-                              getattr(attr, "st_mode", None)))
+                              getattr(attr, "st_mode", None), ftype))
     entries.sort(key=lambda e: (not e.is_dir, (e.name or "").lower()))
     return path, entries
 
@@ -121,6 +221,72 @@ def _some(names, limit=5) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Remote names on this PC
+# --------------------------------------------------------------------------- #
+_WIN_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WIN_RESERVED = frozenset(["CON", "PRN", "AUX", "NUL"]
+                          + [f"{p}{n}" for p in ("COM", "LPT") for n in range(1, 10)])
+
+
+def local_name(name, windows=None) -> str:
+    """A remote entry's *name* made into one this PC can hold, as ONE path
+    component. Windows: ``<>:"/\\|?*`` and control characters become "_" (":"
+    would write an NTFS alternate stream, the others abort the copy; a "\\" or a
+    "C:" would leave the destination folder), trailing dots and spaces too
+    (Windows drops them: "a." and "a" are one file), and a reserved device name
+    (CON, NUL, COM1, LPT1…, with any extension) gets a "_" in front. Everywhere:
+    "/" and NUL, and "." / ".." never stay what they are."""
+    windows = _WINDOWS if windows is None else windows
+    if windows:
+        name = _WIN_BAD.sub("_", name)
+        kept = name.rstrip(" .")
+        name = kept + "_" * (len(name) - len(kept))
+        if name.split(".")[0].rstrip(" ").upper() in _WIN_RESERVED:
+            name = "_" + name
+    else:
+        name = name.replace("/", "_").replace("\0", "_")
+    if name in ("", ".", ".."):
+        name = name.replace(".", "_") or "_"
+    return name
+
+
+def _local_names(names, windows=None) -> dict:
+    """name -> local name for the entries of ONE remote folder: each made valid
+    here (:func:`local_name`) and unique — on Windows "Readme" and "README" are
+    one file, and the second would silently replace the first. Names that need
+    no change keep it; the others get " (2)", " (3)"…"""
+    windows = _WINDOWS if windows is None else windows
+    fold = str.casefold if windows else (lambda n: n)
+    taken, out, later = set(), {}, []
+    for name in names:
+        safe = local_name(name, windows)
+        if safe == name and fold(safe) not in taken:
+            taken.add(fold(safe))
+            out[name] = safe
+        else:
+            later.append((name, safe))
+    for name, safe in later:
+        stem, ext = os.path.splitext(safe)
+        candidate, n = safe, 2
+        while fold(candidate) in taken:
+            candidate, n = f"{stem} ({n}){ext}", n + 1
+        taken.add(fold(candidate))
+        out[name] = candidate
+    return out
+
+
+def _inside(folder, path) -> bool:
+    """Is *path* somewhere below *folder*? The last guard before a remote name
+    becomes a local file: never anywhere else."""
+    folder = os.path.normcase(os.path.abspath(folder))
+    path = os.path.normcase(os.path.abspath(path))
+    try:
+        return path != folder and os.path.commonpath([folder, path]) == folder
+    except ValueError:                   # another drive
+        return False
+
+
+# --------------------------------------------------------------------------- #
 # Operations (worker thread, on the browser's own client)
 # --------------------------------------------------------------------------- #
 def _remove(sftp, path, is_dir):
@@ -143,21 +309,175 @@ def _rename(sftp, src, dst):
     if posixpath.basename(src).lower() != posixpath.basename(dst).lower():
         try:
             sftp.lstat(dst)
+        except socket.timeout:
+            raise
         except IOError:
             pass
         else:
             raise IOError(f"{dst} already exists")
     try:
         sftp.posix_rename(src, dst)
+    except socket.timeout:
+        raise
     except IOError:
         # posix-rename is an OpenSSH extension; servers without it get the plain
         # SFTP rename (a genuine failure fails again there and is reported)
         sftp.rename(src, dst)
 
 
+def _part_name(name) -> str:
+    """A temporary name next to *name* for a file still being written: unique,
+    and recognisably ours if a dropped link leaves it behind."""
+    return f".{name[:150]}.{uuid.uuid4().hex[:8]}{_PART}"
+
+
+def resolve_remote_link(sftp, path):
+    """``(path, attr)``: *path* with symlinks followed — replacing a linked file
+    must replace what it points at, not turn the link into a file — and the
+    lstat of what is there (None if nothing is)."""
+    for _hop in range(_MAX_LINK_HOPS):
+        try:
+            attr = sftp.lstat(path)
+        except socket.timeout:
+            raise
+        except IOError:
+            return path, None
+        if _attr_type(attr) != stat.S_IFLNK:
+            return path, attr
+        target = sftp.readlink(path)
+        if not target:
+            return path, attr
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+    raise IOError(f"{path}: too many levels of symbolic links")
+
+
+def replace_remote(sftp, tmp, dst, existed=True) -> None:
+    """Move the finished *tmp* over *dst*. posix-rename does that in one step.
+    A server without it (the plain SFTP rename never replaces) gets the old file
+    moved aside first and put back if the new one cannot take its place — the
+    content of *dst* is never lost on the way."""
+    try:
+        sftp.posix_rename(tmp, dst)
+        return
+    except socket.timeout:
+        raise
+    except IOError:
+        if not existed:
+            sftp.rename(tmp, dst)
+            return
+    folder, name = posixpath.split(dst)
+    old = posixpath.join(folder, _part_name(name)[:-len(_PART)] + ".turbossh-old")
+    sftp.rename(dst, old)
+    try:
+        sftp.rename(tmp, dst)
+    except BaseException:
+        try:
+            sftp.rename(old, dst)
+        except Exception:
+            pass
+        raise
+    try:
+        sftp.remove(old)
+    except IOError:
+        pass                             # a stray copy of the old file; nothing lost
+
+
+_UNKNOWN = object()
+
+
+def put_atomic(sftp, local, remote, callback=None, existing=_UNKNOWN) -> None:
+    """Upload *local* to *remote* without ever writing into *remote* itself: to
+    a temporary name in the same folder, then renamed over it (with the old
+    file's permissions). A cancel or a dropped link leaves the old file as it
+    was — it used to be truncated, or deleted outright by Cancel. *existing* is
+    the lstat of what is at *remote* (None: nothing) when the caller knows."""
+    if existing is _UNKNOWN or (existing is not None
+                                and _attr_type(existing) == stat.S_IFLNK):
+        remote, existing = resolve_remote_link(sftp, remote)
+    if existing is not None and _attr_is_dir(existing):
+        raise IOError(f"{remote} is a folder")
+    tmp = posixpath.join(posixpath.dirname(remote), _part_name(posixpath.basename(remote)))
+    try:
+        sftp.put(local, tmp, callback=callback, confirm=True)
+        if existing is not None and getattr(existing, "st_mode", None):
+            try:
+                sftp.chmod(tmp, stat.S_IMODE(int(existing.st_mode)))
+            except socket.timeout:
+                raise
+            except IOError:
+                pass                     # the server's default; still a good file
+        replace_remote(sftp, tmp, remote, existed=existing is not None)
+    except BaseException as exc:
+        # a timed-out client is out of step with the server: it is dropped, so
+        # nothing more is sent on it (the stray temporary file is harmless)
+        if not isinstance(exc, socket.timeout):
+            try:
+                sftp.remove(tmp)
+            except Exception:
+                pass
+        raise
+
+
+def get_atomic(sftp, remote, local, callback=None) -> int:
+    """Download *remote* to *local* through a temporary file in the same folder,
+    renamed into place once complete — a cancel or a dropped link leaves an
+    existing *local* untouched. Returns the size."""
+    if os.path.islink(local):
+        local = os.path.realpath(local)  # replace what the link points at
+    tmp = os.path.join(os.path.dirname(local) or ".", _part_name(os.path.basename(local)))
+    try:
+        sftp.get(remote, tmp, callback=callback)
+        size = os.path.getsize(tmp)
+        os.replace(tmp, local)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return size
+
+
+def _mkdir_p(sftp, folder) -> None:
+    if folder in ("", "/", "."):
+        return
+    parts = [p for p in folder.split("/") if p]
+    current = "/" if folder.startswith("/") else ""
+    for part in parts:
+        current = posixpath.join(current, part) if current else part
+        try:
+            sftp.stat(current)
+        except socket.timeout:
+            raise
+        except IOError:
+            try:
+                sftp.mkdir(current)
+            except socket.timeout:
+                raise
+            except IOError:
+                pass                     # made meanwhile; a real problem shows next
+
+
 class _Cancelled(Exception):
-    """Aborts a transfer from its callback. Deliberately not an IOError: push /
-    pull wrap those in SSHTransferError, and this must come back as itself."""
+    """Aborts a transfer from its callback. Deliberately not an IOError: that is
+    what a failure looks like, and this must come back as itself."""
+
+
+def _open_sftp(handler):
+    """An SFTP client whose requests give up after _SFTP_TIMEOUT s of silence.
+    Paramiko's ``open_sftp()`` sets no timeout anywhere: the channel open alone
+    may wait an hour, and every request for as long as TCP takes to notice."""
+    transport = handler.client.get_transport()
+    if transport is None or not transport.is_active():
+        raise IOError("the SSH connection is closed")
+    chan = transport.open_session(timeout=_SFTP_TIMEOUT)
+    try:
+        chan.settimeout(_SFTP_TIMEOUT)
+        chan.invoke_subsystem("sftp")
+        return paramiko.SFTPClient(chan)
+    except BaseException:
+        chan.close()
+        raise
 
 
 class _OwnSftp:
@@ -178,7 +498,18 @@ class _OwnSftp:
     def run(self, fn):
         """``fn(client)`` on the calling worker thread, holding the lock."""
         with self._lock:
-            return fn(self._open())
+            client = self._open()
+            try:
+                return fn(client)
+            except socket.timeout:
+                # a reply cut off half-way leaves the stream out of step with
+                # the server: this client is never used again
+                self.discard(client)
+                raise IOError(f"the remote host did not answer for "
+                              f"{_SFTP_TIMEOUT:.0f} s") from None
+            except (SSHException, EOFError):
+                self.discard(client)     # the channel is gone
+                raise
 
     def _open(self):
         if self._shut:
@@ -186,12 +517,25 @@ class _OwnSftp:
         client = self._client
         chan = client.get_channel() if client is not None else None
         if chan is None or chan.closed:
-            client = self._handler.client.open_sftp()
+            client = _open_sftp(self._handler)
             if self._shut:               # closed while the channel was opening
                 client.close()
                 raise _Cancelled("the file browser was closed")
             self._client = client
         return client
+
+    def current(self):
+        """The client in use now (None before the first use)."""
+        return self._client
+
+    def discard(self, client):
+        """Never use *client* again, and close it on a teardown thread: a request
+        stuck in it then fails at once (closing waits on the link too). Cheap,
+        so the GUI thread may call it."""
+        if self._client is client:
+            self._client = None
+        if client is not None:
+            run_teardown(client.close, "sftp-discard")
 
     def shut(self):
         """Refuse new work from now on (cheap: for the GUI thread). Without it a
@@ -224,40 +568,12 @@ def _job_name(job) -> str:
     return posixpath.basename(job.remote.rstrip("/")) or job.remote
 
 
-class _FileWatch:
-    """What push / pull are given as their SFTP client: the real one plus a hook
-    per file. Their callback only carries byte counts, so this is how the
-    progress label learns WHICH file is moving — and how a cancel is noticed
-    between the files of a folder (an empty file never reaches the callback)."""
-
-    def __init__(self, sftp, on_file):
-        self._sftp, self._on_file = sftp, on_file
-
-    def __getattr__(self, name):
-        return getattr(self._sftp, name)
-
-    def get(self, remotepath, localpath, *args, **kwargs):
-        self._on_file(remotepath)
-        return self._sftp.get(remotepath, localpath, *args, **kwargs)
-
-    def put(self, localpath, remotepath, *args, **kwargs):
-        self._on_file(remotepath)
-        try:
-            return self._sftp.put(localpath, remotepath, *args, **kwargs)
-        except _Cancelled:
-            # pull deletes its partial local file; likewise a half-written
-            # upload must not be left to pass for the real file. Only on a
-            # cancel — that proves the file was opened and written by us.
-            try:
-                self._sftp.remove(remotepath)
-            except Exception:
-                pass
-            raise
-
-
 class _TransferThread(QThread):
-    """Move ONE queued item with handler.pull / handler.push, on the transfer
-    client. The signal names are the ones qtutil.park_thread silences."""
+    """Move ONE queued item — a file, or a folder with its contents — on the
+    transfer client. Every file goes through :func:`get_atomic` /
+    :func:`put_atomic`, and every remote name through :func:`_local_names`
+    before it becomes a local path. The signal names are the ones
+    qtutil.park_thread silences."""
     # file being moved, percent of that file, (bytes moved in all, size of this
     # file, files completed)
     progress = pyqtSignal(str, int, object)
@@ -265,11 +581,13 @@ class _TransferThread(QThread):
     failed = pyqtSignal(str)
     stopped = pyqtSignal()               # cancelled
 
-    def __init__(self, handler, link, job):
+    def __init__(self, link, job):
         super().__init__()
         self.job = job
-        self._handler, self._link = handler, link
+        self._link = link
         self._cancel = threading.Event()
+        self.restart = False             # stopped to run again on a new link
+        self.notes = []                  # names changed, entries skipped
         self._file, self._last = "", 0.0
         self._before = 0                 # bytes of the files already finished
         self._here = self._size = 0      # bytes done / size of the current file
@@ -283,8 +601,9 @@ class _TransferThread(QThread):
         return self._cancel.is_set()
 
     def run(self):
+        started = time.monotonic()
         try:
-            result = self._link.run(self._move)
+            size, files = self._link.run(self._move)
         except Exception as exc:        # noqa: BLE001 - reported to the GUI
             # whatever a cancelled transfer died of, the user asked for it
             if self.cancelled or isinstance(exc, _Cancelled):
@@ -292,20 +611,141 @@ class _TransferThread(QThread):
             else:
                 self.failed.emit(f"{type(exc).__name__}: {exc}")
         else:
-            self.done.emit(str(result), getattr(result, "size_bytes", None),
-                           int(getattr(result, "files", 1) or 1))
+            job = self.job
+            down = job.kind == "download"
+            result = TransferResult(job.remote if down else job.local,
+                                    job.local if down else job.remote,
+                                    "pull" if down else "push", "sftp", size,
+                                    time.monotonic() - started, files)
+            self.done.emit(str(result), size, files)
 
     def _move(self, sftp):
         job = self.job
-        how = dict(recursive=True, callback=self._on_bytes, safe=False,
-                   sftp=_FileWatch(sftp, self._on_file))
         if job.kind == "download":
-            return self._handler.pull(job.remote, job.local, **how)
-        return self._handler.push(job.local, job.remote, **how)
+            return self._download(sftp, job.remote, job.local)
+        return self._upload(sftp, job.local, job.remote)
 
-    def _on_file(self, remote):
+    # ---- download ----
+    def _download(self, sftp, remote, local):
+        try:
+            attr = sftp.stat(remote)
+        except socket.timeout:
+            raise
+        except IOError as exc:
+            raise IOError(f"cannot read {remote}: {exc}") from None
+        ftype = _attr_type(attr)
+        if ftype == stat.S_IFDIR:
+            return self._get_dir(sftp, remote, local, set(), 0)
+        problem = kind_problem(ftype)
+        if problem:
+            raise IOError(f"{remote} {problem}, not a file that can be copied")
+        os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+        return self._get_file(sftp, remote, local), 1
+
+    def _get_file(self, sftp, remote, local) -> int:
+        self._on_file(remote)
+        return get_atomic(sftp, remote, local, self._on_bytes)
+
+    def _get_dir(self, sftp, remote_dir, local_dir, seen, hops):
+        try:
+            real = sftp.normalize(remote_dir)
+        except socket.timeout:
+            raise
+        except IOError:
+            real = remote_dir
+        if real in seen:                 # a symlink loop: already copied
+            return 0, 0
+        seen.add(real)
+        os.makedirs(local_dir, exist_ok=True)
+        attrs = sftp.listdir_attr(remote_dir)
+        links = [a.filename for a in attrs if _attr_type(a) == stat.S_IFLNK]
+        targets = dict(zip(links, _stat_many(
+            sftp, [posixpath.join(remote_dir, n) for n in links])))
+        names = _local_names([a.filename for a in attrs])
+        total = count = 0
+        for attr in attrs:
+            self._check()
+            name = attr.filename
+            rpath = posixpath.join(remote_dir, name)
+            lpath = os.path.join(local_dir, names[name])
+            if not _inside(local_dir, lpath):
+                self.notes.append(f"skipped {rpath}: no usable local name")
+                continue
+            if names[name] != name:
+                self.notes.append(f"{rpath} was saved as {names[name]}")
+            is_link = name in targets
+            target = targets[name] if is_link else attr
+            if target is None:
+                self.notes.append(f"skipped the broken link {rpath}")
+                continue
+            ftype = _attr_type(target)
+            if ftype == stat.S_IFDIR:
+                deeper = hops + (1 if is_link else 0)
+                if deeper > _MAX_LINK_HOPS:
+                    self.notes.append(f"skipped {rpath}: too many nested symlinked "
+                                      f"folders (a link loop?)")
+                    continue
+                size, files = self._get_dir(sftp, rpath, lpath, seen, deeper)
+            elif kind_problem(ftype):
+                self.notes.append(f"skipped {rpath}: it {kind_problem(ftype)}")
+                continue
+            else:
+                size, files = self._get_file(sftp, rpath, lpath), 1
+            total += size
+            count += files
+        return total, count
+
+    # ---- upload ----
+    def _upload(self, sftp, local, remote):
+        if not os.path.exists(local):
+            raise IOError(f"Local path does not exist: {local}")
+        if os.path.isdir(local):
+            return self._put_dir(sftp, local, remote, set())
+        _mkdir_p(sftp, posixpath.dirname(remote))
+        return self._put_file(sftp, local, remote), 1
+
+    def _put_file(self, sftp, local, remote, existing=_UNKNOWN) -> int:
+        self._on_file(remote)
+        put_atomic(sftp, local, remote, self._on_bytes, existing)
+        return os.path.getsize(local)
+
+    def _put_dir(self, sftp, local_dir, remote_dir, seen):
+        real = os.path.realpath(local_dir)
+        if real in seen:                 # a link back up the tree
+            return 0, 0
+        seen.add(real)
+        _mkdir_p(sftp, remote_dir)
+        try:
+            # what is there already, in one listing: one lstat per file before
+            # each upload would cost a round trip per file
+            there = {a.filename: a for a in sftp.listdir_attr(remote_dir)}
+        except socket.timeout:
+            raise
+        except IOError:
+            there = None
+        total = count = 0
+        for name in sorted(os.listdir(local_dir)):
+            self._check()
+            lpath, rpath = os.path.join(local_dir, name), posixpath.join(remote_dir, name)
+            if os.path.isdir(lpath):
+                size, files = self._put_dir(sftp, lpath, rpath, seen)
+            elif os.path.isfile(lpath):
+                existing = _UNKNOWN if there is None else there.get(name)
+                size, files = self._put_file(sftp, lpath, rpath, existing), 1
+            else:
+                self.notes.append(f"skipped {lpath}: not a file or a folder")
+                continue
+            total += size
+            count += files
+        return total, count
+
+    # ---- progress ----
+    def _check(self):
         if self.cancelled:
             raise _Cancelled()
+
+    def _on_file(self, remote):
+        self._check()
         if self._file:                   # the previous file is complete
             self._before += self._here
             self._files += 1
@@ -314,8 +754,7 @@ class _TransferThread(QThread):
         self._report(0, force=True)
 
     def _on_bytes(self, done, total):
-        if self.cancelled:
-            raise _Cancelled()
+        self._check()
         self._here, self._size = done, total
         self._report(int(done * 100 / total) if total else 0)
 
@@ -331,18 +770,23 @@ class _TransferThread(QThread):
 # Widgets
 # --------------------------------------------------------------------------- #
 class _Row(QTreeWidgetItem):
-    """A listing row that sorts by the clicked column — with ".." pinned on top
-    and folders before files whichever way the column is sorted."""
+    """A listing row: *rank* keeps ".." on top and folders before files whichever
+    way a column is sorted, *keys* are its sort key per column, worked out once.
+
+    The browser orders the rows itself, in Python with these keys
+    (:func:`_sorted_rows`): Qt's own sort calls ``__lt__`` once per comparison,
+    and that — asking the header for the order each time — froze the window for
+    seconds on a big folder. ``__lt__`` stays for anything else that sorts, and
+    reads the order the tree caches."""
 
     def __init__(self, texts, rank, keys):
         super().__init__(texts)
         self.rank, self.keys = rank, keys        # rank: 0 "..", 1 folder, 2 file
+        self.name = texts[0]
 
     def __lt__(self, other):
         tree = self.treeWidget()
-        column = tree.sortColumn() if tree is not None else 0
-        ascending = (tree is None
-                     or tree.header().sortIndicatorOrder() == Qt.AscendingOrder)
+        column, ascending = getattr(tree, "order", (0, True))
         if self.rank != other.rank:
             # Qt reverses the result for a descending sort; undo that here so
             # the grouping stays put
@@ -351,6 +795,40 @@ class _Row(QTreeWidgetItem):
         if mine == theirs:
             mine, theirs = self.keys[0], other.keys[0]   # ties: by name
         return mine < theirs
+
+
+def _sorted_rows(rows, column, ascending) -> list:
+    """*rows* (or row specs) in display order: ".." first, then folders, then
+    files, each group by *column* (ties by name)."""
+    top = [r for r in rows if r.rank == 0]
+    rest = sorted((r for r in rows if r.rank),
+                  key=lambda r: (r.keys[column], r.keys[0]), reverse=not ascending)
+    rest.sort(key=lambda r: r.rank)      # stable: the column order is kept
+    return top + rest
+
+
+# what a row shows, worked out on the worker thread
+_Spec = namedtuple("_Spec", "rank keys name is_dir is_link texts")
+
+
+def _row_specs(entries, order) -> list:
+    """The rows of a listing, formatted and in display order — on the worker
+    thread: formatting the dates of 20,000 entries on the GUI thread was a good
+    part of the time the window froze."""
+    specs = []
+    for e in entries:
+        perms = _perms(e.mode)
+        specs.append(_Spec(1 if e.is_dir else 2,
+                           ((e.name or "").lower(), e.size or 0, e.mtime or 0, perms),
+                           e.name, e.is_dir, e.is_link,
+                           ("" if e.is_dir else _human(e.size), _when(e.mtime), perms)))
+    return _sorted_rows(specs, *order)
+
+
+def _listing(link, path, order):
+    """Worker: list *path* and prepare its rows (outside the link's lock)."""
+    path, entries = link.run(lambda sftp: _list_dir(sftp, path))
+    return path, entries, _row_specs(entries, order), order
 
 
 class _FileTree(QTreeWidget):
@@ -362,21 +840,29 @@ class _FileTree(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.order = (0, True)           # sort column, ascending
+        self.source = ""                 # REMOTE_SOURCE_MIME of the rows shown
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
+
+    def sortByColumn(self, column, order=Qt.AscendingOrder):  # noqa: N802 - Qt API
+        """Through the header's sort indicator, which the browser follows by
+        re-ordering the rows itself — never Qt's per-comparison sort."""
+        self.header().setSortIndicator(column, order)
 
     def mimeTypes(self):
         return [REMOTE_MIME]
 
     def mimeData(self, items):
-        """Dragging rows out carries their names (never ".."); the local pane
-        downloads what is dropped on it."""
+        """Dragging rows out carries their names (never "..") and where they
+        are; the local pane downloads what is dropped on it."""
         names = [it.data(0, Qt.UserRole) for it in items]
         names = [n for n in names if n and n != ".."]
         data = QMimeData()
         if names:
             data.setData(REMOTE_MIME, "\n".join(names).encode("utf-8"))
+            data.setData(REMOTE_SOURCE_MIME, self.source.encode("utf-8"))
         return data
 
     def supportedDropActions(self):
@@ -424,6 +910,7 @@ class SftpBrowser(QWidget):
         self.transfers = transfer_log if transfer_log is not None else tl.TransferLog()
         self.local_target = None         # callable -> the local pane's folder
         self.show_inline_progress = True # off when a Transfers panel shows it
+        self.drag_token = uuid.uuid4().hex   # names this browser in its drags
         self._editors = []
         self.cwd = "."                   # only ever the last folder that LISTED
         self._entries = {}               # name -> _Entry: the listing on screen
@@ -432,15 +919,23 @@ class SftpBrowser(QWidget):
         self._xfer = _OwnSftp(handler)       # transfers
         self._queue = deque()            # _Job items waiting their turn
         self._transfer = None            # the _TransferThread moving one now
+        self._stuck = None               # (cancelled transfer, its client)
         self._file, self._percent = "", 0
         self._busy = ""                  # what the list is waiting for; "" = idle
         self._message = ""               # last error / result, until the next action
         self._summary = ""
         self._target = self._select = None
-        self._op = ""
+        self._op = ""                    # the operation in flight ("" = none)
         self._again = False              # re-list as soon as the list is idle
+        self._list_gen = 0               # which listing the rows being added are of
+        self._fill = None                # [gen, specs, next row, current]: filling
+        self._sort_pending = False       # re-order once the fill is complete
         self._focus_back = None
         self._closing = False
+        self._fill_timer = QTimer(self)  # a child: never fires once we are gone
+        self._fill_timer.setSingleShot(True)
+        self._fill_timer.setInterval(0)
+        self._fill_timer.timeout.connect(self._fill_more)
         self._build_ui()
         self._list(".")
 
@@ -471,9 +966,13 @@ class SftpBrowser(QWidget):
         head.setSectionResizeMode(0, QHeaderView.Stretch)
         for col in (1, 2, 3):
             head.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        # click a column to sort by it (folders stay first, ".." stays on top)
-        self.tree.setSortingEnabled(True)
-        self.tree.sortByColumn(0, Qt.AscendingOrder)
+        head.setResizeContentsPrecision(200)         # rows measured per column
+        # click a column to sort by it (folders stay first, ".." stays on top).
+        # The tree's own sorting stays off: the rows are ordered in Python.
+        head.setSectionsClickable(True)
+        head.setSortIndicatorShown(True)
+        head.setSortIndicator(0, Qt.AscendingOrder)
+        head.sortIndicatorChanged.connect(self._resort)
         self.tree.itemActivated.connect(self._open_item)     # double-click / Enter
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._ctx_menu)
@@ -593,43 +1092,92 @@ class SftpBrowser(QWidget):
         if self._busy:                   # it is changing right now: once it settles
             self._again = True
             return
+        self._list(self.cwd, self._current_name())
+
+    def _current_name(self):
         current = self.tree.currentItem()
-        self._list(self.cwd, current.data(0, Qt.UserRole) if current else None)
+        return current.data(0, Qt.UserRole) if current else None
 
     def _list(self, path, select=None) -> bool:
         self._target, self._select = path, select
+        self._list_gen += 1              # rows of an earlier listing stop coming
         self._set_busy(f"Loading {path}…")
-        remote = self._remote            # the worker must not reach into the widget
-        run_job(self._jobs, lambda: remote.run(lambda sftp: _list_dir(sftp, path)),
+        remote, order = self._remote, self.tree.order    # the worker must not
+        run_job(self._jobs, lambda: _listing(remote, path, order),   # touch the widget
                 self._on_listed, self._on_list_fail)
         return True
 
     def _on_listed(self, result):
         if self._closing:
             return
-        self.cwd, entries = result
+        self.cwd, entries, specs, order = result
         self._entries = {e.name: e for e in entries}
         self._summary = _plural(len(entries))
         self.path.setText(self.cwd)
-        items = [self._item("..", self._icons[True, False], 0, ("", -1, 0, ""))]
-        for e in entries:
-            it = self._item(e.name, self._icons[e.is_dir, e.is_link],
-                            1 if e.is_dir else 2,
-                            ((e.name or "").lower(), e.size or 0, e.mtime or 0,
-                             _perms(e.mode)),
-                            "" if e.is_dir else _human(e.size), _when(e.mtime),
-                            _perms(e.mode))
-            it.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-            items.append(it)
+        self.tree.source = f"{self.drag_token}\n{self.cwd}"
+        if order != self.tree.order:     # the order was changed meanwhile
+            specs = _sorted_rows(specs, *self.tree.order)
         self.tree.clear()
-        self.tree.addTopLevelItems(items)
+        top = self._item("..", self._icons[True, False], 0, ("", -1, 0, ""))
+        self.tree.addTopLevelItem(top)
+        self._fill = [self._list_gen, specs, 0, top]
+        self._fill_more()
+
+    def _fill_more(self):
+        """Add the next rows of the listing, a chunk per turn of the event loop:
+        20,000 rows at once kept the window frozen for half a second. The list
+        stays locked (busy) until the last one is in."""
+        if self._closing or self._fill is None:
+            return
+        gen, specs, start, current = self._fill
+        if gen != self._list_gen:        # another listing has started since
+            self._fill = None
+            return
+        end = min(len(specs), start + _FILL_CHUNK)
+        icons, item, select, rows = self._icons, self._item, self._select, []
+        for s in specs[start:end]:
+            it = item(s.name, icons[s.is_dir, s.is_link], s.rank, s.keys, *s.texts)
+            it.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            if s.name == select:
+                current = it
+            rows.append(it)
+        self.tree.addTopLevelItems(rows)
+        if end < len(specs):
+            self._fill[2:] = [end, current]
+            self._fill_timer.start()
+            return
+        self._fill = None
+        if self._sort_pending:           # a column was clicked while it filled
+            self._sort_pending = False
+            self._reorder()
         # keep the keyboard's place: the entry that was current (refresh), just
         # made (mkdir / rename) or just left (Up) — else the top of the list
-        current = next((it for it in items[1:]
-                        if it.data(0, Qt.UserRole) == self._select), items[0])
         self.tree.setCurrentItem(current)
         self.tree.scrollToItem(current)
         self._settled()
+
+    def _resort(self, column, order):
+        """A column header was clicked (or sortByColumn called): re-order the
+        rows in Python, keeping the selection and the current row."""
+        self.tree.order = (column, order == Qt.AscendingOrder)
+        if self._fill is not None:       # half-filled: sort once it is complete
+            self._sort_pending = True
+            return
+        self._reorder()
+
+    def _reorder(self):
+        root = self.tree.invisibleRootItem()
+        if not root.childCount():
+            return
+        current = self._current_name()
+        chosen = {it.data(0, Qt.UserRole) for it in self.tree.selectedItems()}
+        rows = _sorted_rows(root.takeChildren(), *self.tree.order)
+        root.addChildren(rows)
+        for it in rows:
+            if it.name in chosen:
+                it.setSelected(True)
+            if it.name == current:
+                self.tree.setCurrentItem(it, 0, QItemSelectionModel.NoUpdate)
 
     def _on_list_fail(self, msg):
         if self._closing:
@@ -659,7 +1207,7 @@ class SftpBrowser(QWidget):
         if self.local_target is not None and entries:
             m.addAction("Download to the local pane", self.download_to_local_pane)
         m.addAction("Download…", self._download)
-        if len(entries) == 1 and not entries[0].is_dir:
+        if len(entries) == 1 and not kind_problem(entries[0].ftype, unknown_ok=False):
             m.addAction("Edit / view…", self.edit_selected)
         m.addSeparator()
         m.addAction("Upload files…", self._upload)
@@ -678,15 +1226,28 @@ class SftpBrowser(QWidget):
         QApplication.clipboard().setText(
             "\n".join(posixpath.join(self.cwd, e.name) for e in self._selection()))
 
+    # --- the editor ---
+    def _live_editors(self) -> list:
+        """The editors still open (a closed one deletes itself)."""
+        self._editors = [d for d in self._editors if not sip.isdeleted(d)]
+        return self._editors
+
     def edit_selected(self):
-        """Open the selected remote text file in an editor window."""
+        """Open the selected remote text file in an editor window. Only a regular
+        file: a device or a FIFO never ends or never answers."""
         entries = self._selection()
         if len(entries) != 1 or entries[0].is_dir or self._closing:
             return None
+        entry = entries[0]
+        problem = kind_problem(entry.ftype, unknown_ok=False)
+        if problem:
+            self._notice(f"{entry.name} {problem} — it cannot be opened in the "
+                         f"editor", "[WARN] ")
+            return None
         from .remote_edit import RemoteEditDialog
-        dialog = RemoteEditDialog(self._remote, posixpath.join(self.cwd, entries[0].name),
+        dialog = RemoteEditDialog(self._remote, posixpath.join(self.cwd, entry.name),
                                   owner_window(self))
-        self._editors = [d for d in self._editors if d.isVisible()] + [dialog]
+        self._live_editors().append(dialog)
         dialog.show()
         return dialog
 
@@ -729,14 +1290,16 @@ class SftpBrowser(QWidget):
     def _op_done(self, _result):
         if self._closing:
             return
+        self._op = ""
         self._set_busy("")
         self._list(self.cwd, self._select)
 
     def _op_failed(self, msg):
         if self._closing:
             return
+        what, self._op = self._op, ""
         self._set_busy("")
-        self._error(f"{self._op} failed: {msg}")
+        self._error(f"{what} failed: {msg}")
         self._list(self.cwd)             # a recursive delete may have got part-way
 
     def _bad_name(self, name) -> str:
@@ -840,15 +1403,29 @@ class SftpBrowser(QWidget):
 
     def cancel_transfer(self) -> bool:
         """Abort the transfer in flight (its callback raises on the next block)
-        and drop the queued ones. The partial file is removed."""
+        and drop the queued ones. Only the transfer's temporary file goes; what
+        it was going to replace stays as it was."""
         if self._closing or self._transfer is None:
             return False
         self._queue.clear()
         self.transfers.cancel_queued()
-        self._transfer.cancel()
+        t = self._transfer
+        t.cancel()
+        self._stuck = (t, self._xfer.current())
+        QTimer.singleShot(int(_ABORT_AFTER * 1000), self._abort_stuck)
         self.cancel_btn.setEnabled(False)
         self._show_transfer()
         return True
+
+    def _abort_stuck(self):
+        """A cancelled transfer stops at its next block of data — never, on a
+        dead link. Still running after a moment? Close its client under it."""
+        stuck, self._stuck = self._stuck, None
+        if self._closing or stuck is None:
+            return
+        t, client = stuck
+        if t is self._transfer and client is not None and t.isRunning():
+            self._xfer.discard(client)
 
     def _enqueue(self, job) -> bool:
         if self._closing:
@@ -871,7 +1448,7 @@ class SftpBrowser(QWidget):
             self.xfer_row.hide()
             return
         job = self._queue.popleft()
-        t = self._transfer = _TransferThread(self.handler, self._xfer, job)
+        t = self._transfer = _TransferThread(self._xfer, job)
         t.progress.connect(self._on_progress)
         t.done.connect(self._on_transfer_done)
         t.failed.connect(self._on_transfer_failed)
@@ -890,7 +1467,9 @@ class SftpBrowser(QWidget):
 
     def _show_transfer(self):
         t = self._transfer
-        if t.cancelled:
+        if t.restart:
+            text = "Reconnected — starting again…"
+        elif t.cancelled:
             text = "Cancelling…"
         else:
             name = _job_name(t.job)
@@ -915,15 +1494,33 @@ class SftpBrowser(QWidget):
     def _on_transfer_done(self, summary, size, files):
         if self._closing:
             return
+        notes = ""
         if self._transfer is not None:
-            self.transfers.finish(self._transfer.job.log_id, tl.DONE,
+            for note in self._transfer.notes:
+                self.log.emit(f"[WARN] {note}")
+            if self._transfer.notes:
+                notes = (f"{_plural(len(self._transfer.notes), 'name')} changed or "
+                         f"skipped (see the log)")
+                summary += f" — {notes}"
+            self.transfers.finish(self._transfer.job.log_id, tl.DONE, error=notes,
                                   size=size, files=files)
         self._notice(summary)
-        self.notify.emit(summary, "ok")
+        self.notify.emit(summary, "warn" if notes else "ok")
         self._relist_if_here()
 
+    def _restarting(self) -> bool:
+        """The transfer was stopped by :meth:`rebind`: queue it again, first."""
+        t = self._transfer
+        if t is None or not t.restart:
+            return False
+        if self.transfers.requeue(t.job.log_id):
+            self._queue.appendleft(t.job)
+            self.log.emit(f"[WARN] the connection was replaced: {t.job.kind} of "
+                          f"{_job_name(t.job)} starts again")
+        return True
+
     def _on_transfer_failed(self, msg):
-        if self._closing:
+        if self._closing or self._restarting():
             return
         if self._transfer is not None:
             job = self._transfer.job
@@ -934,7 +1531,7 @@ class SftpBrowser(QWidget):
         self._relist_if_here()
 
     def _on_transfer_stopped(self):
-        if self._closing or self._transfer is None:
+        if self._closing or self._transfer is None or self._restarting():
             return
         job = self._transfer.job
         self.transfers.finish(job.log_id, tl.CANCELLED)
@@ -973,7 +1570,7 @@ class SftpBrowser(QWidget):
             return
         if len(entries) == 1 and not entries[0].is_dir:
             name = entries[0].name
-            local, _ = QFileDialog.getSaveFileName(self, "Save as", name)
+            local, _ = QFileDialog.getSaveFileName(self, "Save as", local_name(name))
             if local:
                 self.queue_download(posixpath.join(cwd, name), local)
             return
@@ -986,7 +1583,8 @@ class SftpBrowser(QWidget):
     def download_entries_to(self, dest, entries=None, names=None) -> int:
         """Queue the selection (or *entries*, or the entries called *names*) for
         download into the local folder *dest*; asks once before replacing what
-        is already there. Returns how many were queued."""
+        is already there. Each name is made one this PC can hold
+        (:func:`_local_names`). Returns how many were queued."""
         if self._closing or not dest:
             return 0
         if names is not None:
@@ -994,12 +1592,19 @@ class SftpBrowser(QWidget):
         elif entries is None:
             entries = self._selection()
         cwd, count = self.cwd, 0
-        wanted = self._keep_or_replace(
-            [e.name for e in entries],
-            lambda n: os.path.exists(os.path.join(dest, n)), dest)
+        local = _local_names([e.name for e in entries])
+        wanted = set(self._keep_or_replace(
+            [local[e.name] for e in entries],
+            lambda n: os.path.exists(os.path.join(dest, n)), dest))
         for e in entries:
-            if e.name in wanted and self.queue_download(
-                    posixpath.join(cwd, e.name), os.path.join(dest, e.name), e.is_dir):
+            name = local[e.name]
+            if name not in wanted:
+                continue
+            if name != e.name:
+                self.log.emit(f"[WARN] {e.name} is saved as {name}: the original "
+                              f"name is not possible on this PC")
+            if self.queue_download(posixpath.join(cwd, e.name),
+                                   os.path.join(dest, name), e.is_dir):
                 count += 1
         return count
 
@@ -1016,40 +1621,82 @@ class SftpBrowser(QWidget):
         if folder:
             self._upload_paths([folder])
 
+    def remote_ignores_case(self) -> bool:
+        """Does the remote file system take "Config.ini" and "config.ini" for one
+        file? (Windows: the OS the session found, or a "/C:/…" path.)"""
+        return (getattr(self.handler, "known_os", None) == "windows"
+                or bool(re.match(r"/?[A-Za-z]:", self.cwd or "")))
+
     def _upload_paths(self, paths):
         """Queue local files / folders for upload into the current folder (the
         Upload dialogs, a drop and the local pane all end here). Upload used to
         overwrite a remote file of the same name without a word — now it asks
-        first. Returns how many were queued."""
+        first, also for a name that differs only in case where the remote does
+        not tell those apart. Returns how many were queued."""
         if self._closing:
             return 0
         cwd, count = self.cwd, 0
         local = {os.path.basename(os.path.normpath(p)): p for p in paths}
         local.pop("", None)              # a drive root has no name to upload as
-        for name in self._keep_or_replace(list(local), self._entries.__contains__, cwd):
+        fold = str.casefold if self.remote_ignores_case() else (lambda n: n)
+        there = {fold(n) for n in self._entries}
+        for name in self._keep_or_replace(list(local), lambda n: fold(n) in there, cwd):
             if self.queue_upload(local[name], posixpath.join(cwd, name)):
                 count += 1
         return count
 
     upload_paths = _upload_paths
 
+    # --- a new connection ---
+    def rebind(self, handler) -> None:
+        """Carry on over a new connection to the same host (the session tab calls
+        this after it reconnected). The transfer queue and history and the open
+        editors stay; the SFTP links are re-made on *handler* and the old ones
+        closed on a teardown thread; a transfer that was moving starts again (it
+        never wrote into its destination, so that is safe); whatever else was in
+        flight is dropped, and the current folder is listed again."""
+        if self._closing or handler is None:
+            return
+        self.handler = handler
+        old = (self._remote, self._xfer)
+        self._remote, self._xfer = _OwnSftp(handler), _OwnSftp(handler)
+        for link in old:
+            link.shut()
+            run_teardown(link.close, "sftp-browser-rebind")
+        close_jobs(self._jobs)           # their results belong to the old link
+        if self._op:
+            self._message = (f"{self._op} was interrupted by the reconnect — check "
+                             f"the listing")
+            self.log.emit(f"[WARN] {self._message}")
+        self._op, self._again = "", False
+        if self._busy:
+            self._set_busy("")
+        for editor in self._live_editors():
+            editor.rebind(self._remote)
+        if self._transfer is not None:
+            self._transfer.restart = True
+            self._transfer.cancel()      # comes back via stopped / failed
+            self._show_transfer()
+        self._list(self.cwd, self._current_name())
+
     # --- teardown ---
     def close_browser(self):
         """Stop everything; the owner deletes the widget next. Workers are
         parked (silenced, and kept alive until they finish by themselves), the
         transfer in flight is cancelled, both SFTP clients are closed on a
-        teardown thread, and from here on every late callback is a no-op.
-        Safe to call twice."""
+        teardown thread, and from here on every late callback is a no-op. An
+        editor with unsaved changes stays open, offline, so they can still be
+        saved to a local file; the others close. Safe to call twice."""
         if self._closing:
             return
         self._closing = True
+        self._fill_timer.stop()
         self._queue.clear()
         self.transfers.cancel_queued()
-        for editor in self._editors:
+        for editor in self._live_editors():
             try:
-                editor.discard()
-                editor.close()
-            except Exception:
+                editor.connection_closed()
+            except RuntimeError:         # deleted meanwhile
                 pass
         self._editors = []
         transfer, self._transfer = self._transfer, None

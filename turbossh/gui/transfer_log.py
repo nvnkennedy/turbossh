@@ -65,7 +65,7 @@ class TransferItem:
 
     __slots__ = ("id", "kind", "remote", "local", "is_dir", "status", "error",
                  "total", "moved", "files", "current", "percent",
-                 "added_at", "started_at", "finished_at")
+                 "added_at", "started_at", "finished_at", "rev")
 
     def __init__(self, item_id, kind, remote, local, is_dir, now):
         self.id = item_id
@@ -83,6 +83,7 @@ class TransferItem:
         self.added_at = now
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
+        self.rev = 0                      # the log's revision when it last changed
 
     @property
     def name(self) -> str:
@@ -160,16 +161,24 @@ class TransferStats:
 
 class TransferLog:
     """``revision`` grows on every change, so a view can poll cheaply and redraw
-    only when something actually moved."""
+    only when something actually moved; an item's ``rev`` is the revision that
+    last changed it, so a view repaints only those rows.
+
+    Items are indexed by id and the counts are kept as they change: progress is
+    reported many times a second, and with hundreds of rows of history a scan of
+    the whole list per report (or per cancelled item) added up to a frozen GUI."""
 
     def __init__(self, clock: Callable[[], float] = time.monotonic,
                  limit: int = _HISTORY_LIMIT):
         self._clock = clock
         self._limit = limit
         self._items: List[TransferItem] = []
+        self._by_id = {}                 # id -> TransferItem
         self._next_id = 1
         self._samples: deque = deque()   # (time, total bytes moved by all items)
         self._moved_total = 0
+        self._finished = 0               # how many of the items are finished
+        self._running = 0                # ... and how many are running
         self.revision = 0
 
     # ---- reading ----
@@ -183,36 +192,37 @@ class TransferLog:
         return list(self._items)
 
     def get(self, item_id: int) -> Optional[TransferItem]:
-        for item in self._items:
-            if item.id == item_id:
-                return item
-        return None
+        return self._by_id.get(item_id)
 
     @property
     def active(self) -> bool:
-        return any(item.active for item in self._items)
+        return len(self._items) > self._finished
 
     # ---- writing ----
-    def _touch(self):
+    def _touch(self, item: Optional[TransferItem] = None):
         self.revision += 1
+        if item is not None:
+            item.rev = self.revision
 
     def add(self, kind: str, remote: str, local: str, is_dir: bool = False) -> int:
         item = TransferItem(self._next_id, kind, remote, local, is_dir, self._clock())
         self._next_id += 1
         self._items.append(item)
-        self._trim()
-        self._touch()
+        self._by_id[item.id] = item
+        self._touch(item)
         return item.id
 
     def start(self, item_id: int) -> None:
         item = self.get(item_id)
         if item is None or item.finished:
             return
+        if item.status != RUNNING:
+            self._running += 1
         item.status = RUNNING
         item.started_at = self._clock()
         # the baseline the first progress report is measured against
         self._samples.append((item.started_at, self._moved_total))
-        self._touch()
+        self._touch(item)
 
     def progress(self, item_id: int, current: str, percent: int, moved: int,
                  total: Optional[int] = None, files: Optional[int] = None) -> None:
@@ -231,13 +241,20 @@ class TransferLog:
         if delta:
             self._moved_total += delta
             self._samples.append((self._clock(), self._moved_total))
-        self._touch()
+        self._touch(item)
 
     def finish(self, item_id: int, status: str, error: str = "",
                size: Optional[int] = None, files: Optional[int] = None) -> None:
         item = self.get(item_id)
         if item is None or item.finished:
             return
+        self._end(item, status, error, size, files)
+        self._trim()
+
+    def _end(self, item, status, error="", size=None, files=None) -> None:
+        if item.status == RUNNING:
+            self._running -= 1
+        self._finished += 1
         item.status = status
         item.error = error or ""
         item.finished_at = self._clock()
@@ -254,36 +271,61 @@ class TransferLog:
             item.files = int(files)
         if status == DONE:
             item.percent = 100
-        self._trim()
-        self._touch()
+        self._touch(item)
+
+    def requeue(self, item_id: int) -> bool:
+        """Put a running item back in the queue to start over (the connection it
+        was using has been replaced). False if it is not running."""
+        item = self.get(item_id)
+        if item is None or item.status != RUNNING:
+            return False
+        self._running -= 1
+        item.status = QUEUED
+        item.moved = item.files = item.percent = 0
+        item.total, item.current, item.started_at = None, "", None
+        self._touch(item)
+        return True
 
     def cancel_queued(self) -> List[int]:
         """Mark everything still waiting as cancelled; returns their ids."""
         cancelled = []
         for item in self._items:
             if item.status == QUEUED:
-                self.finish(item.id, CANCELLED)
+                self._end(item, CANCELLED)
                 cancelled.append(item.id)
+        if cancelled:
+            self._trim()                 # once, not once per item
         return cancelled
 
     def remove(self, ids: Iterable[int]) -> int:
         """Drop finished items from the history (active ones are kept)."""
         wanted = set(ids)
-        before = len(self._items)
-        self._items = [i for i in self._items if not (i.id in wanted and i.finished)]
-        if len(self._items) != before:
+        drop = {i.id for i in self._items if i.id in wanted and i.finished}
+        if drop:
+            self._drop(drop)
             self._touch()
-        return before - len(self._items)
+        return len(drop)
 
     def clear_finished(self) -> int:
         return self.remove([i.id for i in self._items if i.finished])
 
+    def _drop(self, ids) -> None:
+        """Forget the (finished) items in *ids*: one pass over the list."""
+        self._items = [i for i in self._items if i.id not in ids]
+        for item_id in ids:
+            if self._by_id.pop(item_id, None) is not None:
+                self._finished -= 1
+
     def _trim(self) -> None:
-        finished = [i for i in self._items if i.finished]
-        excess = len(finished) - self._limit
+        excess = self._finished - self._limit
         if excess > 0:
-            drop = {i.id for i in finished[:excess]}
-            self._items = [i for i in self._items if i.id not in drop]
+            drop = set()
+            for item in self._items:     # the oldest finished ones
+                if item.finished:
+                    drop.add(item.id)
+                    if len(drop) == excess:
+                        break
+            self._drop(drop)
 
     # ---- figures ----
     def speed(self) -> float:
@@ -292,7 +334,7 @@ class TransferLog:
         samples = self._samples
         while samples and now - samples[0][0] > _SPEED_WINDOW:
             samples.popleft()
-        if len(samples) < 2 or not any(i.status == RUNNING for i in self._items):
+        if len(samples) < 2 or not self._running:
             return 0.0
         span = samples[-1][0] - samples[0][0]
         return (samples[-1][1] - samples[0][1]) / span if span > 0 else 0.0

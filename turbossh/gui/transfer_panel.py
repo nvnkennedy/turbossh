@@ -23,15 +23,31 @@ _FILTERS = (("All", None), ("Active", tl.ACTIVE), ("Failed", frozenset((tl.FAILE
             ("Done", frozenset((tl.DONE,))))
 
 
+def _runs(rows):
+    """Sorted row numbers -> (first, last) of each consecutive run."""
+    runs = []
+    for row in rows:
+        if runs and row == runs[-1][1] + 1:
+            runs[-1][1] = row
+        else:
+            runs.append([row, row])
+    return runs
+
+
 class TransferTableModel(QAbstractTableModel):
-    """Rows are the log's items. ``sync()`` re-reads the log; it resets the model
-    only when rows were added or removed, and otherwise just repaints the cells."""
+    """Rows are the log's items. ``sync()`` re-reads the log and tells the view
+    as little as it can: rows dropped from the history are removed, new ones
+    appended, and only the rows that changed (or are running: their speed and
+    time move with the clock) are repainted. Repainting every row on every tick
+    made the view re-query all of them, several times over with columns sized
+    to their contents — 430 ms per 200 ms tick with a full history."""
 
     def __init__(self, log: tl.TransferLog, parent=None):
         super().__init__(parent)
         self._log = log
         self._rows = log.items()
         self._ids = [i.id for i in self._rows]
+        self._rev = log.revision         # changes up to here are on screen
 
     def rowCount(self, parent=QModelIndex()):  # noqa: N802 - Qt API
         return 0 if parent.isValid() else len(self._rows)
@@ -93,13 +109,34 @@ class TransferTableModel(QAbstractTableModel):
         rows = self._log.items()
         ids = [i.id for i in rows]
         if ids != self._ids:
+            self._restructure(rows, ids)
+        seen, self._rev = self._rev, self._log.revision
+        changed = [r for r, item in enumerate(self._rows)
+                   if item.rev > seen or item.status == tl.RUNNING]
+        last = len(COLUMNS) - 1
+        for first, end in _runs(changed):
+            self.dataChanged.emit(self.index(first, 0), self.index(end, last))
+
+    def _restructure(self, rows, ids) -> None:
+        """Rows were dropped and / or added: remove the dropped ones (bottom up,
+        so the row numbers stay valid), then append what is new. Anything else
+        (never done by the log today) resets the model."""
+        keep = set(ids)
+        gone = [r for r, item_id in enumerate(self._ids) if item_id not in keep]
+        for first, end in reversed(_runs(gone)):
+            self.beginRemoveRows(QModelIndex(), first, end)
+            del self._rows[first:end + 1]
+            del self._ids[first:end + 1]
+            self.endRemoveRows()
+        have = len(self._ids)
+        if ids[:have] != self._ids:
             self.beginResetModel()
             self._rows, self._ids = rows, ids
             self.endResetModel()
-        elif rows:
-            self._rows = rows
-            self.dataChanged.emit(self.index(0, 0),
-                                  self.index(len(rows) - 1, len(COLUMNS) - 1))
+        elif len(ids) > have:
+            self.beginInsertRows(QModelIndex(), have, len(ids) - 1)
+            self._rows, self._ids = rows, ids
+            self.endInsertRows()
 
 
 class _StatusFilter(QSortFilterProxyModel):
@@ -168,10 +205,15 @@ class TransferPanel(QFrame):
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setWordWrap(False)
+        # Interactive columns, fitted to their contents when the rows are reset
+        # or first appear — not ResizeToContents, which re-measures every row
+        # each time any cell changes (i.e. several times a second while moving)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(True)
-        for column in range(len(COLUMNS) - 1):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setResizeContentsPrecision(64)        # rows measured when fitting
+        self.model.modelReset.connect(self._fit_columns)
+        self.model.rowsInserted.connect(self._fit_if_first)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.doubleClicked.connect(lambda _index: self._open_folder())
@@ -179,30 +221,51 @@ class TransferPanel(QFrame):
         lay.addWidget(self.table, 1)
 
         # The log changes many times a second during a transfer; poll its revision
-        # and redraw at most a few times a second, and not at all while idle.
+        # and redraw at most a few times a second, not at all while idle, and
+        # not while nobody can see the panel (another tab is in front).
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
+        self._timer.timeout.connect(self._tick)
         self._timer.start(200)
         self.refresh()
+        self._fit_columns()
 
     # ---- rendering ----
+    def _tick(self) -> None:
+        if self.isVisible():
+            self.refresh()
+
+    def showEvent(self, event):  # noqa: N802 - Qt API
+        super().showEvent(event)
+        self.refresh()                   # catch up with what happened while hidden
+
     def refresh(self) -> None:
         active = self._log.active
         if self._log.revision == self._seen and not active:
             return
         self._seen = self._log.revision
-        self.model.sync()
+        if not self.table.isHidden():    # collapsed: only the summary line shows
+            self.model.sync()
         stats = self._log.stats()
         self.summary.setText(stats.summary())
         self.cancel_btn.setEnabled(stats.active)
         self.retry_btn.setEnabled(bool(stats.failed or stats.cancelled))
         self.clear_btn.setEnabled(bool(stats.done or stats.failed or stats.cancelled))
 
+    def _fit_columns(self) -> None:
+        self.table.resizeColumnsToContents()
+
+    def _fit_if_first(self, _parent, first, _last) -> None:
+        if first == 0:                   # the table was empty until now
+            self._fit_columns()
+
     def _set_expanded(self, shown: bool) -> None:
         self.toggle.setText(("▾" if shown else "▸") + " Transfers")
         for widget in (self.table, self.filter, self.cancel_btn, self.retry_btn,
                        self.clear_btn, self.more_btn):
             widget.setVisible(shown)
+        if shown:
+            self._seen = -1              # the table was not kept up to date
+            self.refresh()
 
     def _on_filter(self, index: int) -> None:
         self._proxy.set_statuses(_FILTERS[index][1])

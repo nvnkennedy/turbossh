@@ -66,7 +66,7 @@ def release(tmp_path, monkeypatch):
     monkeypatch.setattr(ffmpeg_tools, "_FFMPEG_URL",
                         f"http://127.0.0.1:{server.server_address[1]}/ffmpeg.zip")
     monkeypatch.setattr(ffmpeg_tools, "_cache_dir", lambda: str(cache))
-    monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ffmpeg_tools, "_which", lambda name: None)
     monkeypatch.delenv(ffmpeg_tools.PIN_ENV, raising=False)
     server.cache = cache
     yield server

@@ -7,6 +7,7 @@ view fills the tab. Runs on its own threads — never touches terminal/serial wo
 from __future__ import annotations
 
 import os
+import re
 import socket
 import tempfile
 import time
@@ -29,6 +30,19 @@ from .widgets import HostCombo
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _RES = {"480p (640×480)": (640, 480), "540p (960×540)": (960, 540),
         "720p (1280×720)": (1280, 720), "1080p (1920×1080)": (1920, 1080)}
+_QUOTE_UNSAFE = re.compile(r'["%$`\x00-\x1f]')
+_FORCE_WARNING = ("Forcing stops EVERY TurboSSH camera stream on that machine — "
+                  "also ones that other TurboSSH windows, or other people, are "
+                  "viewing or recording there right now.")
+# A recording is finished when ffmpeg exits after its input closed. It is never
+# killed while the file is still growing (a kill mid-trailer leaves an
+# unplayable file); only once it has written nothing for this long (s).
+_REC_STALL = 60.0
+# Fragmented MP4: playable up to the last fragment even if ffmpeg dies or the PC
+# loses power, and nothing to rewrite at the end (+faststart rewrote the whole
+# file, which could take longer than the old 30 s limit before ffmpeg was killed).
+# A keyframe (so a fragment) every 50 frames: about 2 s at 25 fps.
+_REC_ARGS = ["-g", "50", "-movflags", "+frag_keyframe+empty_moov+default_base_moof"]
 
 
 def _channel_reader(chan, prebuf=b""):
@@ -82,6 +96,41 @@ def _tail(fileobj, limit=1500) -> str:
         return fileobj.read().decode("utf-8", "replace").strip()[-limit:]
     except Exception:
         return ""
+
+
+def _wait_for_recorder(proc, path, stall=None):
+    """Wait for a recording ffmpeg whose input is closed to finish its file.
+    However long that takes — as long as the file is still growing; it is
+    killed only after it has written nothing for *stall* seconds (hung)."""
+    stall = _REC_STALL if stall is None else stall
+    size, since = -1, time.monotonic()
+    while True:
+        try:
+            proc.wait(timeout=0.5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            now = os.path.getsize(path) if path else -1
+        except OSError:
+            now = -1
+        if now != size:
+            size, since = now, time.monotonic()
+        elif time.monotonic() - since > stall:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return
+
+
+def _close_quietly(fileobj):
+    try:
+        if fileobj is not None:
+            fileobj.close()
+    except Exception:
+        pass
 
 
 def _close_orphan(first, *_rest):
@@ -176,19 +225,26 @@ class _FrameReader(threading.Thread):
 
 
 class _LocalPrep(QThread):
+    """``cancel`` stops the one-time ffmpeg download (CameraPanel._drop_prep)."""
     progress = pyqtSignal(str)
     done = pyqtSignal(str, list)        # ffmpeg path, cameras
     fail = pyqtSignal(str)
 
+    def __init__(self):
+        super().__init__()
+        self.cancel = threading.Event()
+
     def run(self):
         try:
-            ff = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit)
+            ff = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit, cancel=self.cancel)
             self.done.emit(ff, ffmpeg_tools.list_local_cameras(ff))
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
 
 
 class _RemotePrep(QThread):
+    """``cancel`` stops the ffmpeg download and the upload to the remote: a scan
+    the user walked away from used to move ~160 MB to the end regardless."""
     progress = pyqtSignal(str)
     done = pyqtSignal(object, str, list, str)   # handler, remote ffmpeg, cameras, diag
     fail = pyqtSignal(str)
@@ -196,16 +252,18 @@ class _RemotePrep(QThread):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.cancel = threading.Event()
 
     def run(self):
         h = None
         try:
-            local = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit)
+            local = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit, cancel=self.cancel)
             h = SSHHandler(self.cfg, safe=True)
             res = h.connect()
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error)); return
-            remote = ffmpeg_tools.ensure_remote_ffmpeg(h, local, self.progress.emit)
+            remote = ffmpeg_tools.ensure_remote_ffmpeg(h, local, self.progress.emit,
+                                                       cancel=self.cancel)
             r = h.list_cameras(ffmpeg=remote)
             cams = list((r.value if isinstance(r, OperationResult) else r) or [])
             diag = ""
@@ -242,8 +300,11 @@ class _RemoteProbe(QThread):
     def run(self):
         out = b""
         try:
+            # the name goes inside "…" of a remote command line: a quote would end
+            # it, and % (cmd) / $ ` (PowerShell) would be expanded there
+            camera = _QUOTE_UNSAFE.sub("", self.camera)
             cmd = (f'"{self.ffmpeg}" -hide_banner -loglevel verbose -f dshow '
-                   f'-rtbufsize 16M -i video="{self.camera}" -frames:v 1 -f null -')
+                   f'-rtbufsize 16M -i video="{camera}" -frames:v 1 -f null -')
             chan = self.handler._client.get_transport().open_session()
             chan.settimeout(1.0)
             chan.exec_command(cmd)
@@ -494,7 +555,6 @@ class CameraPanel(QWidget):
             self._ensure_dl_dialog()
             if self._dl_dialog is not None:
                 self._dl_dialog.setLabelText(msg)
-                import re
                 m = re.search(r"\((\d+)%\)", msg)
                 if m:
                     self._dl_dialog.setRange(0, 100)
@@ -566,11 +626,15 @@ class CameraPanel(QWidget):
 
     # ---- enumerate ----
     def _drop_prep(self):
-        """Forget the scan in flight. Its QThread is parked, never dropped while
-        running (Qt aborts the app for that — and a scan can be a 160 MB download),
-        its result is ignored, and a connection it opens is closed."""
+        """Forget the scan in flight. Its QThread is told to stop (a download or
+        an upload of ffmpeg ends at its next block), parked — never dropped while
+        running, Qt aborts the app for that — its result is ignored, and a
+        connection it opens is closed."""
         self._scan_gen += 1
         prep, self._prep = self._prep, None
+        cancel = getattr(prep, "cancel", None)
+        if cancel is not None:
+            cancel.set()
         qtutil.park_thread(prep, orphan={"done": _close_orphan})
 
     def _start_prep(self, thread, on_done):
@@ -683,6 +747,9 @@ class CameraPanel(QWidget):
                                           stderr=self._proc_err,
                                           bufsize=0, creationflags=_NO_WINDOW)
         except Exception as exc:
+            self._proc = None
+            _close_quietly(self._proc_err)
+            self._proc_err = None
             QMessageBox.warning(self, "Camera", f"Couldn't start the camera:\n\n{exc}")
             return
         self._stream_gen += 1
@@ -737,6 +804,7 @@ class CameraPanel(QWidget):
         # "no video frames" / device-in-use almost always means another app (or a
         # stuck ffmpeg from a previous run) is holding the camera on that machine.
         # Offer to force any stuck holder closed and retry — unless we already did.
+        # Default No: forcing reaches beyond this tab.
         looks_busy = any(k in msg.lower() for k in (
             "no video frames", "in use", "i/o error", "could not run graph",
             "buffer too full", "being used", "busy", "timeout"))
@@ -746,8 +814,8 @@ class CameraPanel(QWidget):
                 f"Couldn't start the camera:\n\n{msg}\n\n"
                 "This usually means another app — or a stuck ffmpeg from a "
                 "previous run — is holding the camera on that machine.\n\n"
-                "Force any stuck camera process closed there and try again?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                f"{_FORCE_WARNING}\n\nForce them closed and try again?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if r == QMessageBox.Yes:
                 self._start_remote(cam, w, h, fps, force=True)
                 return
@@ -799,7 +867,7 @@ class CameraPanel(QWidget):
             "access your camera' on the RDP machine.\n"
             "(You do NOT normally need to be signed into the desktop — the camera "
             "opens fine over SSH.)\n\n"
-            "Try again, forcing any stuck ffmpeg closed first?",
+            f"{_FORCE_WARNING}\n\nForce them closed and try again?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if r == QMessageBox.Yes and self._handler is not None:
             self._busy_checked = False
@@ -847,6 +915,8 @@ class CameraPanel(QWidget):
         self.log.emit("[ERROR] camera stream ended" + (f": {detail}" if detail else ""))
 
     def _tick(self):
+        if self._rec_proc is not None and self._rec_proc.poll() is not None:
+            self._recorder_quit()        # cheap: no wait, just the exit status
         if self.reader is not None and self.reader.ended:
             self._on_stream_ended()
             return
@@ -968,8 +1038,7 @@ class CameraPanel(QWidget):
                 [ff, "-y", "-hide_banner", "-loglevel", "error",
                  "-f", "mjpeg", "-use_wallclock_as_timestamps", "1", "-i", "-",
                  "-an", "-c:v", "libx264", "-preset", "veryfast",
-                 "-pix_fmt", "yuv420p", "-fps_mode", "vfr",
-                 "-movflags", "+faststart", path],
+                 "-pix_fmt", "yuv420p", "-fps_mode", "vfr", *_REC_ARGS, path],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=self._rec_err, creationflags=_NO_WINDOW)
             self._rec_path = path
@@ -979,9 +1048,20 @@ class CameraPanel(QWidget):
             self.log.emit(f"[OK] recording to {path}")
         except Exception as exc:
             self._rec_proc = None
+            _close_quietly(self._rec_err)
+            self._rec_err = None
             self.log.emit(f"[ERROR] record: {exc}")
 
-    def _stop_record(self):
+    def _recorder_quit(self):
+        """ffmpeg exited while it was still being fed frames — an older ffmpeg
+        that rejects an option, a full disk, a folder it may not write to. Say
+        so now: the panel used to show "Recording…" until Stop was pressed."""
+        self.log.emit("[ERROR] the recording stopped: ffmpeg exited "
+                      f"(code {self._rec_proc.returncode})")
+        self._set_status("Recording failed", "error")
+        self._stop_record(early=True)
+
+    def _stop_record(self, early=False):
         if self.reader:
             self.reader.set_recorder(None)
         proc, self._rec_proc = self._rec_proc, None
@@ -995,33 +1075,24 @@ class CameraPanel(QWidget):
 
         def finalize():
             # Off the GUI thread: ffmpeg needs a moment to flush the remaining
-            # frames and write the MP4 trailer (this used to block the window for
-            # up to 10 s). And it is only "saved" if a non-empty file is really
-            # there — an ffmpeg that rejected an option exits at once and used to
-            # be reported as a saved recording.
+            # frames and finish the file. And it is only "saved" if a non-empty
+            # file is really there — an ffmpeg that rejected an option exits at
+            # once and used to be reported as a saved recording.
             try:
                 proc.stdin.close()
             except Exception:
                 pass
-            try:
-                proc.wait(timeout=30)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
+            _wait_for_recorder(proc, path)
             ok = False
             try:
-                ok = (proc.returncode == 0 and bool(path)
+                ok = (not early and proc.returncode == 0 and bool(path)
                       and os.path.getsize(path) > 0)
             except OSError:
                 pass
             detail = _tail(errors)
-            try:
-                errors.close()
-            except Exception:
-                pass
+            if early and not detail:
+                detail = f"ffmpeg stopped by itself (exit code {proc.returncode})."
+            _close_quietly(errors)
             done.emit(path or "", ok, detail)    # a no-op once the panel is gone
         qtutil.run_teardown(finalize, "record-finalize")
 
@@ -1039,8 +1110,9 @@ class CameraPanel(QWidget):
                       + (f": {detail}" if detail else ""))
         QMessageBox.warning(
             self, "Recording",
-            f"ffmpeg did not produce a video file at\n{path}\n\n"
-            + (detail or "It exited without an error message.")
+            f"The recording to\n{path}\nfailed (whatever was recorded before "
+            f"that is kept in the file, if there is one).\n\n"
+            + (detail or "ffmpeg exited without an error message.")
             + "\n\nAn older ffmpeg (before 5.1) does not know the options "
               "TurboSSH uses — check Settings → Camera → ffmpeg path.")
 
@@ -1089,30 +1161,28 @@ class CameraPanel(QWidget):
                     except Exception:
                         pass
             threading.Thread(target=reap, daemon=True).start()
-        was_remote = self._chan is not None
-        if self._chan is not None:
-            exec_c = getattr(self._chan, "_ffmpeg_exec", None)
-            try:
-                self._chan.close()
-            except Exception:
-                pass
-            if exec_c is not None:       # also end the ffmpeg exec (TCP-tunnel mode)
-                try:
-                    exec_c.close()
-                except Exception:
-                    pass
-            self._chan = None
+        # The channels are closed on the teardown thread too: closing one sends
+        # a message, which on a stalled link waits for it (up to 30 s in a rekey)
+        chan, self._chan = self._chan, None
+        was_remote = chan is not None
+        channels = [c for c in (chan, getattr(chan, "_ffmpeg_exec", None))
+                    if c is not None]    # the ffmpeg exec too (TCP-tunnel mode)
         handler = self._handler
         if drop_handler:
             self._handler = None
-        if handler is not None and (was_remote or drop_handler):
+        if channels or (handler is not None and drop_handler):
             def teardown():
-                if was_remote:           # only if a remote ffmpeg was running
+                for c in channels:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                if handler is not None and was_remote:   # a remote ffmpeg ran
                     try:
                         handler.webcam_release(safe=True)
                     except Exception:
                         pass
-                if drop_handler:
+                if handler is not None and drop_handler:
                     try:
                         handler.disconnect()
                     except Exception:
