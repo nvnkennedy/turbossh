@@ -95,6 +95,20 @@ else:
         pass
 
 
+_MAX_SHUTDOWN_WAIT = 60.0      # the most `shutdown` waits for remote releases
+
+
+def _shutdown_wait(wait) -> float:
+    """``close(wait=…)`` as TurboSSH takes it: 0 to 60 s (more counts as 60)."""
+    try:
+        wait = float(wait)
+    except (TypeError, ValueError):
+        return 6.0
+    if wait != wait:                     # NaN
+        return 6.0
+    return min(max(wait, 0.0), _MAX_SHUTDOWN_WAIT)
+
+
 def _wait(flag: threading.Event, timeout: Optional[float]) -> bool:
     deadline = None if timeout is None else time.monotonic() + timeout
     while not flag.wait(0.01):
@@ -377,9 +391,11 @@ class TurboSSHProcess:
 
     def run(self, session: str, command: str, timeout: float = 60.0) -> dict:
         """Run a command over the session's SSH connection (not in its terminal):
-        ``{"exit_code", "stdout", "stderr", "duration"}``."""
+        ``{"exit_code", "stdout", "stderr", "duration"}``. ``timeout`` 0 is no
+        limit (the answer is then waited for as long as it takes)."""
         return self._request("run", {"session": session, "command": command,
-                                     "timeout": timeout}, timeout + 15)
+                                     "timeout": timeout},
+                             timeout + 15 if timeout else None)
 
     def activate(self, session: str) -> None:
         self.call("activate", session=session)
@@ -423,14 +439,19 @@ class TurboSSHProcess:
 
     # ---- the end ----
     def close(self, wait: float = 6.0, timeout: float = 20.0) -> int:
-        """Close every session (waiting up to ``wait`` s for remote ports and
-        cameras to be released) and end the process. Returns its exit code."""
+        """Close every session (waiting up to ``wait`` s, 0 to 60, for remote
+        ports and cameras to be released) and end the process. Returns its exit
+        code. The process gets ``timeout`` s to end, and at least ``wait`` + 5;
+        only then is it killed (its sessions are not released then)."""
+        wait = _shutdown_wait(wait)
         if self.is_running:
             try:
                 self.call("shutdown", wait=wait, timeout=5.0)
-            except TurboSSHError:
-                pass
-        deadline = time.monotonic() + timeout
+            except TurboSSHError as exc:
+                if exc.type != "Exited":
+                    # refused, or no answer: closing its stdin ends it as cleanly
+                    self._hang_up()
+        deadline = time.monotonic() + max(float(timeout), wait + 5.0)
         while self.process.poll() is None and time.monotonic() < deadline:
             _pump()
             time.sleep(0.02)
@@ -442,6 +463,15 @@ class TurboSSHProcess:
             except OSError:
                 pass
         return self.process.wait()
+
+    def _hang_up(self) -> None:
+        """Close TurboSSH's stdin: it notices, closes every session cleanly and
+        ends, as for ``shutdown``."""
+        try:
+            with self._write_lock:
+                self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
 
     def kill(self) -> None:
         try:

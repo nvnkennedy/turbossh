@@ -48,6 +48,9 @@ class SessionStore:
     def __init__(self):
         self.sessions: list[dict] = []
         self.load_problem: Optional[str] = None   # set when the file was unreadable
+        # True while the file is there but could not be read (a passing lock):
+        # what is in memory is not what it holds, so read it again soon
+        self.unread = False
         self._seen = None                         # _signature() of what was loaded
         self.load()
 
@@ -69,8 +72,12 @@ class SessionStore:
         data, problem = self._read()
         if _transient(problem):
             self._seen = None
+            self.unread = True
             return False
         self._seen = seen
+        self.unread = False
+        if self.load_problem is not None and _transient(self.load_problem):
+            self.load_problem = None   # it reads now: the lock has passed
         self.sessions = data if data is not None else []
         return True
 
@@ -99,6 +106,8 @@ class SessionStore:
             self.sessions = fresh
         change(self.sessions)
         atomic_write_json(_FILE, self.sessions)
+        self.unread = False
+        self._seen = _signature()        # this list is what the file holds now
 
     # ---- queries ----
     def names(self) -> list[str]:
@@ -194,35 +203,92 @@ class SessionStore:
         """The session's OWN jump password (see :func:`jump_password_for`)."""
         return SessionStore.password(f"{name}::jump")
 
-    def forget_jump_copies(self, shared: str) -> None:
-        """Drop per-session jump passwords that are just copies of *shared*, the
-        jump password in Settings that is about to change: they would keep the
-        old one alive (and lock the account) after the change."""
-        if not shared:
+    def shared_jump_changing(self, old: dict, new: dict) -> None:
+        """The jump host in Settings changes from *old* to *new* (each
+        ``{"host", "user", "password"}``): keep every session that used the old
+        one on the password of ITS jump host.
+
+        Only sessions whose jump host and user are the Settings ones share its
+        password (:func:`uses_shared_jump`). Of those:
+
+        * same host and user, new password: a copy of the old password that a
+          session kept (2.0.0 stored one for each) is dropped, so it follows the
+          new one instead of locking the account with the old one;
+        * another host or user: a session that took the shared password keeps
+          the old one as its own. It still goes to the old host, which must not
+          be sent the new host's password (and its own still works there).
+
+        A session with another jump host is not touched: its own password is its
+        own, even when it happens to equal the shared one."""
+        old_pw = old.get("password") or ""
+        if not old_pw:
+            return                       # nothing was shared, nothing to keep
+        same = _same_jump(old.get("host"), old.get("user"), new.get("host"), new.get("user"))
+        if same and (new.get("password") or "") == old_pw:
             return
-        for name in self.names():
-            if self.jump_password(name) == shared:
-                self._set_secret(f"{name}::jump", None)
+        for session in list(self.sessions):
+            name = session.get("name")
+            if not name or not uses_shared_jump(session, old):
+                continue
+            own = self.jump_password(name) or ""
+            if same:
+                if own == old_pw:
+                    self._set_secret(f"{name}::jump", None)
+            elif not own and session.get("use_jump"):
+                self._set_secret(f"{name}::jump", old_pw)
+
+
+def _same_jump(host_a, user_a, host_b, user_b) -> bool:
+    """The same jump account: host names compare case-insensitively (DNS), user
+    names exactly. An empty host is nobody's."""
+    host_a, host_b = (host_a or "").strip(), (host_b or "").strip()
+    return bool(host_a) and host_a.lower() == host_b.lower() \
+        and (user_a or "").strip() == (user_b or "").strip()
+
+
+def uses_shared_jump(session: dict, shared: Optional[dict] = None) -> bool:
+    """Whether *session* goes through the jump host in Settings (*shared*, read
+    afresh when not given): its jump host AND user are the Settings ones. Only
+    then is the password in Settings its password; any other jump host has its
+    own, and none means none (a key or agent login)."""
+    if shared is None:
+        from . import settings
+        shared = settings.shared_jump()
+    return _same_jump(session.get("jhost"), session.get("juser"),
+                      shared.get("host"), shared.get("user"))
 
 
 def jump_secret_to_store(session: dict, entered: str) -> str:
     """The jump password worth keeping for *session* ("" = none). Only a session
-    that goes through a jump host keeps one, and only one that differs from the
-    shared jump password in Settings: storing a copy of that for every session
-    (as the dialog did) left copies behind when it was changed or cleared."""
+    that goes through a jump host keeps one; a session going through the jump
+    host in Settings does not keep a copy of its password (it follows that one
+    when it changes). Any other jump host keeps what was typed, even when it
+    equals the shared one: it is that host's password."""
     if not session.get("use_jump") or not entered:
         return ""
     from . import settings
-    return "" if entered == settings.jump_password() else entered
+    shared = settings.shared_jump()
+    if uses_shared_jump(session, shared) and entered == shared["password"]:
+        return ""
+    return entered
+
+
+def effective_jump_password(session: dict, entered: str) -> str:
+    """The jump password to connect *session* with when *entered* is what its
+    own is: that, else the shared one if it goes through the jump host in
+    Settings, else none."""
+    if entered:
+        return entered
+    from . import settings
+    shared = settings.shared_jump()
+    return shared["password"] if uses_shared_jump(session, shared) else ""
 
 
 def jump_password_for(name: str, session: dict) -> str:
-    """The jump password to connect *session* with: its own, else the shared one
-    from Settings (sessions keep their own only when it differs)."""
+    """The jump password to connect saved *session* with: its own, else the
+    shared one from Settings when it goes through that jump host, else none.
+    A 2.0.0 session with no jump password of its own (a key or agent login to
+    another bastion) is not sent the shared one."""
     if not session.get("use_jump"):
         return ""
-    own = SessionStore.jump_password(name)
-    if own:
-        return own
-    from . import settings
-    return settings.jump_password()
+    return effective_jump_password(session, SessionStore.jump_password(name) or "")

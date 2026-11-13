@@ -315,8 +315,7 @@ class TurboSSHWidget(QWidget):
         """Re-read sessions.json if it changed: the desktop app or another widget
         may have saved one since this widget was created. Only then: a host
         polling the names rebuilt the lists each time, losing the selection."""
-        if self._win.store.reload_if_changed():
-            self._win.refresh_sessions()
+        self._win.reload_saved_sessions()
 
     def open_local_terminal(self) -> EmbeddedSession:
         """Open a shell on this machine in a tab."""

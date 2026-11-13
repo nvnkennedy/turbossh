@@ -28,6 +28,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import traceback
@@ -76,39 +77,89 @@ def _flag(name: str, value) -> bool:
     return value
 
 
+_WHOLE_TEXT = re.compile(r"\s*[+-]?\d+\s*\Z")
+_NUMBER_TEXT = re.compile(r"\s*[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?\s*\Z")
+
+
+def _numeric(value, whole: bool = False):
+    """*value* as a finite number, or None. A JSON number, or a string holding
+    one: 2.0 took ``"port": "22"``, ``"baudrate": "115200"`` and ``"timeout":
+    "30"`` (as Python and paramiko do), and hosts send them. Never ``true``,
+    NaN or an infinity, nor "inf" / "nan" spelled out; *whole*: no fraction
+    (22.0 is 22, 22.5 is refused)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not (_WHOLE_TEXT if whole else _NUMBER_TEXT).match(value):
+            return None
+        value = int(value) if whole else float(value)
+    if isinstance(value, float):
+        if not math.isfinite(value) or (whole and not value.is_integer()):
+            return None
+        return int(value) if whole else value
+    return value if isinstance(value, int) else None
+
+
 def _number(name: str, value, low: float, high: float, whole: bool = False):
-    """A finite number from *low* to *high*. JSON also brings Infinity, NaN and
-    1e999: a wait of Infinity overflowed the join and the process never ended."""
-    ok = isinstance(value, (int, float)) and not isinstance(value, bool)
-    if ok and isinstance(value, float):
-        ok = math.isfinite(value) and not whole
-    if not ok or not low <= value <= high:
+    """A finite number from *low* to *high* (see :func:`_numeric`). JSON also
+    brings Infinity, NaN and 1e999: a wait of Infinity overflowed the join and
+    the process never ended."""
+    number = _numeric(value, whole)
+    if number is None or not low <= number <= high:
         kind = "a whole number" if whole else "a number"
         raise ProtocolError(f"{name} must be {kind} from {low:g} to {high:g}, "
                             f"not {_shown(value)}")
-    return value
+    return number
+
+
+def _wait(value) -> float:
+    """shutdown's ``wait``: seconds from 0 to 60, a longer one counting as 60 and
+    a negative one as 0 (2.0 took any number). Refusing a long one made
+    embed_client's close() kill the process after its timeout: remote COM ports
+    and cameras stayed taken. Only what is no number at all is refused."""
+    if value is None:
+        return _QUIT_WAIT
+    if isinstance(value, float) and math.isinf(value):
+        number = value                   # 1e999: "a long time", i.e. the most
+    else:
+        number = _numeric(value)
+    if number is None:
+        raise ProtocolError(f"wait must be a number of seconds from 0 to "
+                            f"{_MAX_WAIT:g} (more counts as {_MAX_WAIT:g}), "
+                            f"not {_shown(value)}")
+    return float(min(max(number, 0.0), _MAX_WAIT))
 
 
 _OPEN_FLAGS = ("legacy_algorithms", "ignore_host_key")
 _OPEN_PORTS = ("port", "jump_port")
 _OPEN_TEXT = ("host", "device", "username", "password", "domain", "key_file", "name",
               "jump_host", "jump_username", "jump_password", "jump_domain")
+# optional arguments for which null means "the default", as it did in 2.0
+_OPEN_DEFAULTED = _OPEN_FLAGS + _OPEN_PORTS + ("baudrate", "quick_commands")
 
 
-def _check_open(options: dict) -> None:
-    """The arguments of an open request, by type (the opener checks the names)."""
+def _open_args(options: dict) -> dict:
+    """The arguments of an open request, checked by type (the opener checks the
+    names) and in the form the opener takes: a whole number given as a string
+    becomes that number, and null for an optional flag, port, baud rate or
+    ``quick_commands`` leaves the default (2.0 took both)."""
+    clean = {}
     for key, value in options.items():
+        if value is None and key in _OPEN_DEFAULTED:
+            continue
         if key in _OPEN_FLAGS:
-            _flag(key, value)
+            value = _flag(key, value)
         elif key in _OPEN_PORTS:
-            _number(key, value, 1, 65535, whole=True)
+            value = _number(key, value, 1, 65535, whole=True)
         elif key == "baudrate":
-            _number(key, value, 1, 100_000_000, whole=True)
+            value = _number(key, value, 1, 100_000_000, whole=True)
         elif key == "quick_commands":
             if not isinstance(value, list) or not all(isinstance(c, str) for c in value):
                 raise ProtocolError("quick_commands must be a list of strings")
         elif key in _OPEN_TEXT and value is not None and not isinstance(value, str):
             raise ProtocolError(f"{key} must be a string, not {_shown(value)}")
+        clean[key] = value
+    return clean
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +439,15 @@ class _Opening:
         self.sid = sid
 
 
+class _Queued:
+    """UI work queued for an answered request, and what answers for it if
+    TurboSSH ends first (``on_skip``, or None when nothing is owed)."""
+    __slots__ = ("on_skip",)
+
+    def __init__(self, on_skip):
+        self.on_skip = on_skip
+
+
 class ControlBridge(QObject):
     """Serves one host over a pair of byte streams (one JSON object per line)."""
 
@@ -415,6 +475,8 @@ class ControlBridge(QObject):
         # in the question's event loop, and those took or cleared that slot — the
         # session came out under another id, or its id never heard a word.
         self._frames: list = []
+        self._queued: list = []      # _Queued: work of answered requests not run yet
+        self._running: dict = {}     # token -> id of a `run` not answered yet
         self._jobs: set = set()
         self._line.connect(self._on_line)
         widget.session_opened.connect(self._on_session_opened)
@@ -525,8 +587,15 @@ class ControlBridge(QObject):
 
     def _later(self, fn, *args, on_skip=None) -> None:
         """UI work, after the answer has gone (see the module docstring). If
-        TurboSSH has shut down by then, ``on_skip`` answers for it instead."""
+        TurboSSH has shut down by then, ``on_skip`` answers for it instead: when
+        the work comes up, or when :meth:`finish` runs first (a timer still
+        waiting when the application quits never fires)."""
+        entry = _Queued(on_skip)
+        self._queued.append(entry)
+
         def run():
+            if not self._take(entry):
+                return                   # finish() has answered for it already
             if self.ended:
                 if on_skip is not None:
                     on_skip()
@@ -546,6 +615,32 @@ class ControlBridge(QObject):
             if self._frames[i] is frame:
                 del self._frames[i]
                 return
+
+    def _take(self, entry) -> bool:
+        """Remove *entry* from the work still queued; False if it was not there."""
+        for i, queued in enumerate(self._queued):
+            if queued is entry:
+                del self._queued[i]
+                return True
+        return False
+
+    def _answer_for_the_rest(self) -> None:
+        """The end has come before the work queued for answered requests: say
+        what became of each now (an open's id gets session_failed and
+        session_closed, confirm_close an answer), and answer every ``run``
+        still under way. Once the application quits, queued timers never fire,
+        and a parked job's result is dropped: those ids never heard back."""
+        queued, self._queued = self._queued, []
+        for entry in queued:
+            if entry.on_skip is not None:
+                try:
+                    entry.on_skip()
+                except Exception as exc:  # noqa: BLE001 - the rest still answer
+                    self.send_event("error", text=f"{type(exc).__name__}: {exc}")
+        running, self._running = self._running, {}
+        for rid in running.values():
+            self.reply(rid, error=ProtocolError(
+                "run: TurboSSH has shut down before the command ended"))
 
     # ---- sessions ----
     def _new_id(self) -> str:
@@ -615,16 +710,17 @@ class ControlBridge(QObject):
 
     # ---- commands: opening ----
     def cmd_connect_ssh(self, rid, host, **options):
-        _check_open(dict(options, host=host))
-        return self._open(self.widget.connect_ssh, host, **options)
+        options = _open_args(dict(options, host=host))
+        return self._open(self.widget.connect_ssh, options.pop("host"), **options)
 
     def cmd_open_serial(self, rid, device, **options):
-        _check_open(dict(options, device=device))
-        return self._open(self.widget.open_serial, device, **options)
+        options = _open_args(dict(options, device=device))
+        return self._open(self.widget.open_serial, options.pop("device"), **options)
 
     def cmd_open_serial_over_ssh(self, rid, device, host, **options):
-        _check_open(dict(options, device=device, host=host))
-        return self._open(self.widget.open_serial_over_ssh, device, host, **options)
+        options = _open_args(dict(options, device=device, host=host))
+        return self._open(self.widget.open_serial_over_ssh, options.pop("device"),
+                          options.pop("host"), **options)
 
     def cmd_open_saved(self, rid, name):
         if name not in self.widget.saved_session_names():
@@ -688,21 +784,30 @@ class ControlBridge(QObject):
 
     def cmd_run(self, rid, session, command, timeout=60.0):
         """Run a command over the session's connection (its own channel: the
-        terminal is not touched) and answer with its output when it ends."""
-        timeout = _number("timeout", timeout, 0.1, _MAX_RUN)
+        terminal is not touched) and answer with its output when it ends.
+        ``timeout`` 0 is no limit, as in the library (and 2.0); null is 60 s."""
+        timeout = 60.0 if timeout is None else _number("timeout", timeout, 0, _MAX_RUN)
         handler = self._session(session).handler
         if handler is None or not hasattr(handler, "run"):
             raise ProtocolError(f"session {session!r} has no SSH connection to run on")
+        token = object()
+        self._running[token] = rid       # answered by finish() if it comes first
 
         def done(result):
+            if self._running.pop(token, None) is None:
+                return
             if not getattr(result, "success", True):
                 self.reply(rid, error=result.error or ProtocolError("the command failed"))
                 return
             value = getattr(result, "value", result)
             self.reply(rid, {"exit_code": value.exit_code, "stdout": value.stdout,
                              "stderr": value.stderr, "duration": value.duration})
+
+        def fail(text):
+            if self._running.pop(token, None) is not None:
+                self.reply(rid, error=ProtocolError(text))
         qtutil.run_job(self._jobs, lambda: handler.run(command, timeout=float(timeout)),
-                       on_done=done, on_fail=lambda text: self.reply(rid, error=ProtocolError(text)))
+                       on_done=done, on_fail=fail)
         return _LATER
 
     # ---- commands: the window ----
@@ -727,7 +832,8 @@ class ControlBridge(QObject):
         unknown = sorted(set(parts) - set(_CHROME))
         if unknown:
             raise ProtocolError(f"unknown part(s) {unknown}; choose from {list(_CHROME)}")
-        parts = {k: _flag(k, v) for k, v in parts.items()}
+        # null leaves a part as it is (the Python API's None)
+        parts = {k: _flag(k, v) for k, v in parts.items() if v is not None}
         self._later(lambda: self.widget.set_chrome(**parts))
         return {}
 
@@ -796,17 +902,20 @@ class ControlBridge(QObject):
         return _LATER
 
     def cmd_shutdown(self, rid, wait=_QUIT_WAIT):
-        self._later(self.finish, float(_number("wait", wait, 0, _MAX_WAIT)))
+        self._later(self.finish, _wait(wait))
         return {}
 
     # ---- the end ----
     def finish(self, wait: float = _QUIT_WAIT) -> None:
         """Close everything, say so, and end the process — once, whoever asks
         first: the host's shutdown, its hang-up (noticed by the reader and the
-        writer both), its window going away, or our own window being closed."""
+        writer both), its window going away, or our own window being closed.
+        Every request answered before is accounted for first (the writer
+        delivers that while the sessions close, and is flushed at the end)."""
         if self._finished:
             return
         self._finished = True
+        self._answer_for_the_rest()
         qtutil.close_jobs(self._jobs)
         end_process(self.widget, wait)
 

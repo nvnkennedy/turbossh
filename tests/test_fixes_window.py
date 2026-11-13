@@ -597,12 +597,13 @@ def test_the_end_runs_once_and_waits_as_long_as_the_host_said(bridge, monkeypatc
     ("set_camera_enabled", {"enabled": "false"}, "true or false"),
     ("set_visible", {"visible": 0}, "true or false"),
     ("set_chrome", {"ribbon": "no"}, "true or false"),
-    ("shutdown", {"wait": float("inf")}, "from 0 to 60"),
     ("shutdown", {"wait": float("nan")}, "from 0 to 60"),
-    ("shutdown", {"wait": 1e9}, "from 0 to 60"),
     ("shutdown", {"wait": True}, "from 0 to 60"),
+    ("shutdown", {"wait": "soon"}, "from 0 to 60"),
     ("connect_ssh", {"host": "h", "ignore_host_key": "false"}, "true or false"),
-    ("connect_ssh", {"host": "h", "port": "22"}, "whole number"),
+    ("connect_ssh", {"host": "h", "port": 22.5}, "whole number"),
+    ("connect_ssh", {"host": "h", "port": "22.5"}, "whole number"),
+    ("connect_ssh", {"host": "h", "port": float("inf")}, "whole number"),
     ("connect_ssh", {"host": "h", "quick_commands": "ls"}, "list of strings"),
     ("open_serial", {"device": 5}, "string"),
     ("run", {"session": "s1", "command": "x", "timeout": float("inf")}, "timeout"),
@@ -641,6 +642,7 @@ def test_a_session_keeps_its_own_jump_password_only_when_it_differs(window, monk
     from turbossh.gui.session_dialog import SessionDialog
     from turbossh.gui.sessions import SessionStore
     settings.set_jump_password("shared-pw")
+    settings.save({"jump_host": "j", "jump_user": ""})   # the sessions' jump host
     names = ("jt-plain", "jt-hop", "jt-own")
     try:
         dlg = SessionDialog(window)
@@ -698,10 +700,12 @@ def test_changing_the_shared_jump_password_drops_old_copies(window):
     from turbossh.gui.sessions import SessionStore
     from turbossh.gui.settings_dialog import SettingsDialog
     store = SessionStore()
-    store.save({"name": "jc-copy", "type": "ssh", "host": "h", "use_jump": True},
+    hop = {"use_jump": True, "jhost": "rdp-box", "juser": "me"}   # the Settings one
+    store.save(dict(hop, name="jc-copy", type="ssh", host="h"),
                "", "shared-1")                       # what earlier versions stored
-    store.save({"name": "jc-own", "type": "ssh", "host": "h", "use_jump": True},
+    store.save(dict(hop, name="jc-own", type="ssh", host="h"),
                "", "its-own")
+    settings.save({"jump_host": "rdp-box", "jump_user": "me"})
     settings.set_jump_password("shared-1")
     try:
         dlg = SettingsDialog(window)

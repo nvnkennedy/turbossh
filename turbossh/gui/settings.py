@@ -1,11 +1,13 @@
 """Persisted app settings (theme, fonts, defaults) in <state dir>/settings.json.
 
 Written atomically, and merged: ``save`` re-reads the file and writes only the
-keys this process changed, so two TurboSSH processes (the desktop app and one
+keys this process sets, so two TurboSSH processes (the desktop app and one
 hosted in another application, or two windows) never wipe out each other's
-saved machines or jump host. A file that cannot be read is never written over:
-a damaged one only once a copy of it is kept (see ``load_problem``), a locked
-one not at all (see ``save_problem``)."""
+saved machines or jump host. What a running window shows (``LIVE``: its theme,
+whether the Camera is on) stays this process's own: another process saving a
+different one does not switch it under the user. A file that cannot be read is
+never written over: a damaged one only once a copy of it is kept (see
+``load_problem``), a locked one not at all (see ``save_problem``)."""
 
 from __future__ import annotations
 
@@ -98,6 +100,12 @@ save_problem: str | None = None
 # Changes a save could not write yet (the file was locked): written with the next
 # save that can read the file, so nothing the user chose is dropped on the way.
 _unsaved: dict = {}
+# What the running window shows. This process's value is the one that counts for
+# it, even when another TurboSSH process saved a different one: taking that one
+# in switched the window's theme, or closed its Camera tabs, under the user. So
+# merging in what the file holds never changes these, and saving one writes it
+# whenever the file differs (an explicit "dark" while the file says "light").
+LIVE = ("theme", "camera_enabled")
 
 
 def _read_from_disk() -> dict:
@@ -111,47 +119,117 @@ def _read_from_disk() -> dict:
     return data
 
 
-def load() -> dict:
-    """Return the full settings (defaults + saved), from the in-memory cache."""
+def _view() -> dict:
+    """This process's settings: the cache itself (not a copy), loaded once."""
     global _cache
     if _cache is None:
         _cache = _read_from_disk()
+    return _cache
+
+
+def load() -> dict:
+    """Return the full settings (defaults + saved), from the in-memory cache."""
     # a deep copy, so callers can't mutate the cache (nested lists included)
-    return copy.deepcopy(_cache)
+    return copy.deepcopy(_view())
+
+
+def _merged(saved: dict, view: dict) -> dict:
+    """What this process sees once it has read *saved* (the file): the file on
+    top of the defaults, except what its window shows (``LIVE``) and its own
+    changes that are not written yet."""
+    merged = copy.deepcopy(DEFAULTS)
+    merged.update(copy.deepcopy(saved))
+    for key in LIVE:
+        if key in view:
+            merged[key] = copy.deepcopy(view[key])
+    merged.update(copy.deepcopy(_unsaved))
+    return merged
 
 
 def save(data: dict) -> None:
-    """Change the settings in *data* (a partial dict is fine).
+    """Set the settings in *data* (a partial dict: what the caller sets).
 
-    Only the keys whose value differs from what this process last saw are
-    written, on top of the file as it is NOW. Callers often pass the whole dict
-    back (``cfg = load(); cfg[k] = v; save(cfg)``, the Settings dialog's every
-    field): writing all of it would undo whatever another TurboSSH process saved
-    since this one read the file."""
+    Written on top of the file as it is NOW, so what another TurboSSH process
+    saved meanwhile stays. A key is written when this process changes it (its
+    value differs from what this process had), and a ``LIVE`` key also whenever
+    the file holds another value: ``set_theme("dark")`` in a window that shows
+    dark must save dark, even if another process saved light since. A key passed
+    back unchanged (``cfg = load(); cfg[k] = v; save(cfg)``) is not written, so
+    that pattern does not undo another process's changes either.
+
+    Afterwards this process also sees what the others saved, except its
+    ``LIVE`` settings: a theme or Camera switch saved by another process does not
+    switch this window (it used to, on any save at all)."""
     global _cache, save_problem, load_problem
-    seen = load()
-    changed = {key: copy.deepcopy(value) for key, value in data.items()
-               if key not in seen or seen[key] != value}
-    _unsaved.update(changed)
+    view = _view()
+    wanted = {key: copy.deepcopy(value) for key, value in data.items()
+              if key in LIVE or key not in view or view[key] != value}
+    view.update(copy.deepcopy(wanted))   # the running app has it at once
+    _unsaved.update(wanted)
     on_disk, problem = _read_for_save()
     if problem is not None:
-        save_problem = problem
-        # the running app stays consistent (a live theme switch still applies)
-        _cache.update(copy.deepcopy(changed))
+        save_problem = problem           # kept in _unsaved for the next save
         return
     if on_disk:
         load_problem = None          # whatever went wrong at start-up, it reads now
-    on_disk.update(copy.deepcopy(_unsaved))
+    changes = {key: value for key, value in _unsaved.items()
+               if key not in on_disk or on_disk[key] != value}
     try:
-        atomic_write_json(_FILE, on_disk)
+        if changes:
+            on_disk.update(copy.deepcopy(changes))
+            atomic_write_json(_FILE, on_disk)
     except Exception as exc:
         save_problem = f"settings could not be saved: {exc}"
     else:
         save_problem = None
         _unsaved.clear()
-    merged = copy.deepcopy(DEFAULTS)
-    merged.update(on_disk)           # what other processes saved meanwhile, too
-    _cache = merged
+    _cache = _merged(on_disk, view)
+
+
+def refresh() -> dict:
+    """Take in what other TurboSSH processes saved since this one last read the
+    file, as a save does, and return the settings (``load()``). The Settings
+    dialog opens with this: it showed the machines and jump host this process
+    read long ago, and saving them wrote that old list over newer ones. What the
+    window shows (``LIVE``) and changes not written yet stay this process's. A
+    file that cannot be read just now changes nothing."""
+    global _cache
+    view = _view()
+    saved = _peek()
+    if saved is not None:
+        _cache = _merged(saved, view)
+    return load()
+
+
+def _peek():
+    """The saved settings as the file holds them now; None when it cannot be read
+    just now. Nothing is copied aside or reported: that is for load and save."""
+    try:
+        raw = _read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def shared_jump() -> dict:
+    """The shared jump host in Settings as saved NOW: ``{"host", "user",
+    "domain", "password"}``. Read afresh because the password always is (every
+    TurboSSH process shares the OS vault): a jump host another process changed
+    must not be paired here with the password it saved for its new one."""
+    cfg = load()
+    saved = _peek()
+    if saved is not None:
+        cfg = _merged(saved, cfg)
+    return {"host": str(cfg.get("jump_host") or "").strip(),
+            "user": str(cfg.get("jump_user") or "").strip(),
+            "domain": str(cfg.get("jump_domain") or "").strip(),
+            "password": jump_password()}
 
 
 def _read_bytes() -> bytes:
@@ -215,19 +293,18 @@ def _kept_aside(raw: bytes) -> bool:
 
 
 def reload() -> dict:
-    """Drop the cache and re-read from disk (rarely needed; the app owns the
-    file, so the cache is normally authoritative)."""
+    """Drop the cache and re-read from disk, ``LIVE`` settings included (rarely
+    needed: :func:`refresh` takes in other processes' changes without switching
+    this window's theme or Camera). Changes not written yet stay."""
     global _cache
-    _cache = None
+    _cache = _read_from_disk()
+    _cache.update(copy.deepcopy(_unsaved))
     return load()
 
 
 def get(key):
     """Return one setting from the cache (no disk hit on the hot path)."""
-    global _cache
-    if _cache is None:
-        _cache = _read_from_disk()
-    return _cache.get(key, DEFAULTS.get(key))
+    return _view().get(key, DEFAULTS.get(key))
 
 
 def machines() -> list:

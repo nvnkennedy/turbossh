@@ -275,20 +275,36 @@ class SessionDialog(QDialog):
     def _prefill_jump_defaults(self):
         """Fill jump fields from the shared Settings values if empty."""
         from . import settings as s
+        shared = s.shared_jump()         # as saved now, like its password
         if not self.jhost.text():
-            self.jhost.setText(s.get("jump_host") or "")
+            self.jhost.setText(shared["host"])
         if not self.juser.text():
-            self.juser.setText(s.get("jump_user") or "")
+            self.juser.setText(shared["user"])
         if not self.jdomain.text():
-            self.jdomain.setText(s.get("jump_domain") or "")
+            self.jdomain.setText(shared["domain"])
         # Not the password itself: put in the field, it was saved as this
         # session's own copy (even with the jump host off), and those copies went
-        # stale when the shared one changed. Empty means "the one in Settings".
-        if s.jump_password():
+        # stale when the shared one changed. Empty means "the one in Settings" —
+        # for the jump host and user in Settings only: any other has its own.
+        self._shared_jump = shared
+        self.jhost.editTextChanged.connect(self._sync_jump_hint)
+        self.juser.textChanged.connect(self._sync_jump_hint)
+        self._sync_jump_hint()
+
+    def _sync_jump_hint(self, *_):
+        from .sessions import uses_shared_jump
+        shared = self._shared_jump
+        if shared["password"] and uses_shared_jump(
+                {"jhost": self.jhost.text(), "juser": self.juser.text()}, shared):
             self.jpass.setPlaceholderText("the jump password from Settings")
             self.jpass.setToolTip("Leave empty to use the jump password from Settings "
                                   "(it follows when that one changes). Type one only "
                                   "if this session needs a different one.")
+        else:
+            self.jpass.setPlaceholderText("none: a key or agent login")
+            self.jpass.setToolTip("This jump host and user are not the ones in Settings, "
+                                  "so its password is not used here: type this jump "
+                                  "host's own, or leave it empty for a key or agent login.")
 
     def _browse_key(self):
         import os
@@ -433,10 +449,11 @@ class SessionDialog(QDialog):
                     "and login above — then press Scan remote.")
                 return
             from .session_widgets import config_from_session
-            from . import settings as settings_mod
-            cfg = config_from_session(self.result_session(), self.password_value(),
-                                      self.jump_password_value()
-                                      or settings_mod.jump_password())
+            from .sessions import effective_jump_password
+            session = self.result_session()
+            cfg = config_from_session(session, self.password_value(),
+                                      effective_jump_password(
+                                          session, self.jump_password_value()))
             self.scan_btn.setEnabled(False)
             self.scan_status.setText("⏳ Scanning the remote machine's serial ports…")
             self._scan = _PortScanThread(cfg)
@@ -538,9 +555,14 @@ class SessionDialog(QDialog):
         self.ser_via_ssh.setChecked(s.get("via_ssh", False))
         self.password.setText(SessionStore.password(s.get("name", "")) or "")
         from . import settings as settings_mod
+        from .sessions import uses_shared_jump
         own = SessionStore.jump_password(s.get("name", "")) or ""
-        # a copy of the shared one is shown as what it is: "use the one in Settings"
-        self.jpass.setText("" if own == settings_mod.jump_password() else own)
+        # A copy of the shared one is shown as what it is, "use the one in
+        # Settings" — when this session goes through that jump host and user.
+        # Another jump host's password is its own, even when it is the same text.
+        shared = settings_mod.shared_jump()
+        is_copy = bool(own) and own == shared["password"] and uses_shared_jump(s, shared)
+        self.jpass.setText("" if is_copy else own)
 
     def result_session(self) -> dict:
         try:
@@ -581,5 +603,6 @@ class SessionDialog(QDialog):
         return self.password.text()
 
     def jump_password_value(self) -> str:
-        """What was typed for the jump password: "" means the one in Settings."""
+        """What was typed for the jump password: "" means the one in Settings for
+        its jump host and user, none for any other."""
         return self.jpass.text()

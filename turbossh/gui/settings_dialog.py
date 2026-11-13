@@ -83,7 +83,12 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("TurboSSH — Settings")
         self.resize(660, 480)
-        self.cfg = settings_mod.load()
+        # as saved now: machines, jump host … another TurboSSH process saved since
+        # this one read the file are shown (and kept on OK). This window's own
+        # theme and Camera stay what it shows (settings.LIVE).
+        self.cfg = settings_mod.refresh()
+        # what the Jump host page shows: the file and the vault as they are now
+        self._jump_before = settings_mod.shared_jump()
         self._machines = list(self.cfg.get("machines") or [])
         self._orig_theme = self.cfg.get("theme", "dark")
         self._win = parent
@@ -174,10 +179,10 @@ class SettingsDialog(QDialog):
         v.addWidget(_wrap("The RDP / Windows machine TurboSSH hops through. Entered "
                           "once here, reused by every session that uses 'via jump host'."))
         f = QFormLayout(); v.addLayout(f)
-        self.jhost = QLineEdit(self.cfg.get("jump_host", ""))
-        self.juser = QLineEdit(self.cfg.get("jump_user", ""))
-        self.jdomain = QLineEdit(self.cfg.get("jump_domain", ""))
-        self.jpass = QLineEdit(settings_mod.jump_password())
+        self.jhost = QLineEdit(self._jump_before["host"])
+        self.juser = QLineEdit(self._jump_before["user"])
+        self.jdomain = QLineEdit(self._jump_before["domain"])
+        self.jpass = QLineEdit(self._jump_before["password"])
         self.jpass.setEchoMode(QLineEdit.Password); theme.attach_eye(self.jpass)
         f.addRow("Host", self.jhost); f.addRow("User", self.juser)
         f.addRow("Domain", self.jdomain); f.addRow("Password", self.jpass)
@@ -198,7 +203,10 @@ class SettingsDialog(QDialog):
         self.camera_on = None
         if not self._camera_locked:
             self.camera_on = QCheckBox("Show the Camera in the ribbon, File menu and Home tab")
-            self.camera_on.setChecked(bool(self.cfg.get("camera_enabled")))
+            shown = getattr(self._win, "camera_enabled", None)
+            # what the window shows: OK must not close its Camera tabs unasked
+            self.camera_on.setChecked(bool(shown() if callable(shown)
+                                           else self.cfg.get("camera_enabled")))
             f.addRow(self.camera_on)
             f.addRow(_wrap("Off by default: nothing camera-related appears or runs "
                            "until you turn it on. View → Camera does the same. "
@@ -249,14 +257,19 @@ class SettingsDialog(QDialog):
             self._update_manage_label()
 
     def result_settings(self) -> dict:
-        old, new = settings_mod.jump_password(), self.jpass.text()
-        if old and new != old:
-            # sessions saved before 2.1 kept their own copy of the shared jump
-            # password: a changed (or cleared) one would leave them on the old
-            # password, locking the account after a few tries
+        new = {"host": self.jhost.text().strip(), "user": self.juser.text().strip(),
+               "password": self.jpass.text()}
+        old = settings_mod.shared_jump()         # another process may have saved one
+        if (old["host"], old["user"], old["password"]) != \
+                (new["host"], new["user"], new["password"]):
+            # Sessions through the old jump host keep ITS password: a stale copy
+            # of a changed one is dropped (2.0.0 stored one per session, and it
+            # locked the account), and one that took the shared password keeps
+            # it when Settings moves to another jump host. Sessions through any
+            # other jump host are left alone.
             from .sessions import SessionStore
-            SessionStore().forget_jump_copies(old)
-        settings_mod.set_jump_password(new)     # password -> OS vault
+            SessionStore().shared_jump_changing(old, new)
+        settings_mod.set_jump_password(new["password"])     # password -> OS vault
         result = {
             "machines": self._machines,
             "term_font": self.font.currentFont().family(),

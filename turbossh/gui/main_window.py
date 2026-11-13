@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QEvent, QSize, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QKeySequence
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QListWidget, QListWidgetItem, QPushButton,
@@ -163,6 +163,12 @@ class MainWindow(QMainWindow):
         self._apply_stylesheet(theme.current_name())
 
         self.store = SessionStore()
+        # sessions.json in use by another program at start-up: read it again until
+        # it can be (see reload_saved_sessions)
+        self._store_retry = QTimer(self)
+        self._store_retry.timeout.connect(self.reload_saved_sessions)
+        if self.store.unread:
+            self._store_retry.start(self._STORE_RETRY_MS)
         self._tiled = False
         self._tiled_widget = None
         self.named_actions = {}          # stable name -> QAction, for embedders
@@ -259,9 +265,10 @@ class MainWindow(QMainWindow):
                 part.setVisible(bool(value))
 
     def _report_store_problems(self):
-        """Say so when sessions.json / settings.json could not be read. The file
-        was copied aside; staying silent would look like the sessions just
-        vanished, and the next save would replace the file."""
+        """Say so when sessions.json / settings.json could not be read. Staying
+        silent would look like the sessions just vanished. A damaged file was
+        copied aside; one that another program held open (a passing lock) was
+        not, and is read again (sessions: see reload_saved_sessions)."""
         from . import settings as settings_mod
         problems = [m for m in (self.store.load_problem, settings_mod.load_problem,
                                 settings_mod.save_problem) if m]
@@ -269,11 +276,22 @@ class MainWindow(QMainWindow):
             return
         for message in problems:
             self.log_panel.append(f"[ERROR] {message}")
-        QMessageBox.warning(
-            self, "Saved data could not be read",
-            "\n\n".join(problems) +
-            "\n\nTurboSSH is starting without it. Nothing was deleted: fix or "
-            "restore the copy named above if you need what was in it.")
+        notes = []
+        if any(getattr(m, "backup", None) for m in problems):
+            notes.append("TurboSSH is starting without it. Nothing was deleted: fix or "
+                         "restore the copy named above if you need what was in it.")
+        if any(getattr(m, "transient", False) for m in problems):
+            note = ("Nothing was copied or changed: another program (an antivirus "
+                    "scan, a backup or sync tool) had the file open, and TurboSSH "
+                    "does not write over a file it cannot read.")
+            if self.store.unread:
+                note += (" It reads the saved sessions again by itself and lists "
+                         "them as soon as it can.")
+            notes.append(note)
+        if not notes:
+            notes.append("TurboSSH is starting without it.")
+        QMessageBox.warning(self, "Saved data could not be read",
+                            "\n\n".join(problems + notes))
 
     # ---- menu bar ----
     def _build_menubar(self):
@@ -883,6 +901,35 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence(seq), self, activated=slot, context=context)
 
     # ---- sessions ----
+    _STORE_RETRY_MS = 1500      # how often a sessions.json in use is read again
+
+    def reload_saved_sessions(self) -> bool:
+        """Re-read sessions.json if it changed since it was read, or could not be
+        read then, and rebuild the lists if so: True when it did. Runs when the
+        window is activated (sessions another TurboSSH saved meanwhile show up)
+        and, while the file stays in use by another program, on a timer: a lock
+        at start-up (an antivirus scan) left the sidebar and Home empty for the
+        whole run."""
+        was_unread = self.store.unread
+        changed = self.store.reload_if_changed()
+        if self.store.unread:
+            if not self._store_retry.isActive():
+                self._store_retry.start(self._STORE_RETRY_MS)
+            return False
+        self._store_retry.stop()
+        if changed:
+            self.refresh_sessions()
+            if was_unread:
+                self.log_panel.append(f"[OK] sessions.json could be read now: "
+                                      f"{len(self.store.sessions)} saved session(s)")
+        return changed
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() \
+                and hasattr(self, "_store_retry"):
+            self.reload_saved_sessions()
+
     def refresh_sessions(self):
         keep = self._selected_name()    # a rebuild must not lose the user's selection
         self.session_list.clear()
@@ -1044,7 +1091,9 @@ class MainWindow(QMainWindow):
         changed = enabled != self.camera_enabled()
         if self.camera_locked:
             self._camera_forced = enabled
-        elif changed:
+        else:
+            # also when this window already shows it: another TurboSSH process
+            # may have saved the other choice since (written only if so)
             from . import settings as _s
             _s.save({"camera_enabled": enabled})
         if not enabled:
@@ -1304,10 +1353,10 @@ class MainWindow(QMainWindow):
             from . import settings as settings_mod
             cfg = dlg.result_settings()
             camera = cfg.pop("camera_enabled", None)
-            settings_mod.save(cfg)
+            settings_mod.save(cfg)              # what the dialog showed: written if changed
             name = theme.current_name()
             self.apply_theme(name)              # full immediate update everywhere
-            if camera is not None:
+            if camera is not None and camera != self.camera_enabled():
                 self.set_camera_enabled(camera)
             self.log_panel.append(f"[OK] Settings saved — theme: {name}")
 
@@ -1387,6 +1436,9 @@ class MainWindow(QMainWindow):
                 getattr(self, "_update_thread", None)]:
             qtutil.park_thread(thread)
         self._stop_sshd_poll()
+        retry = getattr(self, "_store_retry", None)
+        if retry is not None:
+            retry.stop()
 
     def shut_down(self):
         """Close every session and stop all background work: no questions, no

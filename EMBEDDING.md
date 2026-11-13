@@ -128,7 +128,10 @@ Everything else on stdout is an event: `{"event": "<name>", …}`.
 
 Arguments are checked by type: a flag is JSON `true` / `false` (not `"false"`, not
 `0`), and a number is finite and within its range (no `Infinity`, `NaN` or
-`1e999`). Anything else is refused with a `ProtocolError`.
+`1e999`), whole where it must be (a port is `22`, not `22.5`). A number may also
+come as a string holding one (`"port": "22"`, `"baudrate": "115200"`, `"timeout":
+"30"`), and `null` for an optional argument means its default. Anything else is
+refused with a `ProtocolError`.
 
 TurboSSH answers every request immediately; what the request does to the window
 happens right after the answer has gone. The one exception is a command whose
@@ -171,7 +174,7 @@ events rather than wait for you; answers and the other events are never dropped.
 | `send` | `session`, and `text` *or* `data_base64` | `{}` — type into the terminal (raw bytes base64-encoded, e.g. `"Aw=="` for Ctrl-C). An SSH / serial session must be connected |
 | `send_line` | `session`, `text` | `{}` — type a line and press Enter |
 | `screen_text` | `session` | `{"text"}` — what the terminal shows now |
-| `run` | `session`, `command`, optional `timeout` (s, default 60, at most 86400) | `{"exit_code", "stdout", "stderr", "duration"}` — runs on the session's SSH connection in a channel of its own (the terminal is not touched); answered when it ends |
+| `run` | `session`, `command`, optional `timeout` (s, default 60, at most 86400; `0` is no limit) | `{"exit_code", "stdout", "stderr", "duration"}` — runs on the session's SSH connection in a channel of its own (the terminal is not touched); answered when it ends |
 | `activate` | `session` | `{}` — bring the tab forward and give it the keyboard |
 | `close_session` | `session` | `{}` |
 | `focus` | — | `{}` — give TurboSSH the keyboard |
@@ -183,17 +186,20 @@ events rather than wait for you; answers and the other events are never dropped.
 | `set_camera_enabled` | `enabled` | `{}` |
 | `current_theme` | — | the theme name, or `"inherit"` |
 | `set_theme` | `name` | `{}` |
-| `set_chrome` | any of `menu_bar`, `ribbon`, `sidebar`, `log_dock`, `status_bar` (true / false) | `{}` |
+| `set_chrome` | any of `menu_bar`, `ribbon`, `sidebar`, `log_dock`, `status_bar` (true / false; `null` leaves it as it is) | `{}` |
 | `action_names` | — | `["session", "local", …]` (see [Action names](#joining-the-hosts-menus-and-toolbars)) |
 | `trigger_action` | `name` | `{}` — as if the ribbon button was clicked |
 | `confirm_close` | — | `true` when nothing is open (no session, no remote-file editor with unsaved changes) or the user agreed to close; answered when they have |
-| `shutdown` | optional `wait` (s, default 6, 0 to 60) | `{}` — closes every session (waiting up to `wait` for remote ports and cameras to be released, and no longer) and ends the process |
+| `shutdown` | optional `wait` (s, default 6, 0 to 60: more counts as 60) | `{}` — closes every session (waiting up to `wait` for remote ports and cameras to be released, and no longer) and ends the process |
 
 Once TurboSSH has shut down (by `shutdown`, or any of the ways under
 [Ending it](#ending-it)), it answers only `ping`, `shutdown` and the queries
 (`sessions`, `current_session`, `saved_session_names`, `camera_enabled`,
 `current_theme`, `action_names`, `window`); every other request gets a
-`ProtocolError` until the process has ended.
+`ProtocolError` until the process has ended. What was asked before still gets its
+due as it ends: an open whose session had not opened yet gets `session_failed`
+and `session_closed` for its id, and a `confirm_close` or `run` still waiting is
+answered with a `ProtocolError`.
 
 ### Events
 
@@ -251,13 +257,13 @@ gui.close()
 | `call(cmd, *, timeout=30, **args)` | Any command of the table above; returns its result or raises `TurboSSHError` (with `.type`). |
 | `call_async(cmd, callback=None, **args)` | The same without waiting; `callback(result_or_error)` runs on the callback thread (also, with an error, if TurboSSH exits first). |
 | `connect_ssh`, `open_serial`, `open_serial_over_ssh`, `open_saved`, `open_local_terminal`, `open_camera` | Return the new session's id. |
-| `sessions`, `current_session`, `saved_session_names`, `send`, `send_line`, `screen_text`, `run`, `activate`, `close_session` | As the commands (`send` takes `str` or `bytes`). |
+| `sessions`, `current_session`, `saved_session_names`, `send`, `send_line`, `screen_text`, `run`, `activate`, `close_session` | As the commands (`send` takes `str` or `bytes`; `run(session, command, timeout=60)` waits for the answer up to `timeout` + 15 s, or as long as it takes with `timeout=0`). |
 | `focus`, `set_geometry`, `fill_parent`, `set_visible`, `set_theme`, `set_camera_enabled`, `set_chrome`, `trigger_action`, `show_settings`, `new_session_dialog` | As the commands. |
 | `on_event(callback)` | `callback(event)` for every event, on the callback thread. |
 | `poll_events()` | The events since the last poll — call it from a UI timer (Tk `after`, a `QTimer` …). |
 | `wait_for(event, session=None, *, timeout=30)` | The first such event, including one that already arrived. |
 | `window`, `version`, `ready`, `is_running`, `stderr_tail()` | TurboSSH's own handle, version, `ready` event, whether it runs, its last stderr lines. |
-| `close(wait=6, timeout=20)` | `shutdown`, wait for the process, return its exit code. Also a context manager. |
+| `close(wait=6, timeout=20)` | `shutdown` (`wait` 0 to 60 s, more counts as 60), wait for the process, return its exit code. The process gets `timeout` s to end, and at least `wait` + 5; if `shutdown` is refused, closing its stdin ends it as cleanly. Also a context manager. |
 | `kill()` | End it at once (sessions are not released). |
 
 Waiting calls keep delivering the window messages the embedded window sends to
