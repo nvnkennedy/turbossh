@@ -1,7 +1,8 @@
 """Session tab widgets: an SSH tab (interactive terminal + SFTP browser + logs)
 and a Serial tab (interactive serial console). Everything that touches the
 network or a port — connecting, probing, opening the serial bridge, releasing it,
-disconnecting — runs off the GUI thread, so the window never blocks."""
+disconnecting, and every keystroke, paste and window-size change — runs off the
+GUI thread, so the window never blocks."""
 
 from __future__ import annotations
 
@@ -17,10 +18,50 @@ from ..core import SSHHandler
 from ..serial_handler import SerialHandler
 from ..results import OperationResult
 from . import qtutil
-from .terminal import ReaderThread
+from .terminal import ReaderThread, Writer
 from .vt100 import Vt100Terminal
 from .file_browser import FileBrowser
 from .logs_tab import LogsTab
+
+# a connection that dies sooner than this after it opened is reconnected only
+# after a growing pause (2, 4, 8 … 30 s), not in a tight loop
+_QUICK_DROP = 5.0
+_MAX_BACKOFF = 30.0
+
+
+def _channel_reader(chan):
+    """``read_fn`` for a :class:`ReaderThread` on a paramiko channel (whose
+    timeout is short, so the reader notices being stopped). EOF is reported
+    only once everything already received has been read: checking
+    ``eof_received`` / ``closed`` first lost the last output — logout and
+    reboot messages, the serial bridge's BUSY line."""
+    def read():
+        try:
+            data = chan.recv(65536)
+        except socket.timeout:
+            # nothing yet — or a channel closed under us with nothing left
+            return None if chan.closed and not chan.recv_ready() else b""
+        except Exception:
+            return None
+        return data or None              # b"": closed / EOF, and drained
+    return read
+
+
+def _channel_writer(chan):
+    """``write_fn`` for a :class:`Writer` on a paramiko channel. The channel's
+    timeout is the reader's 0.1 s (paramiko has one for both directions), and
+    ``sendall`` raised socket.timeout mid-paste whenever the window was full
+    that long — a paste to a small-window server (Dropbear: 24 KB) over a slow
+    VPN lost its rest. Here a full window just means "try again"; the Writer
+    gives up only when nothing at all is taken for a minute."""
+    def write(data: bytes):
+        if chan.closed:
+            raise OSError("the connection is closed")
+        try:
+            return chan.send(data)
+        except socket.timeout:
+            return 0
+    return write
 
 
 def config_from_session(s: dict, password: str, jump_password: str) -> SSHConfig:
@@ -181,13 +222,19 @@ class SshSessionWidget(QWidget):
 
         self._cfg = config_from_session(session, password, jump_password)
         self._engine_log = _EngineLog(self.log, session.get("name", ""))
+        self._write_gate = qtutil.SignalGate(self.log)   # the writer thread's errors
+        self._writer = None
         self._user_closed = False          # set in close_session -> no auto-reconnect
         self._reconnecting = False
         self._reconnect_until = 0.0
+        self._connected_at = 0.0           # time.monotonic() of the last connect
+        self._quick_drops = 0              # connections in a row that died at once
         self.term.on_reconnect = self._manual_reconnect   # Ctrl-R when disconnected
         self._connect()
 
     def _connect(self):
+        # (the previous attempt has finished; parking is only a safety net)
+        qtutil.park_thread(self._ct, orphan={"ok": lambda h, _shell: _close_handler(h)})
         self._ct = _SshConnectThread(self._cfg, self._engine_log)
         self._ct.ok.connect(self._on_connected)
         self._ct.fail.connect(self._on_reconnect_fail if self._reconnecting
@@ -202,6 +249,14 @@ class SshSessionWidget(QWidget):
             reader.stop()
             qtutil.park_thread(reader)
 
+    def _drop_writer(self):
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.close()
+
+    def _on_write_error(self, exc):
+        self._write_gate.emit(f"[ERROR] send: {exc}")    # (on the writer thread)
+
     def _on_connected(self, handler, shell):
         if self._closed:                   # the tab was closed while connecting
             _close_handler(handler)
@@ -211,8 +266,10 @@ class SshSessionWidget(QWidget):
         was_reconnect = self._reconnecting
         self._reconnecting = False
         self._reconnect_until = 0.0
+        self._connected_at = time.monotonic()
         self.term.reconnect_armed = False
         self._drop_reader()
+        self._drop_writer()
         previous = self.handler
         self.handler = handler
         self.shell = shell
@@ -229,34 +286,22 @@ class SshSessionWidget(QWidget):
                       f"{'reconnected' if was_reconnect else 'connected'}")
         self.connected.emit(True, f"{'Reconnected' if was_reconnect else 'Connected'} to {host}")
         if was_reconnect:
-            self.term.feed(b"\r\n\x1b[32m[reconnected]\x1b[0m\r\n")
+            self.term.notice(b"\r\n\x1b[32m[reconnected]\x1b[0m\r\n")
         else:
             self._welcome_banner()
         chan = shell.channel
-        chan.settimeout(0.1)
-
-        def read_fn():
-            if chan.closed or chan.eof_received:
-                return None
-            try:
-                data = chan.recv(65536)
-                return None if data == b"" else data
-            except socket.timeout:
-                return b""
-            except Exception:
-                return None
-
-        self.reader = ReaderThread(read_fn)
+        chan.settimeout(0.1)               # the reader's; the writer copes with it
+        # keystrokes, pastes and resizes go out on a thread of their own
+        self._writer = Writer(_channel_writer(chan), on_error=self._on_write_error,
+                              name="ssh-input")
+        self.reader = ReaderThread(_channel_reader(chan))
         self.reader.closed.connect(self._on_disconnected)
         self.reader.start()
         # the GUI drains on a timer, and is told when output had to be skipped
         self.term.set_source(self.reader.pull, self.reader.take_dropped)
         # keyboard Ctrl-C should also drop the buffered flood, not just the button
         self.term.on_interrupt = lambda: self.reader.flush() if self.reader else None
-        try:
-            self.shell.resize(self.term.cols, self.term.rows)
-        except Exception:
-            pass
+        self._on_term_resize(self.term.cols, self.term.rows)
 
         # focus the working terminal FIRST so an SFTP hiccup can't steal it
         self.logs_tab.set_handler(handler)
@@ -264,6 +309,15 @@ class SshSessionWidget(QWidget):
         self.term.setFocus()
 
         # populate the SFTP tab — never let an SFTP error break the session
+        rebind = getattr(self.sftp_page, "rebind", None)
+        if callable(rebind):
+            # a reconnect: the browser keeps its queue, transfer history and
+            # open editors, and just carries on over the new connection
+            try:
+                rebind(handler)
+            except Exception as exc:
+                self.log.emit(f"[ERROR] SFTP browser: {exc}")
+            return
         try:
             browser = FileBrowser(handler)        # local | remote + transfers
             browser.log.connect(self.log)
@@ -290,21 +344,60 @@ class SshSessionWidget(QWidget):
         old.deleteLater()
 
     def _on_disconnected(self):
-        # reader signals this when the channel drops. Unless the user is closing
-        # the session, try to reconnect automatically for ~30s.
+        # the reader signals this when the channel ends: either the remote shell
+        # ended (exit / logout, or an account whose shell quits at once) — then
+        # it stays down until Ctrl+R — or the link died, and it reconnects
+        # automatically for ~30 s
         if self._user_closed or self._reconnecting:
             return
+        status = self._exit_status()
+        if status is not None:
+            self._on_shell_ended(status)
+            return
         self.connected.emit(False, f"Disconnected from {self.session.get('host')}")
-        self._start_reconnect()
+        # a connection that dies right after it opened would otherwise be
+        # retried in a tight connect / drop loop
+        lived = time.monotonic() - self._connected_at
+        self._quick_drops = self._quick_drops + 1 if lived < _QUICK_DROP else 0
+        delay = min(_MAX_BACKOFF, 2.0 ** self._quick_drops) if self._quick_drops else 0.0
+        self._start_reconnect(delay=delay)
 
-    def _start_reconnect(self, window: float = 30.0):
+    def _exit_status(self):
+        """The shell's exit status if the server sent one (the shell ended on its
+        own), else None (the link died: no status; a shell killed by a reboot
+        sends a signal, not a status, so that reconnects too)."""
+        chan = getattr(self.shell, "channel", None)
+        try:
+            if chan is not None and chan.exit_status_ready():
+                return chan.exit_status
+        except Exception:
+            pass
+        return None
+
+    def _on_shell_ended(self, status):
+        host = self.session.get("host")
+        self._quick_drops = 0
+        self.status.setText(f"Session ended — {host}")
+        self.term.notice(f"\r\n\x1b[33m[the remote shell ended (exit status {status})]"
+                         f"\x1b[0m  press \x1b[1mCtrl+R\x1b[0m to reconnect\r\n"
+                         .encode("utf-8"))
+        self.term.reconnect_armed = True
+        self.log.emit(f"[INFO] {self.session.get('name')}: the remote shell ended "
+                      f"(exit status {status})")
+        self.connected.emit(False, f"Session ended on {host}")
+
+    def _start_reconnect(self, window: float = 30.0, delay: float = 0.0):
         self._reconnecting = True
         self.term.reconnect_armed = False
-        self._reconnect_until = time.time() + window
+        self._reconnect_until = time.time() + delay + window
         self.status.setText("Connection lost — reconnecting…")
-        self.term.feed("\r\n\x1b[33m[connection lost — reconnecting for 30s…]"
-                       "\x1b[0m\r\n".encode("utf-8"))
-        self._try_reconnect()
+        wait = f" in {delay:.0f}s, then" if delay else ""
+        self.term.notice(f"\r\n\x1b[33m[connection lost — reconnecting{wait} for "
+                         f"{window:.0f}s…]\x1b[0m\r\n".encode("utf-8"))
+        if delay:
+            QTimer.singleShot(int(delay * 1000), self._try_reconnect)
+        else:
+            self._try_reconnect()
 
     def _try_reconnect(self):
         if self._reconnecting and not self._user_closed:
@@ -314,14 +407,14 @@ class SshSessionWidget(QWidget):
         if self._user_closed:
             return
         if time.time() < self._reconnect_until:
-            self.term.feed(b".")                       # progress dots
+            self.term.notice(b".")                       # progress dots
             QTimer.singleShot(3000, self._try_reconnect)
             return
         # window elapsed -> stop and let the user retry with Ctrl+R
         self._reconnecting = False
         self.status.setText("SSH connection closed")
-        self.term.feed("\r\n\x1b[31m[SSH connection closed]\x1b[0m  press "
-                       "\x1b[1mCtrl+R\x1b[0m to reconnect\r\n".encode("utf-8"))
+        self.term.notice("\r\n\x1b[31m[SSH connection closed]\x1b[0m  press "
+                         "\x1b[1mCtrl+R\x1b[0m to reconnect\r\n".encode("utf-8"))
         self.term.reconnect_armed = True
         self.term.setFocus()
         self.connected.emit(False, f"SSH connection closed: {self.session.get('host')}")
@@ -330,23 +423,26 @@ class SshSessionWidget(QWidget):
         if self._user_closed or self._reconnecting:
             return
         self.term.reconnect_armed = False
-        self.term.feed("\r\n\x1b[33m[reconnecting…]\x1b[0m\r\n".encode("utf-8"))
+        self._quick_drops = 0              # asked for: no back-off
+        self.term.notice("\r\n\x1b[33m[reconnecting…]\x1b[0m\r\n".encode("utf-8"))
         self._start_reconnect()
 
     def _on_fail(self, msg):
         self.status.setText("Connect failed")
-        self.term.feed(f"\r\n\x1b[31m[connect failed]\x1b[0m {msg}\r\n".encode())
+        self.term.notice(f"\r\n\x1b[31m[connect failed]\x1b[0m {msg}\r\n".encode())
         self.log.emit(f"[ERROR] {self.session['name']}: {msg}")
         self.failed.emit(f"{self.session.get('name')}: {msg}")
 
     def _send(self, data: bytes):
-        try:
-            if self.shell:
-                # sendall: send() may take only part of a large write (a long
-                # paste was silently cut off at the SSH packet size)
-                self.shell.channel.sendall(data)
-        except Exception as exc:
-            self.log.emit(f"[ERROR] send: {exc}")
+        """Queue input for the shell; never blocks. Ctrl-C is an interrupt: what
+        is still queued (the rest of a paste) is dropped and it goes first."""
+        writer = self._writer
+        if writer is None:
+            return
+        if data == b"\x03":
+            writer.interrupt(data)
+        else:
+            writer.send(data)
 
     def _send_cmd(self, command: str):
         """Used by the one-click Quick buttons (slog2info/journalctl/…)."""
@@ -368,7 +464,7 @@ class SshSessionWidget(QWidget):
         meta = "  ·  ".join(x for x in (osname, time.strftime("%Y-%m-%d %H:%M:%S")) if x)
         line1 = f"{C}●{R} {B}{name}{R}  {G}{user}@{host}:{port}{R}{extra}"
         line2 = f"{D}  {meta}{R}"
-        self.term.feed((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
+        self.term.notice((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
 
     def _interrupt(self):
         """Send Ctrl-C to the shell and immediately drop the buffered backlog, so
@@ -383,11 +479,11 @@ class SshSessionWidget(QWidget):
         self.term.setFocus()
 
     def _on_term_resize(self, cols, rows):
-        try:
-            if self.shell:
-                self.shell.resize(cols, rows)
-        except Exception:
-            pass
+        # a window-change request is an SSH message like any other: it waits for
+        # a rekey just the same, so it goes through the writer (latest size only)
+        shell, writer = self.shell, self._writer
+        if shell is not None and writer is not None:
+            writer.call(lambda: shell.resize(cols, rows), key="resize")
 
     def _on_inner_tab(self, index):
         # keep the terminal focused so keystrokes reach the shell
@@ -401,6 +497,7 @@ class SshSessionWidget(QWidget):
             return
         self._closed = True
         self._engine_log.close()          # the handler outlives us on a teardown thread
+        self._write_gate.close()
         self._user_closed = True          # stop any auto-reconnect
         self._reconnecting = False
         # a connect still in flight: let it finish, then close what it opened
@@ -410,6 +507,7 @@ class SshSessionWidget(QWidget):
         except Exception:
             pass
         self._drop_reader()
+        self._drop_writer()
         closer = getattr(self.sftp_page, "close_browser", None)
         if closer is not None:
             try:
@@ -501,6 +599,8 @@ class SerialSessionWidget(QWidget):
         self._jobs: set = set()        # worker threads (bridge open)
         self._closed = False
         self._engine_log = _EngineLog(self.log, session.get("name", ""))
+        self._write_gate = qtutil.SignalGate(self.log)   # the writer thread's errors
+        self._writer = None            # sends keystrokes / pastes off the GUI thread
 
         lay = QVBoxLayout(self); lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
         self.status = QLabel("Opening…")
@@ -559,9 +659,9 @@ class SerialSessionWidget(QWidget):
             return
         dev = self.session.get("device", "the port")
         self.status.setText(f"{dev} — closed")
-        self.term.feed(f"\r\n\x1b[31m[{dev} closed — the port was unplugged or the "
-                       f"link dropped; reopen the session to continue]\x1b[0m\r\n"
-                       .encode("utf-8"))
+        self.term.notice(f"\r\n\x1b[31m[{dev} closed — the port was unplugged or the "
+                         f"link dropped; reopen the session to continue]\x1b[0m\r\n"
+                         .encode("utf-8"))
         self.log.emit(f"[WARN] serial {dev} closed")
         self.connected.emit(False, f"Serial {dev} closed")
 
@@ -586,6 +686,11 @@ class SerialSessionWidget(QWidget):
             except Exception:
                 return None
 
+        # pyserial blocks until every byte is out: 4 KB at 9600 baud is 4 s.
+        # Small chunks, so a Ctrl-C waits for at most ~0.5 s of a paste.
+        self._writer = Writer(lambda data: handler.write_bytes(data, safe=False),
+                              on_error=self._on_write_error, chunk=512,
+                              name="serial-input")
         self._start_reader(read_fn)
 
     # --- serial over SSH: a NATIVE, bidirectional bridge (char-by-char, Tab
@@ -609,7 +714,7 @@ class SerialSessionWidget(QWidget):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if r != QMessageBox.Yes:
                 self.status.setText(f"{dev} is in use — not opened")
-                self.term.feed(f"--- {dev} is in use; not opened ---\r\n".encode())
+                self.term.notice(f"--- {dev} is in use; not opened ---\r\n".encode())
                 self.failed.emit(f"{self.session.get('name')}: {dev} in use")
                 return
             force = True
@@ -633,37 +738,34 @@ class SerialSessionWidget(QWidget):
         dev = self.session.get("device", "/dev/ser1")
         baud = self.session.get("baud", 115200)
         self.bridge_chan = chan
-        chan.settimeout(0.1)
+        chan.settimeout(0.1)               # the reader's; the writer copes with it
         self.status.setText(f"Serial over SSH — {dev} @ {baud} (native)")
         self.log.emit(f"[OK] serial-over-SSH {dev} (native bridge)")
         self.connected.emit(True, f"Serial over SSH: {dev}")
         self._serial_banner(dev, baud, True)
-
-        def read_fn():
-            if chan.closed or chan.eof_received:
-                return None
-            try:
-                data = chan.recv(65536)
-                return None if data == b"" else data
-            except socket.timeout:
-                return b""
-            except Exception:
-                return None
-
-        self._start_reader(read_fn)
+        self._writer = Writer(_channel_writer(chan), on_error=self._on_write_error,
+                              name="serial-bridge-input")
+        self._start_reader(_channel_reader(chan))
         # match the remote PTY to our terminal so the conpty doesn't pad the
         # output with stray blank lines.
         self._on_term_resize(self.term.cols, self.term.rows)
 
+    def _on_write_error(self, exc):
+        self._write_gate.emit(f"[ERROR] serial write: {exc}")   # (writer thread)
+
     def _on_term_resize(self, cols, rows):
         # keep the remote bridge's PTY the SAME size as our terminal — an oversized
         # (250x50) conpty was repositioning output across a taller screen, which is
-        # what produced the stray blank lines in serial-over-SSH.
-        try:
-            if self.bridge_chan is not None and not self.bridge_chan.closed:
-                self.bridge_chan.resize_pty(width=int(cols), height=int(rows))
-        except Exception:
-            pass
+        # what produced the stray blank lines in serial-over-SSH. (Through the
+        # writer: an SSH request can wait seconds on a slow or rekeying link.)
+        chan, writer = self.bridge_chan, self._writer
+        if chan is None or writer is None:
+            return
+
+        def resize():
+            if not chan.closed:
+                chan.resize_pty(width=int(cols), height=int(rows))
+        writer.call(resize, key="resize")
 
     def _retry_open(self):
         self.status.setText("Retrying…")
@@ -684,8 +786,8 @@ class SerialSessionWidget(QWidget):
                                       "denied", "being used", "cannot open",
                                       "could not open"))
         if busy and not self.via_ssh:
-            self.term.feed(f"\r\n\x1b[31m[{dev} is in use by another "
-                           f"application]\x1b[0m\r\n".encode())
+            self.term.notice(f"\r\n\x1b[31m[{dev} is in use by another "
+                             f"application]\x1b[0m\r\n".encode())
             r = QMessageBox.question(
                 self, "Serial port in use",
                 f"{dev} is held by another application (MobaXterm, PuTTY, another "
@@ -698,20 +800,21 @@ class SerialSessionWidget(QWidget):
             self.failed.emit(f"{self.session.get('name')}: {dev} in use")
             self.log.emit(f"[ERROR] serial: {dev} in use (held by another app)")
             return
-        self.term.feed(f"\r\n\x1b[31m[serial open failed]\x1b[0m {msg}\r\n".encode())
+        self.term.notice(f"\r\n\x1b[31m[serial open failed]\x1b[0m {msg}\r\n".encode())
         self.log.emit(f"[ERROR] serial: {msg}")
         self.failed.emit(f"{self.session.get('name')}: {msg}")
 
     def _send(self, data: bytes):
-        """Native input. via_ssh -> raw SSH bridge channel; local -> the port."""
-        try:
-            if self.via_ssh:
-                if self.bridge_chan and not self.bridge_chan.closed:
-                    self.bridge_chan.sendall(data)
-            elif self.handler:
-                self.handler.write_bytes(data, safe=False)
-        except Exception as exc:
-            self.log.emit(f"[ERROR] serial write: {exc}")
+        """Native input (via_ssh -> raw SSH bridge channel; local -> the port),
+        queued for the writer thread: never blocks. Ctrl-C drops what is still
+        queued and goes first."""
+        writer = self._writer
+        if writer is None:
+            return
+        if data == b"\x03":
+            writer.interrupt(data)
+        else:
+            writer.send(data)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -735,7 +838,7 @@ class SerialSessionWidget(QWidget):
         where = f"on {self.session.get('host')} via SSH" if via_ssh else "local"
         line1 = f"{C}●{R} {B}{name}{R}  {G}{dev} @ {baud}{R}  {D}{where}{R}"
         line2 = f"{D}  {time.strftime('%Y-%m-%d %H:%M:%S')}{R}"
-        self.term.feed((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
+        self.term.notice((line1 + "\r\n" + line2 + "\r\n\r\n").encode("utf-8"))
 
     def close_session(self):
         """Release the port and close the connection — on a background thread,
@@ -746,6 +849,7 @@ class SerialSessionWidget(QWidget):
             return
         self._closed = True
         self._engine_log.close()          # the handler outlives us on a teardown thread
+        self._write_gate.close()
         # an open still in flight: let it finish, then close what it opened
         qtutil.park_thread(self._ct, orphan={"ok": lambda h, *_: _close_handler(h)})
         qtutil.close_jobs(self._jobs)
@@ -753,6 +857,9 @@ class SerialSessionWidget(QWidget):
         if reader is not None:
             reader.stop()
             qtutil.park_thread(reader)
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.close()                # a write still blocked ends with the port
         try:
             self.term.cleanup()
         except Exception:

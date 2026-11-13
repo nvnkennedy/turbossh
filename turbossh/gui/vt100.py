@@ -13,16 +13,19 @@ import os
 import re
 import threading
 import time
+import weakref
+from collections import deque
 
 import pyte
-from PyQt5.QtCore import QEvent, QRect, Qt, QTimer, pyqtSignal
+from PyQt5 import sip
+from PyQt5.QtCore import QEvent, QObject, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QFileDialog, QMenu,
                              QMessageBox, QScrollBar, QToolTip, QWidget)
 
 from .. import paths
 from .qtutil import SignalGate
-from .termscreen import TermScreen
+from .termscreen import TermScreen, rows_text
 
 # 16-color ANSI palette (xterm-ish), on a dark background. The terminal is ALWAYS
 # dark (black bg, light text) regardless of app theme — like MobaXterm and most
@@ -55,9 +58,12 @@ _HIGHLIGHTS = [
                 re.I), "green"),
 ]
 
-# The disk capture of a session stops growing here (a week-long `slog2info -w`
-# must not fill the disk); the on-screen scrollback is unaffected.
+# The disk capture of a session never holds more than this (a week-long
+# `slog2info -w` must not fill the disk). It is written in parts and the oldest
+# part is dropped when a new one starts, so it always has the LATEST output —
+# it used to stop at the limit, and Save then missed everything after it.
 _CAPTURE_LIMIT = 256 * 1024 * 1024
+_CAPTURE_PARTS = 4
 
 _MODIFIER_KEYS = (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta,
                   Qt.Key_AltGr, Qt.Key_CapsLock, Qt.Key_NumLock, Qt.Key_ScrollLock)
@@ -77,6 +83,81 @@ _CTRL_PUNCT = {Qt.Key_Space: 0, Qt.Key_At: 0, Qt.Key_2: 0, Qt.Key_BracketLeft: 2
                Qt.Key_Minus: 31, Qt.Key_Slash: 31}
 
 
+class _Pump(QObject):
+    """Drains the readers of EVERY terminal in the process from one timer.
+
+    Each terminal used to have its own timer and its own 12 ms budget, so four
+    flooding tabs in split view took ~50 ms of every 33 ms frame and the window
+    stopped responding. Here one budget per tick is shared: terminals are fed a
+    slice at a time, round-robin (starting with a different one each tick, so
+    none is starved), until their backlogs are empty or the budget is spent."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._terms: list = []           # weak references: a deleted tab drops out
+        self._turn = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def add(self, term) -> None:
+        self._terms.append(weakref.ref(term))
+        if not self._timer.isActive():
+            self._timer.start(33)
+
+    def remove(self, term) -> None:
+        self._terms = [ref for ref in self._terms if ref() not in (None, term)]
+        if not self._terms:
+            self._timer.stop()
+
+    def _live(self) -> list:
+        live = []
+        for ref in self._terms:
+            term = ref()
+            if term is not None and not sip.isdeleted(term):
+                live.append(term)
+        if len(live) != len(self._terms):
+            self._terms = [weakref.ref(term) for term in live]
+        return live
+
+    def _tick(self) -> None:
+        terms = self._live()
+        if not terms:
+            self._timer.stop()
+            return
+        self._turn = (self._turn + 1) % len(terms)
+        terms = terms[self._turn:] + terms[:self._turn]
+        deadline = time.perf_counter() + Vt100Terminal._TICK_BUDGET
+        busy, out_of_time = terms, False
+        while busy and not out_of_time:
+            more = []
+            for term in busy:
+                try:
+                    if term._feed_slice():
+                        more.append(term)
+                except Exception:        # one broken tab must not stall the rest
+                    pass
+                if time.perf_counter() > deadline:
+                    out_of_time = True
+                    break
+            busy = more
+        for term in terms:
+            try:
+                term._after_feed()
+            except Exception:            # e.g. deleted while we were feeding
+                pass
+
+
+_PUMP = None
+
+
+def _pump() -> _Pump:
+    global _PUMP
+    if _PUMP is None or sip.isdeleted(_PUMP):
+        # owned by the application, so it lives exactly as long as the event loop
+        _PUMP = _Pump(QApplication.instance())
+    return _PUMP
+
+
 class Vt100Terminal(QWidget):
     """Renders a terminal screen; forwards keystrokes via ``send_fn(bytes)``.
     Emits ``resized(cols, rows)`` so the caller can resize the remote PTY."""
@@ -84,11 +165,13 @@ class Vt100Terminal(QWidget):
     resized = pyqtSignal(int, int)
     _saved = pyqtSignal(str, str)           # path, error ("" = ok); from the save worker
 
-    # seconds of escape-sequence parsing allowed per timer tick: the reader's
-    # backlog is fed in slices until this is used up, so a flood can never hold
-    # the GUI thread for more than a frame
+    # seconds of escape-sequence parsing allowed per timer tick, for ALL the
+    # terminals together (see _Pump): the backlogs are fed in slices until this
+    # is used up, so a flood can never hold the GUI thread for more than a
+    # frame. The budget is checked between slices, so a slice is small: a flood
+    # of short lines costs ~13 us a line, i.e. ~7 ms for 2 KB of them.
     _TICK_BUDGET = 0.012
-    _SLICE = 16384
+    _SLICE = 2048
 
     def __init__(self, send_fn, cols=120, rows=34, parent=None):
         super().__init__(parent)
@@ -110,8 +193,11 @@ class Vt100Terminal(QWidget):
         self.stream = pyte.ByteStream(self.screen)
         self._following = True          # auto-stick to the bottom (live tail)
         self._cap_fh = None             # disk tee of everything printed
-        self._cap_path = None
-        self._cap_bytes = 0
+        self._cap_path = None           # the part being written
+        self._cap_parts: list = []      # every part kept, oldest first
+        self._cap_stale: list = []      # dropped parts Windows would not delete yet
+        self._cap_trimmed = False       # True once the oldest output was dropped
+        self._cap_bytes = 0             # bytes in the part being written
         self._open_capture()
 
         self.setFocusPolicy(Qt.StrongFocus)
@@ -132,11 +218,14 @@ class Vt100Terminal(QWidget):
         self._hl_cache: dict = {}       # row text -> per-column colours | None
         self._apply_font()
 
-        # drain the reader buffer + repaint at ~30fps
+        # drain the reader buffer + repaint at ~30fps — from the one timer all
+        # terminals share, so they share one time budget too
         self._pull = None
         self._dropped = None
-        self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
-        self._timer.start(33)
+        # what comes after the current source: notices (bytes) and the next
+        # source ((pull, dropped)) — see notice() / set_source()
+        self._queued: deque = deque()
+        _pump().add(self)
 
         # resize is DEBOUNCED. Maximise / split / dragging a divider fires a STORM
         # of resize events; applying each one (screen resize + a remote SIGWINCH)
@@ -179,9 +268,28 @@ class Vt100Terminal(QWidget):
     def set_source(self, pull_fn, dropped_fn=None):
         """Provide a callable(maxn) -> bytes that the timer drains each tick, and
         optionally one returning how many bytes the reader had to discard since
-        it was last asked (so the gap is shown instead of silently skipped)."""
-        self._pull = pull_fn
-        self._dropped = dropped_fn
+        it was last asked (so the gap is shown instead of silently skipped).
+
+        What a previous source still holds — the end of a connection that just
+        closed — is shown first: it takes over once that one is empty."""
+        if self._pull is not None and pull_fn is not None:
+            self._queued.append((pull_fn, dropped_fn))
+            self._tick()
+        else:
+            self._pull, self._dropped = pull_fn, dropped_fn
+            self._queued.clear()
+
+    def notice(self, data):
+        """Show a message of our own (connection lost, the shell ended …) AFTER
+        the output the reader has received but the screen not shown yet. Fed
+        directly, it landed above the last lines of the session — or, with a
+        reconnect replacing the reader, they were never shown at all."""
+        data = data if isinstance(data, bytes) else data.encode("utf-8")
+        if self._pull is None and not self._queued:
+            self.feed(data)
+            return
+        self._queued.append(data)
+        self._tick()
 
     def _reply(self, text: str):
         """The screen answering a query from the program (cursor position …)."""
@@ -249,24 +357,47 @@ class Vt100Terminal(QWidget):
                         os.remove(p)
                 except Exception:
                     pass
-            self._cap_path = os.path.join(
-                capdir, f"term-{os.getpid()}-{id(self)}.log")
-            self._cap_fh = open(self._cap_path, "wb")
+            self._cap_base = os.path.join(capdir, f"term-{os.getpid()}-{id(self)}")
+            self._cap_serial = 0
+            self._next_capture_part()
         except Exception:
             self._cap_fh = None
+
+    def _next_capture_part(self):
+        """Start a new part of the capture; drop the oldest beyond the limit."""
+        path = f"{self._cap_base}.{self._cap_serial}.log"
+        self._cap_serial += 1
+        self._cap_fh = open(path, "wb")
+        self._cap_path = path
+        self._cap_parts.append(path)
+        self._cap_bytes = 0
+        while len(self._cap_parts) > _CAPTURE_PARTS:
+            self._cap_stale.append(self._cap_parts.pop(0))
+            self._cap_trimmed = True
+        self._remove_stale_parts()
+
+    def _remove_stale_parts(self):
+        # a save may still be reading one (Windows will not delete an open
+        # file): it is tried again at the next part and at cleanup
+        for path in list(self._cap_stale):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                self._cap_stale.remove(path)
+            except OSError:
+                pass
 
     def _capture(self, data: bytes):
         fh = self._cap_fh
         if fh is None:
             return
         try:
-            if self._cap_bytes + len(data) > _CAPTURE_LIMIT:
-                fh.write(b"\r\n[capture stopped: the %d MB limit for one session "
-                         b"was reached]\r\n" % (_CAPTURE_LIMIT // (1024 * 1024)))
-                fh.flush()
-                self._cap_fh = None     # keep the file for saving, stop writing
-                self._cap_closed = fh
-                return
+            if self._cap_bytes and (self._cap_bytes + len(data)
+                                    > _CAPTURE_LIMIT // _CAPTURE_PARTS):
+                fh.close()
+                self._cap_fh = None
+                self._next_capture_part()
+                fh = self._cap_fh
             fh.write(data)
             self._cap_bytes += len(data)
         except Exception:
@@ -287,23 +418,48 @@ class Vt100Terminal(QWidget):
         self._feed(data if isinstance(data, bytes) else data.encode())
         self._refresh()
 
-    def _tick(self):
-        if self._pull is not None:
-            deadline = time.perf_counter() + self._TICK_BUDGET
-            while True:
-                data = self._pull(self._SLICE)
-                if not data:
-                    break
+    def _feed_slice(self) -> bool:
+        """Feed one slice of the reader's backlog (called by the pump). True if
+        there is probably more. Once the source is empty, what was queued
+        after it follows: notices, then the next source."""
+        while True:
+            data = b""
+            pull = self._pull
+            if pull is not None:
+                try:
+                    data = pull(self._SLICE)
+                except Exception:        # the reader is gone
+                    data = b""
+            if data:
                 self._feed(data)
-                if time.perf_counter() > deadline:
-                    break
-            if self._dropped is not None:
+                return len(data) >= self._SLICE
+            if not self._queued:
+                return False
+            item = self._queued.popleft()
+            if type(item) is bytes:
+                self._feed(item)
+            else:
+                self._pull, self._dropped = item
+
+    def _after_feed(self):
+        """End of a pump tick: show a gap the reader reported, then repaint."""
+        if self._pull is not None and self._dropped is not None:
+            try:
                 lost = self._dropped()
-                if lost:
-                    self._feed(("\r\n\x1b[33m[… %d KB of output skipped: it arrived "
-                                "faster than a terminal can show …]\x1b[0m\r\n"
-                                % max(1, lost // 1024)).encode("utf-8"))
+            except Exception:
+                lost = 0
+            if lost:
+                self._feed(("\r\n\x1b[33m[… %d KB of output skipped: it arrived "
+                            "faster than a terminal can show …]\x1b[0m\r\n"
+                            % max(1, lost // 1024)).encode("utf-8"))
         self._refresh()
+
+    def _tick(self):
+        """Drain this terminal on its own (the pump does all of them at once)."""
+        deadline = time.perf_counter() + self._TICK_BUDGET
+        while self._feed_slice() and time.perf_counter() < deadline:
+            pass
+        self._after_feed()
 
     def _refresh(self):
         """Repaint what changed since the last call (and nothing if nothing did)."""
@@ -547,8 +703,9 @@ class Vt100Terminal(QWidget):
         """Paint one row as RUNS of same-styled cells: one fillRect + one drawText
         per run instead of one per cell (a 200x50 screen is 10,000 cells but
         typically a few hundred runs)."""
-        cw, ch, cols = self.cw, self.ch, self.cols
-        cells = [line[x] for x in range(cols)]
+        cw, ch = self.cw, self.ch
+        cells = self.screen.cells(line)          # a screen line or a scrollback Row
+        cols = min(self.cols, len(cells))
         hl = None
         if self._highlight:
             hl = self._row_highlights("".join(c.data or " " for c in cells))
@@ -868,31 +1025,68 @@ class Vt100Terminal(QWidget):
                                               "terminal.txt")
         if not path:
             return
-        source = self._cap_path
+        self.save_output_to(path)
+
+    def save_output_to(self, path: str) -> threading.Thread:
+        """Write the session to *path* on a worker thread; ``_saved`` reports."""
         fh = self._cap_fh
         if fh is not None:
             try:
                 fh.flush()
             except Exception:
                 pass
-        fallback = "\n".join(self.screen.row_text(i).rstrip()
-                             for i in range(self.screen.total_rows))
-        threading.Thread(target=self._save_worker, args=(source, path, fallback),
-                         daemon=True).start()
+        # Only a cheap snapshot here (the scrollback rows never change, so they
+        # are shared; the screen's rows are copied). The text is built on the
+        # worker, and only if there is no capture to save — building it here
+        # took 1.7 s of the GUI thread for 50k lines, every time.
+        rows = self.screen.snapshot()
+        worker = threading.Thread(
+            target=self._save_worker,
+            args=(list(self._cap_parts), path, rows, self._cap_trimmed), daemon=True)
+        worker.start()
+        return worker
 
-    def _save_worker(self, source, path, fallback):
+    def _save_worker(self, sources, path, fallback, trimmed=False):
+        """*sources*: the capture's parts in order (or one path, or None);
+        *fallback*: what to write without a capture — text, or rows."""
         from ..results import strip_ansi
+        if isinstance(sources, str):
+            sources = [sources]
         try:
             wrote = False
             with open(path, "w", encoding="utf-8", newline="\n") as out:
-                if source and os.path.exists(source):
-                    with open(source, "rb") as src:
-                        for raw in src:              # line by line: constant memory
-                            text = strip_ansi(raw.decode("utf-8", "replace"))
-                            if text:
-                                out.write(text if text.endswith("\n") else text + "\n")
-                                wrote = wrote or bool(text.strip())
-                if not wrote:                        # no capture: what is on screen
+
+                def emit(raw: bytes):
+                    nonlocal wrote
+                    text = strip_ansi(raw.decode("utf-8", "replace"))
+                    if text:
+                        out.write(text if text.endswith("\n") else text + "\n")
+                        wrote = wrote or bool(text.strip())
+
+                if trimmed:
+                    out.write(f"[… earlier output is not included: a session keeps "
+                              f"its last {_CAPTURE_LIMIT // (1024 * 1024)} MB …]\n")
+                # the parts are one stream: a line (or a UTF-8 character) cut
+                # where a new part began is joined up again
+                carry = b""
+                for source in sources or ():
+                    try:
+                        src = open(source, "rb")
+                    except OSError:              # dropped since the snapshot
+                        continue
+                    with src:
+                        for raw in src:          # line by line: constant memory
+                            if carry:
+                                raw, carry = carry + raw, b""
+                            if raw.endswith(b"\n"):
+                                emit(raw)
+                            else:
+                                carry = raw
+                if carry:
+                    emit(carry)
+                if not wrote:                    # no capture: what is on screen
+                    if not isinstance(fallback, str):
+                        fallback = rows_text(fallback)
                     out.write(fallback)
             self._saved_gate.emit(path, "")
         except Exception as exc:
@@ -936,22 +1130,22 @@ class Vt100Terminal(QWidget):
         """Close + delete the disk capture (call when the session closes)."""
         self._saved_gate.close()
         try:
-            self._resize_timer.stop(); self._timer.stop()
+            self._resize_timer.stop()
+            _pump().remove(self)
         except Exception:
             pass
         self._pull = None
-        for fh in (self._cap_fh, getattr(self, "_cap_closed", None)):
-            try:
-                if fh is not None:
-                    fh.close()
-            except Exception:
-                pass
-        self._cap_fh = None
+        self._dropped = None
+        self._queued.clear()
         try:
-            if self._cap_path and os.path.exists(self._cap_path):
-                os.remove(self._cap_path)
+            if self._cap_fh is not None:
+                self._cap_fh.close()
         except Exception:
             pass
+        self._cap_fh = None
+        self._cap_stale.extend(self._cap_parts)
+        self._cap_parts = []
+        self._remove_stale_parts()
 
     # the names the main window's menus call
     _copy = copy_selection

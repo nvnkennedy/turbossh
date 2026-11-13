@@ -147,21 +147,52 @@ class LocalShell:
         return data or None
 
     def write(self, data: bytes) -> None:
+        """Blocks until the shell has taken *data* (a busy shell may not read for
+        a long time): the terminal tab calls this from its writer thread."""
         try:
             if self._master is not None:
-                os.write(self._master, data)
+                view = memoryview(data)
+                while view:              # a pty may take only part of a write
+                    view = view[os.write(self._master, view):]
             elif self._proc is not None and self._proc.stdin:
                 self._proc.stdin.write(data)
                 self._proc.stdin.flush()
         except (OSError, ValueError):
             pass
 
+    def signal_interrupt(self) -> bool:
+        """POSIX: deliver Ctrl+C the way the terminal would — SIGINT to the
+        foreground process group — without writing it into the pty, where it
+        would wait behind a paste the program has not read yet. Only when the
+        terminal would turn Ctrl+C into that signal at all (a full-screen
+        program switches that off and reads the key itself). False: send the
+        byte instead."""
+        if self._master is None:
+            return False
+        try:
+            import signal
+            import termios
+            attrs = termios.tcgetattr(self._master)
+            if not attrs[3] & termios.ISIG or attrs[6][termios.VINTR] != b"\x03":
+                return False
+            group = os.tcgetpgrp(self._master)
+            # 0 / our own group: the pty has no foreground job of its own, and
+            # signalling that would interrupt TurboSSH itself
+            if group <= 0 or group == os.getpgrp():
+                return False
+            os.killpg(group, signal.SIGINT)
+            return True
+        except Exception:
+            return False
+
     def interrupt(self) -> None:
-        """Stop the running command. POSIX: Ctrl+C through the pty. Windows: end
-        the processes the shell started (a pipe cannot carry a Ctrl+C, and
-        Ctrl+Break is ignored by many programs); the shell stays at its prompt."""
+        """Stop the running command. POSIX: Ctrl+C, as a signal or through the
+        pty. Windows: end the processes the shell started (a pipe cannot carry a
+        Ctrl+C, and Ctrl+Break is ignored by many programs); the shell stays at
+        its prompt."""
         if self._master is not None:
-            self.write(b"\x03")
+            if not self.signal_interrupt():
+                self.write(b"\x03")
         elif self.alive:
             for pid in _descendants(self._proc.pid):
                 _terminate(pid)

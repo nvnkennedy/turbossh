@@ -12,25 +12,85 @@ needs and pyte leaves out. No Qt in here, so it is unit-testable headless.
   batches) and only for lines that scroll off a full-height screen — not for the
   inner scrolling of a region, and never while the alternate screen is up.
 * **A fast path for plain text.** pyte's ``draw`` does a width lookup, several
-  mode checks and a ``namedtuple._replace`` for every character; for ordinary
-  ASCII in replace mode the result is fully determined by (attributes, char), so
-  cells are taken from a cache instead. This is what makes a log flood usable.
+  mode checks and a ``namedtuple._replace`` for every character; in replace mode
+  with the default charset the result is fully determined by (attributes, char),
+  so cells are taken from a cache instead. This is what makes a log flood
+  usable — and it means a cell is shared, not one object per character.
+* **Compact scrollback.** A screen line is a dict of column -> cell (~10 KB for
+  a full line). A line that scrolls off becomes a :class:`Row`, a tuple of
+  shared cells (~1.6 KB), so 10k lines of scrollback is ~20 MB, not 100-270 MB.
 """
 
 from __future__ import annotations
 
 import copy
+import unicodedata
 from typing import Callable, List, Optional
 
 import pyte
 import pyte.charsets as cs
 import pyte.modes as mo
-from pyte.screens import Margins
+from pyte.screens import Char, Margins, StaticDefaultDict, wcwidth
 
 _ALT_SCREEN_MODES = (47, 1047, 1049)
 DECCKM = 1 << 5             # application cursor keys (private mode 1, as pyte stores it)
 BRACKETED_PASTE = 2004 << 5
 _TRIM_SLACK = 1000          # scrollback is trimmed in batches of this many lines
+_BLANK = Char(" ")          # pyte's default cell
+_tuple_item = tuple.__getitem__
+
+
+class Row(tuple):
+    """A scrollback line: its cells, up to the last one written, as a tuple.
+
+    Read like a screen line (``row[x]``): a column past the end is a blank. It
+    never changes — a line that comes back onto the screen (the window grew) is
+    turned back into a dict first — so a save on a worker thread can read it."""
+
+    __slots__ = ()
+
+    def __getitem__(self, x):
+        try:
+            return _tuple_item(self, x)
+        except IndexError:
+            return _BLANK
+
+
+_EMPTY = Row()
+_COLUMN_KEYS: dict = {}     # n -> (0, 1, …, n-1)
+
+
+def compact(line) -> Row:
+    """*line* (a screen line: dict of column -> cell) as a :class:`Row`."""
+    if type(line) is Row:
+        return line
+    n = len(line)
+    if not n:
+        return _EMPTY
+    keys = tuple(line)
+    in_order = _COLUMN_KEYS.get(n)
+    if in_order is None and n <= 4096:
+        in_order = _COLUMN_KEYS[n] = tuple(range(n))
+    if keys == in_order:
+        # written left to right without gaps (nearly every line): the values
+        # already are the row — a third of the cost of looking each one up
+        return Row(line.values())
+    # a gap reads as the line's own blank; past the end, a row reads as pyte's
+    return Row(map(line.__getitem__, range(max(keys) + 1)))
+
+
+def rows_text(rows) -> str:
+    """Plain text of *rows* (screen lines or :class:`Row`), trailing blanks
+    dropped — for saving what the terminal holds."""
+    out = []
+    for row in rows:
+        if type(row) is Row:
+            out.append("".join([cell.data for cell in row]).rstrip())
+        elif row:
+            out.append("".join([row[x].data for x in range(max(row) + 1)]).rstrip())
+        else:
+            out.append("")
+    return "\n".join(out)
 
 
 class _History:
@@ -143,7 +203,7 @@ class TermScreen(pyte.Screen):
         history = self.history
         if history.limit <= 0:
             return
-        history.top.append(line)
+        history.top.append(compact(line))
         history.pushed += 1
         if len(history.top) > history.limit + _TRIM_SLACK:
             del history.top[:len(history.top) - history.limit]
@@ -151,35 +211,69 @@ class TermScreen(pyte.Screen):
     def clear_history(self) -> None:
         self.history.top.clear()
 
+    def _as_line(self, row):
+        """A :class:`Row` coming back onto the screen, as a writable line."""
+        if type(row) is not Row:
+            return row
+        line = StaticDefaultDict(self.default_char)
+        line.update(enumerate(row))
+        return line
+
     def index(self) -> None:
+        # pyte's own index, with the rows shifted by C loops instead of a Python
+        # one: a flood of short lines is one index per line, and this is O(rows)
         top, bottom = self.margins or Margins(0, self.lines - 1)
-        if self.cursor.y == bottom and top == 0 and self._alt is None:
-            self._push_history(self.buffer[0])
-        super().index()
+        if self.cursor.y != bottom:
+            self.cursor_down()
+            return
+        buffer = self.buffer
+        if top == 0 and self._alt is None:
+            self._push_history(buffer[0])
+        self.dirty.update(range(self.lines))
+        # sequential: row y is read before it is overwritten by row y + 1
+        buffer.update(zip(range(top, bottom),
+                          map(buffer.__getitem__, range(top + 1, bottom + 1))))
+        buffer.pop(bottom, None)
+
+    # pyte raises UnboundLocalError for a mode it does not know (ESC[3K, ESC[5K,
+    # ESC[4J), and the rest of the data being fed is lost with it. A terminal
+    # ignores an unknown mode.
+    def erase_in_line(self, how: int = 0, *args, **kwargs) -> None:
+        if how in (0, 1, 2):
+            super().erase_in_line(how, *args, **kwargs)
 
     def erase_in_display(self, how: int = 0, *args, **kwargs) -> None:
+        if how not in (0, 1, 2, 3):
+            return
         if how == 3 and self._alt is None:
             self.clear_history()         # ESC[3J: what `clear` sends to drop scrollback
         super().erase_in_display(how, *args, **kwargs)
 
     # ------------------------------------------------------------- drawing
-    def draw(self, data: str) -> None:
-        # Fast path: printable ASCII, replace mode, default charset. Every such
-        # character is one cell wide and maps to itself, so the loop pyte runs
-        # per character collapses to "copy cached cells into the line".
-        if (self.charset or self.g0_charset is not cs.LAT1_MAP
-                or mo.IRM in self.mode
-                or not (data.isascii() and data.isprintable())):
-            super().draw(data)
-            return
-        cursor = self.cursor
-        columns = self.columns
-        attrs = cursor.attrs
+    def _cells_for(self, attrs) -> dict:
         cells = self._cells.get(attrs)
         if cells is None:
             if len(self._cells) > 256:   # bound it: SGR combinations are few
                 self._cells.clear()
             cells = self._cells[attrs] = {}
+        elif len(cells) > 4096:          # and the characters drawn in one style
+            cells.clear()
+        return cells
+
+    def draw(self, data: str) -> None:
+        if self.charset or self.g0_charset is not cs.LAT1_MAP or mo.IRM in self.mode:
+            super().draw(data)           # another charset / insert mode: rare
+            return
+        if not (data.isascii() and data.isprintable()):
+            self._draw_unicode(data)
+            return
+        # Fast path: printable ASCII, replace mode, default charset. Every such
+        # character is one cell wide and maps to itself, so the loop pyte runs
+        # per character collapses to "copy cached cells into the line".
+        cursor = self.cursor
+        columns = self.columns
+        attrs = cursor.attrs
+        cells = self._cells_for(attrs)
         pos, end = 0, len(data)
         while pos < end:
             if cursor.x >= columns:
@@ -190,16 +284,63 @@ class TermScreen(pyte.Screen):
                 else:
                     cursor.x = columns - 1      # no wrap: overwrite the last cell
             take = min(end - pos, columns - cursor.x)
-            line = self.buffer[cursor.y]
+            chunk = data[pos:pos + take]
+            row = list(map(cells.get, chunk))
+            if not all(row):             # a character not drawn in this style yet
+                for i, ch in enumerate(chunk):
+                    if row[i] is None:
+                        row[i] = cells.get(ch) or cells.setdefault(
+                            ch, attrs._replace(data=ch))
             x = cursor.x
-            for ch in data[pos:pos + take]:
-                cell = cells.get(ch)
-                if cell is None:
-                    cell = cells[ch] = attrs._replace(data=ch)
-                line[x] = cell
-                x += 1
-            cursor.x = x
+            self.buffer[cursor.y].update(zip(range(x, x + take), row))
+            cursor.x = x + take
             pos += take
+        self.dirty.add(cursor.y)
+
+    def _draw_unicode(self, data: str) -> None:
+        """pyte's ``draw`` loop, step for step, for text beyond printable ASCII
+        (accents, symbols, CJK) — except that a cell comes from the cache. pyte
+        made a new cell object for every character drawn, ~27 KB per line."""
+        cursor = self.cursor
+        columns = self.columns
+        buffer = self.buffer
+        attrs = cursor.attrs
+        cells = self._cells_for(attrs)
+        for char in data:
+            width = wcwidth(char)
+            if cursor.x == columns:
+                if mo.DECAWM in self.mode:
+                    self.dirty.add(cursor.y)
+                    self.carriage_return()
+                    self.linefeed()
+                elif width > 0:
+                    cursor.x -= width
+            line = buffer[cursor.y]
+            if width == 1 or width == 2:
+                cell = cells.get(char)
+                if cell is None:
+                    cell = cells[char] = attrs._replace(data=char)
+                line[cursor.x] = cell
+                if width == 2 and cursor.x + 1 < columns:
+                    stub = cells.get("")         # a wide character's second cell
+                    if stub is None:
+                        stub = cells[""] = attrs._replace(data="")
+                    line[cursor.x + 1] = stub
+            elif width == 0 and unicodedata.combining(char):
+                # a combining mark joins the character before it (rare: as pyte)
+                if cursor.x:
+                    last = line[cursor.x - 1]
+                    line[cursor.x - 1] = last._replace(
+                        data=unicodedata.normalize("NFC", last.data + char))
+                elif cursor.y:
+                    above = buffer[cursor.y - 1]
+                    last = above[columns - 1]
+                    above[columns - 1] = last._replace(
+                        data=unicodedata.normalize("NFC", last.data + char))
+            else:
+                break                    # unprintable: pyte stops here too
+            if width > 0:
+                cursor.x = min(cursor.x + width, columns)
         self.dirty.add(cursor.y)
 
     # ------------------------------------------------------------- resize
@@ -224,10 +365,10 @@ class TermScreen(pyte.Screen):
         start = 0 if cur_abs < new_rows else cur_abs - (new_rows - 1)
         window = rows[start:start + new_rows]
         pyte.Screen.resize(self, new_rows, new_cols)
-        top[:] = rows[:start]
+        top[:] = [compact(line) for line in rows[:start]]
         for y in range(new_rows):
             if y < len(window):
-                self.buffer[y] = window[y]
+                self.buffer[y] = self._as_line(window[y])
             else:
                 self.buffer.pop(y, None)        # fresh blank line on next access
         self.cursor.y = max(0, min(cur_abs - start, new_rows - 1))
@@ -251,6 +392,16 @@ class TermScreen(pyte.Screen):
             return self.buffer[y]
         return None
 
+    def cells(self, line) -> list:
+        """The ``columns`` cells of a screen line or :class:`Row`, for painting."""
+        columns = self.columns
+        if type(line) is Row:
+            out = list(_tuple_item(line, slice(0, columns)))
+            if len(out) < columns:
+                out.extend([_BLANK] * (columns - len(out)))
+            return out
+        return list(map(line.__getitem__, range(columns)))
+
     def row_text(self, index: int, first: int = 0, last: Optional[int] = None) -> str:
         """Text of a row between columns [first, last) — for selection / copy."""
         line = self.row(index)
@@ -258,6 +409,15 @@ class TermScreen(pyte.Screen):
             return ""
         last = self.columns if last is None else min(last, self.columns)
         return "".join(line[x].data for x in range(max(0, first), last))
+
+    def snapshot(self) -> list:
+        """Every row (scrollback + screen) as :class:`Row` objects, which do not
+        change afterwards — cheap to take on the GUI thread (the scrollback rows
+        are shared, only the screen's are copied), so the text can be built on
+        a worker thread with :func:`rows_text`."""
+        buffer = self.buffer
+        return list(self.history.top) + [compact(buffer.get(y) or _EMPTY)
+                                          for y in range(self.lines)]
 
     def text_range(self, start: tuple, end: tuple) -> str:
         """Text between two (row, column) positions, inclusive of *end*. Trailing

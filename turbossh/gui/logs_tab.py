@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from collections import deque
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QSyntaxHighlighter,
-                         QTextCharFormat, QTextDocument)
+                         QTextCharFormat, QTextCursor, QTextDocument)
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
                              QLineEdit, QPushButton, QPlainTextEdit, QFileDialog,
                              QShortcut, QCheckBox)
@@ -20,8 +21,19 @@ from . import qtutil
 _PRESETS = ["journalctl", "slog2info", "dmesg", "journalctl -f", "slog2info -w",
             "dmesg -w", "tail -f /var/log/messages"]
 # every line received is kept (unfiltered) up to this many, so changing the
-# filter re-filters what already arrived instead of only what comes next
+# filter re-filters what already arrived instead of only what comes next, and
+# Save writes them all
 _KEEP_LINES = 200000
+# ...but the view holds the latest this many: a line in a QPlainTextEdit costs
+# ~0.6 KB (the view's old 500k-line cap was ~315 MB per tab) and ~25 us to lay
+# out and colour, so the view is built a timed step at a time (_STEP_BUDGET of
+# GUI time per tick), never all at once
+_VIEW_LINES = 50000
+_PULL_LINES = 20000         # lines taken from the worker per tick (filtering is cheap)
+_SCAN_LINES = 20000         # stored lines re-filtered per step
+_CHUNK = 500                # lines added to the view per call
+_STEP_BUDGET = 0.015
+_TICK_MS = 50
 
 
 # Level colouring: the first rule that matches a line decides its colour. The
@@ -35,6 +47,10 @@ _LEVEL_RULES = (
     (re.compile(r"\b(success(ful)?|passed|started|connected|ready|ok)\b", re.I),
      "#5be39a"),
 )
+
+
+class _Marker(str):
+    """A line TurboSSH adds itself (output was skipped): shown under any filter."""
 
 
 class _LevelHighlighter(QSyntaxHighlighter):
@@ -58,16 +74,25 @@ class _LevelHighlighter(QSyntaxHighlighter):
 
 class _LogThread(QThread):
     """Buffers log lines; the GUI pulls them on a timer so a flood never freezes
-    the UI thread."""
+    the UI thread. Past *cap* undrained lines the oldest are dropped — and
+    counted, so the view says so instead of silently leaving a gap."""
     stopped = pyqtSignal()
 
     def __init__(self, handler, command, stop_event, get_pty=True, cap=200000):
         super().__init__()
         self.handler, self.command, self.stop_event = handler, command, stop_event
         self._get_pty = get_pty
-        self._lines = []
+        self._lines: deque = deque()
         self._lock = threading.Lock()
         self._cap = cap
+        self._dropped = 0
+
+    def _add(self, line: str):
+        with self._lock:
+            if len(self._lines) >= self._cap:
+                self._lines.popleft()
+                self._dropped += 1
+            self._lines.append(line)
 
     def run(self):
         try:
@@ -77,34 +102,44 @@ class _LogThread(QThread):
             # (SYSTEMD_PAGER/PAGER=cat) so journalctl doesn't wait on `less`.
             for ln in self.handler.iter_lines(self.command, stop_event=self.stop_event,
                                               get_pty=self._get_pty):
-                with self._lock:
-                    self._lines.append(strip_ansi(ln))
-                    if len(self._lines) > self._cap:
-                        del self._lines[:-self._cap]
+                self._add(strip_ansi(ln))
         except Exception as exc:
-            with self._lock:
-                self._lines.append(f"[ERROR] {exc}")
+            self._add(f"[ERROR] {exc}")
         self.stopped.emit()
 
-    def pull(self, maxn=3000):
+    def pull(self, maxn=3000) -> list:
+        """Up to *maxn* buffered lines (removed), led by a marker line if lines
+        were dropped since the last pull."""
         with self._lock:
-            if not self._lines:
-                return []
-            out = self._lines[:maxn]
-            del self._lines[:maxn]
+            out = []
+            if self._dropped:
+                out.append(_Marker(f"[… {self._dropped} lines skipped: they arrived "
+                                   f"faster than this tab could take them …]"))
+                self._dropped = 0
+            for _ in range(min(maxn, len(self._lines))):
+                out.append(self._lines.popleft())
             return out
 
 
 class LogsTab(QWidget):
     title = "Logs"
+    _save_done = pyqtSignal(str)            # status text, from the save worker
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.handler = None
         self._thread = None            # NB: not `thread` — that is QObject.thread()
+        self._sources: list = []       # stopped workers still holding lines, oldest first
         self.stop_event = threading.Event()
         self._paused = False
-        self._lines: deque = deque(maxlen=_KEEP_LINES)
+        self._lines: deque = deque(maxlen=_KEEP_LINES)   # everything received
+        # the view is fed from these, a step per tick: new lines go below what is
+        # shown, a re-filter's older lines above it (newest first)
+        self._pending: deque = deque(maxlen=_VIEW_LINES)
+        self._older: deque = deque()   # lists of lines, the newest list first
+        self._older_count = 0
+        self._scan = None              # re-filter in progress: [snapshot, end index]
+        self._view_reset = False       # the pending lines replace the whole view
         self._rx = None                # compiled filter, or None = show everything
         self._rx_note = ""
 
@@ -129,10 +164,12 @@ class LogsTab(QWidget):
 
         self.statusrow = QLabel("○ stopped")
         self._count = 0
+        self._save_done.connect(self.statusrow.setText)
+        self._save_gate = qtutil.SignalGate(self._save_done)
 
         self.view = QPlainTextEdit(); self.view.setReadOnly(True)
         self.view.setFont(QFont("Consolas", 9))
-        self.view.setMaximumBlockCount(500000)
+        self.view.setMaximumBlockCount(_VIEW_LINES)
         self.view.setStyleSheet("background:#000000; color:#cfe3f7;")
         self._highlighter = _LevelHighlighter(self.view.document())
 
@@ -166,9 +203,10 @@ class LogsTab(QWidget):
             shortcut = QShortcut(QKeySequence(seq), self, activated=slot)
             shortcut.setContext(Qt.WidgetWithChildrenShortcut)
 
-        # drain buffered lines on a timer (bounded work -> never freezes). It
-        # only runs while a stream is live — not for every tab ever opened.
-        self._timer = QTimer(self); self._timer.timeout.connect(self._drain)
+        # drain buffered lines and build the view on a timer (bounded work ->
+        # never freezes). It only runs while there is something to do — not for
+        # every tab ever opened.
+        self._timer = QTimer(self); self._timer.timeout.connect(self._on_timer)
         # re-filter a moment after the user stops typing, not on every keystroke
         self._filter_timer = QTimer(self); self._filter_timer.setSingleShot(True)
         self._filter_timer.timeout.connect(self._apply_filter)
@@ -208,28 +246,33 @@ class LogsTab(QWidget):
         self._thread = _LogThread(self.handler, cmd, self.stop_event, get_pty)
         self._thread.stopped.connect(self._on_stream_ended)
         self._thread.start()
-        self._timer.start(80)
+        self._timer.start(_TICK_MS)
         self.statusrow.setText(f"● live — {raw}")
 
     def _stop(self):
         """Stop the stream WITHOUT waiting for the worker on the GUI thread. It is
         parked: a worker stuck on a dead link finishes on its own later, and its
-        QThread is never dropped while still running (which aborts the app)."""
+        QThread is never dropped while still running (which aborts the app).
+        What it had already buffered is still taken, a step per tick."""
         self.stop_event.set()
-        thread, self._thread = self._thread, None
-        if thread is not None:
-            self._take(thread)              # what it had already buffered
-            qtutil.park_thread(thread)
-        self._timer.stop()
+        self._retire_thread()
         self._set_stopped_status()
 
     def _on_stream_ended(self):
-        # the command ended on its own (or failed): collect the tail, then idle
+        # The command ended on its own (or failed). run() emits `stopped` as its
+        # LAST step, so the thread is usually still running here: dropping the
+        # only reference to it then destroyed a running QThread, and Qt aborted
+        # the whole app — after every one-shot preset (journalctl, dmesg …).
+        self._retire_thread()
+        self._set_stopped_status()
+
+    def _retire_thread(self):
         thread, self._thread = self._thread, None
         if thread is not None:
-            self._take(thread)
-        self._timer.stop()
-        self._set_stopped_status()
+            qtutil.park_thread(thread)      # kept alive until it really ends
+            self._sources.append(thread)    # its buffered tail is still taken
+            self._on_timer()
+            self._kick()
 
     def _set_stopped_status(self):
         self.statusrow.setText(f"○ stopped — {self._count} lines{self._rx_note}")
@@ -241,32 +284,62 @@ class LogsTab(QWidget):
             self._render_all()              # show what arrived while paused
 
     # ---- lines ----
-    def _take(self, thread):
-        """Move everything the worker has buffered into our store and the view."""
-        while True:
-            lines = thread.pull(3000)
-            if not lines:
-                return
-            self._accept(lines)
+    def _on_timer(self):
+        self._drain()
+        self._work()
+        if self._thread is None and not self._busy():
+            self._timer.stop()
 
     def _drain(self):
-        if self._thread is None:
-            return
-        lines = self._thread.pull(3000)
-        if lines:
-            self._accept(lines)
+        """Take what the workers buffered (bounded per tick), oldest first."""
+        budget = _PULL_LINES
+        sources = self._sources + ([self._thread] if self._thread is not None else [])
+        for source in sources:
+            lines = source.pull(budget)
+            if lines:
+                self._store(lines)
+            if len(lines) < budget and source is not self._thread:
+                self._sources.remove(source)   # a stopped worker, now emptied
+            budget -= len(lines)
+            if budget <= 0:
+                break
+        if self._thread is not None:
+            self.statusrow.setText(f"● live — {self._count} lines{self._rx_note}")
 
     def _accept(self, lines):
+        """Take *lines* as if they had just arrived."""
+        self._store(lines)
+        self._work()
+        self._kick()
+
+    def _store(self, lines):
         self._lines.extend(lines)           # kept even when filtered out / paused
         if self._paused:
             return
-        if self._rx is not None:
-            lines = [ln for ln in lines if self._rx.search(ln)]
-        if lines:
-            self._count += len(lines)
-            self.view.appendPlainText("\n".join(lines))
-            if self._thread is not None:
-                self.statusrow.setText(f"● live — {self._count} lines{self._rx_note}")
+        shown = self._matching(lines)
+        if shown:
+            self._count += len(shown)
+            if len(self._pending) + len(shown) >= _VIEW_LINES:
+                # these alone push everything shown now out of the view: start
+                # it afresh rather than lay out lines that are dropped at once
+                self._view_reset = True
+                self._older.clear()
+                self._older_count = 0
+            self._pending.extend(shown)     # (bounded: the oldest fall off)
+
+    def _matching(self, lines):
+        rx = self._rx
+        if rx is None:
+            return list(lines)
+        return [ln for ln in lines if type(ln) is _Marker or rx.search(ln)]
+
+    def _busy(self) -> bool:
+        return bool(self._sources or self._pending or self._older
+                    or self._scan is not None or self._view_reset)
+
+    def _kick(self):
+        if not self._timer.isActive() and (self._thread is not None or self._busy()):
+            self._timer.start(_TICK_MS)
 
     def _apply_filter(self):
         pattern = self.filter.text().strip()
@@ -281,15 +354,89 @@ class LogsTab(QWidget):
         self._render_all()
 
     def _render_all(self):
-        """Re-render the view from every stored line under the current filter."""
-        rx = self._rx
-        shown = [ln for ln in self._lines if rx.search(ln)] if rx else list(self._lines)
-        self._count = len(shown)
-        self.view.setPlainText("\n".join(shown))
-        self.view.moveCursor(self.view.textCursor().End)
+        """Re-show the stored lines under the current filter. Re-filtering and
+        laying out up to 200k lines at once froze the window for 6-12 s, so it
+        is done in timed steps: the newest lines first (the bottom of the view,
+        where the user looks), then older ones above them."""
+        self.view.clear()
+        self._pending.clear()
+        self._older.clear()
+        self._older_count = 0
+        self._view_reset = False
+        self._count = 0
+        self._scan = [list(self._lines), len(self._lines)] if self._lines else None
+        self._work()
+        self._kick()
+        self._show_status()
+
+    def _show_status(self):
         live = self._thread is not None
         self.statusrow.setText(f"{'● live' if live else '○ stopped'} — "
                                f"{self._count} lines{self._rx_note}")
+
+    def _work(self):
+        """One step of view work, within _STEP_BUDGET of GUI time: new lines
+        first, then a re-filter's older lines, then more re-filtering — so the
+        newest matches show at once and the rest fills in above them."""
+        deadline = time.perf_counter() + _STEP_BUDGET
+        if self._view_reset:
+            self.view.clear()
+            self._view_reset = False
+        while time.perf_counter() < deadline:
+            if self._pending:
+                n = min(_CHUNK, len(self._pending))
+                self.view.appendPlainText("\n".join([self._pending.popleft()
+                                                     for _ in range(n)]))
+            elif self._older:
+                self._insert_older()
+            elif self._scan is not None:
+                self._scan_step()
+            else:
+                break
+
+    def _scan_step(self):
+        snapshot, end = self._scan
+        start = max(0, end - _SCAN_LINES)
+        matched = self._matching(snapshot[start:end])
+        self._count += len(matched)
+        room = _VIEW_LINES - self._older_count - len(self._pending)
+        if matched and room > 0:
+            matched = matched[-room:]
+            self._older.append(matched)           # older than all before it
+            self._older_count += len(matched)
+        self._scan[1] = start
+        if start == 0:
+            self._scan = None
+            self._show_status()
+
+    def _insert_older(self):
+        room = _VIEW_LINES - self.view.document().blockCount()
+        if room <= 0:                             # the view is full: drop the rest
+            self._older.clear()
+            self._older_count = 0
+            return
+        newest = self._older[0]
+        n = min(_CHUNK, len(newest), room)
+        piece = newest[-n:]
+        del newest[-n:]
+        if not newest:
+            self._older.popleft()
+        self._older_count -= n
+        self._insert_above(piece)
+
+    def _insert_above(self, lines):
+        doc = self.view.document()
+        if doc.isEmpty():
+            self.view.appendPlainText("\n".join(lines))
+            return
+        bar = self.view.verticalScrollBar()
+        following = bar.value() >= bar.maximum()
+        value = bar.value()
+        cursor = QTextCursor(doc)
+        cursor.movePosition(QTextCursor.Start)
+        cursor.insertText("\n".join(lines) + "\n")
+        # stay at the bottom, or keep the lines the user scrolled to in view
+        bar.setValue(bar.maximum() if following else value + len(lines))
 
     # ---- find ----
     def _focus_find(self):
@@ -325,20 +472,48 @@ class LogsTab(QWidget):
 
     def _clear(self):
         self._lines.clear()
+        self._pending.clear()
+        self._older.clear()
+        self._older_count = 0
+        self._scan = None
+        self._view_reset = False
         self._count = 0
         self.view.clear()
 
     def _save(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save log", "log.txt")
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(self.view.toPlainText())
-            self.statusrow.setText(f"saved {self._count} lines to {path}")
-        except OSError as exc:
-            self.statusrow.setText(f"⚠ could not save: {exc}")
+        if path:
+            self._save_to(path)
+
+    def _save_to(self, path: str) -> threading.Thread:
+        """Write every stored line that passes the filter (not just the view's
+        latest ones) to *path*, on a worker thread."""
+        lines, rx, gate = list(self._lines), self._rx, self._save_gate
+
+        def work():
+            try:
+                count = 0
+                with open(path, "w", encoding="utf-8") as fh:
+                    for line in lines:
+                        if rx is None or type(line) is _Marker or rx.search(line):
+                            fh.write(line + "\n")
+                            count += 1
+                gate.emit(f"saved {count} lines to {path}")
+            except OSError as exc:
+                gate.emit(f"⚠ could not save: {exc}")
+
+        worker = threading.Thread(target=work, name="logs-save", daemon=True)
+        worker.start()
+        return worker
 
     def close_tab(self):
-        self._stop()
+        """Stop the stream and drop the backlog — rendering it into a view about
+        to be deleted froze the window for seconds."""
+        self.stop_event.set()
+        self._save_gate.close()
+        thread, self._thread = self._thread, None
+        qtutil.park_thread(thread)
+        self._sources.clear()
+        self._timer.stop()
         self._filter_timer.stop()
+        self._clear()
