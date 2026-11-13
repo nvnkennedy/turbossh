@@ -56,7 +56,12 @@ class WinRMTimeoutError(WinRMError):
 # command that never ends (Add-WindowsCapability with Windows Update blocked, a
 # service stuck starting) blocked the caller for good — the GUI's install thread,
 # or SSHHandler's connect lock during an auto-bootstrap.
+# The offline install (unpack the uploaded ZIP, register the service):
 COMMAND_TIMEOUT = 600.0
+# The online install: Add-WindowsCapability downloads OpenSSH from Windows
+# Update or the company's WSUS, which on a slow source takes well over ten
+# minutes and still succeeds.
+ONLINE_INSTALL_TIMEOUT = 2700.0
 # the small steps (probe the architecture, upload one chunk) are quick when
 # anything works at all
 _STEP_TIMEOUT = 120.0
@@ -131,7 +136,7 @@ def enable_openssh_via_winrm(
     ssh_port: int = 22,
     set_powershell_default: bool = False,
     log: Optional[Callable[[str], None]] = None,
-    command_timeout: float = COMMAND_TIMEOUT,
+    command_timeout: float = ONLINE_INSTALL_TIMEOUT,
 ) -> dict:
     """
     Connect over WinRM and enable OpenSSH Server on *host*.
@@ -141,7 +146,8 @@ def enable_openssh_via_winrm(
     attacker on the path can read the administrator credentials).
 
     The remote script is stopped if it runs longer than ``command_timeout``
-    seconds (Add-WindowsCapability can wait for ever for a blocked Windows Update).
+    seconds, 45 minutes by default (Add-WindowsCapability can wait for ever for
+    a blocked Windows Update, and takes a long time from a slow WSUS).
 
     :returns: dict with keys ``ok``, ``status``, ``stdout``, ``stderr``.
     :raises WinRMError: if pywinrm is missing or the WinRM call fails
@@ -180,7 +186,9 @@ def enable_openssh_via_winrm(
         raise WinRMTimeoutError(
             f"{exc} Add-WindowsCapability waits for Windows Update (or a "
             f"capability source), which locked-down networks block; the offline "
-            f"install (turbossh install-ssh-remote) needs neither.") from None
+            f"install (turbossh install-ssh-remote) needs neither. If the source "
+            f"is only slow, give it longer: enable_openssh_via_winrm(..., "
+            f"command_timeout=SECONDS).") from None
     except WinRMError:
         raise
     except Exception as exc:  # pragma: no cover - needs a live host
@@ -356,13 +364,34 @@ _DECODE_B64 = (
     r"[Convert]::FromBase64String(((Get-Content -LiteralPath (Join-Path $d 'openssh.b64')) -join '')));"
     r"'OK'")
 
+# Make the staging folder and say where it is. The path is sent as base64 of
+# its UTF-8 bytes: WinRM returns console output in the remote OEM code page, so
+# a plain path with a "Müller" in it came back as "M?ller".
+_STAGE = (
+    r"$d=Join-Path $env:TEMP 'turbossh_ossh';"
+    r"New-Item -ItemType Directory -Force -Path $d|Out-Null;"
+    r"[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($d))")
+
+
+def _stage_path(output: Optional[bytes]) -> Optional[str]:
+    """The staging folder from _STAGE's output, or None if it cannot be read."""
+    import base64
+    import binascii
+    lines = (output or b"").decode("ascii", "replace").split()
+    try:
+        return base64.b64decode(lines[-1], validate=True).decode("utf-8") or None
+    except (IndexError, ValueError, binascii.Error):
+        return None
+
+
 # PowerShell that installs OpenSSH Server from an already-present ZIP — fully
 # OFFLINE (no Add-WindowsCapability / Windows Update), then repairs host keys,
-# starts the service and opens the firewall. {zip} (a quoted PowerShell literal,
-# see cli._ps_quote) and {port} are substituted.
+# starts the service and opens the firewall. Only {port} is substituted: the
+# ZIP's path is built on the remote side, the same way the upload built it, so
+# no path (with an account name in it) makes the round trip through Python.
 _INSTALL_FROM_ZIP = r"""
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
-$zip = {zip}
+$zip = Join-Path $env:TEMP 'turbossh_ossh\openssh.zip'
 try {{
     $dest = Join-Path $env:ProgramFiles 'OpenSSH'
     # IDEMPOTENT: if sshd is already installed, do NOT re-copy the binaries — they
@@ -445,7 +474,6 @@ def enable_openssh_via_winrm_offline(
     """
     import base64
     import os
-    from .cli import _ps_quote
 
     step = min(command_timeout, _STEP_TIMEOUT)
 
@@ -482,24 +510,23 @@ def enable_openssh_via_winrm_offline(
             raise WinRMError(f"Bundled OpenSSH ZIP not found: {zip_path}")
         _log(f"WinRM -> {endpoint} as {login}; remote arch {arch or '?'} -> {name}")
 
-        # Get the remote TEMP dir + prepare staging.
-        rt = _run_ps(session, r"$d=Join-Path $env:TEMP 'turbossh_ossh';"
-                              r"New-Item -ItemType Directory -Force -Path $d|Out-Null;$d",
-                     step, f"Preparing a staging folder on {host}")
-        remote_temp = (rt.std_out or b"").decode("utf-8", "replace").strip().splitlines()
-        remote_temp = remote_temp[-1] if remote_temp else r"C:\Windows\Temp\turbossh_ossh"
+        # Prepare the staging folder (%TEMP%\turbossh_ossh) and learn where it
+        # is, for the admin-share copy.
+        rt = _run_ps(session, _STAGE, step, f"Preparing a staging folder on {host}")
+        remote_temp = _stage_path(rt.std_out)
 
         used_smb = False
         # --- fast path: copy the ZIP over the admin share (SMB) -------------- #
-        try:
-            used_smb = _smb_copy(host, login, raw_pw, zip_path,
-                                 remote_temp + r"\openssh.zip", _log)
-        except Exception as exc:
-            _log(f"  SMB copy unavailable ({exc}); falling back to WinRM upload")
-
-        if used_smb:
-            remote_zip = remote_temp + r"\openssh.zip"
+        if remote_temp is None:
+            _log("  the remote staging folder was not reported; uploading over WinRM")
         else:
+            try:
+                used_smb = _smb_copy(host, login, raw_pw, zip_path,
+                                     remote_temp + r"\openssh.zip", _log)
+            except Exception as exc:
+                _log(f"  SMB copy unavailable ({exc}); falling back to WinRM upload")
+
+        if not used_smb:
             # --- fallback: base64 chunked upload over WinRM ----------------- #
             with open(zip_path, "rb") as fh:
                 b64 = base64.b64encode(fh.read()).decode("ascii")
@@ -536,15 +563,15 @@ def enable_openssh_via_winrm_offline(
                          f"Reassembling the uploaded ZIP on {host}")
             if "OK" not in (dr.std_out or b"").decode("utf-8", "replace"):
                 raise WinRMError("failed to reassemble the uploaded ZIP remotely")
-            remote_zip = remote_temp + r"\openssh.zip"
 
         _log("Transfer done — extracting + installing on the remote host…")
-        # the path comes from the remote %TEMP%, so it holds the account name:
-        # quoted, or O'Brien's ends the string and breaks the script — after
-        # the whole slow upload
-        result = _run_ps(
-            session, _INSTALL_FROM_ZIP.format(zip=_ps_quote(remote_zip), port=ssh_port),
-            command_timeout, f"Installing OpenSSH Server on {host}")
+        try:
+            result = _run_ps(session, _INSTALL_FROM_ZIP.format(port=ssh_port),
+                             command_timeout, f"Installing OpenSSH Server on {host}")
+        except WinRMTimeoutError as exc:
+            raise WinRMTimeoutError(
+                f"{exc} To wait longer, pass command_timeout=SECONDS "
+                f"(turbossh install-ssh-remote --timeout SECONDS).") from None
     except WinRMError:
         raise
     except Exception as exc:

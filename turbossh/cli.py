@@ -138,10 +138,13 @@ def launch_setup_server(install_pip: bool = False, port: int = 22) -> bool:
         inner += " -InstallPip"
     # Write a tiny launcher .ps1 that fires the UAC prompt — running it via
     # `-File` avoids all the Windows quoting pitfalls of passing a complex
-    # `-Command` string through subprocess.
+    # `-Command` string through subprocess. With a BOM: Windows PowerShell 5.1
+    # reads a .ps1 without one in the ANSI code page, which garbled a stage
+    # path with a non-ASCII character (C:\Users\Müller\...) and the elevated
+    # setup never started.
     elevate_ps = os.path.join(stage, "elevate.ps1")
     try:
-        with open(elevate_ps, "w", encoding="utf-8") as fh:
+        with open(elevate_ps, "w", encoding="utf-8-sig") as fh:
             fh.write(
                 "$ErrorActionPreference='Stop'\n"
                 "Start-Process -FilePath 'powershell.exe' -Verb RunAs "
@@ -446,7 +449,8 @@ def _add_conn_args(p: argparse.ArgumentParser, required: bool = True) -> None:
                    help="keys / agent only; never send a password")
     g.add_argument("--jump-host", default=None,
                    help="connect through this jump host (bastion); its password "
-                        "comes from TURBOSSH_JUMP_PASSWORD or the saved session")
+                        "comes from TURBOSSH_JUMP_PASSWORD or, with --session, the "
+                        "saved session or the GUI's shared jump password")
     g.add_argument("--jump-user", default=None, help="user on the jump host")
     g.add_argument("--jump-port", type=int, default=None,
                    help="SSH port of the jump host (default 22)")
@@ -489,6 +493,43 @@ def _resolve_password(args, login_user: str, host: str | None) -> Secret | None:
     if env is not None:
         return Secret(env)
     return None
+
+
+def _winrm_password(args, login_user: str) -> Secret:
+    """The password for install-ssh-remote's WinRM login, saying on standard
+    error where it came from.
+
+    An explicit choice (--use-stored, --password, --password-stdin) wins.
+    TURBOSSH_PASSWORD is used only when there is nobody to ask: it is usually
+    set for the SSH targets, and a wrong password sent to a domain account
+    counts toward locking it, so at a terminal the password is asked for."""
+    interactive = sys.stdin is not None and sys.stdin.isatty()
+    from_env = os.environ.get("TURBOSSH_PASSWORD") is not None
+    if args.use_stored:
+        source = "the OS credential vault (--use-stored)"
+    elif args.password:
+        source = None                   # the prompt itself says so
+    elif args.password_stdin:
+        source = "standard input (--password-stdin)"
+    elif from_env and not interactive:
+        source = "TURBOSSH_PASSWORD"
+    elif interactive:
+        if from_env:
+            print("TURBOSSH_PASSWORD is set, but at a terminal the WinRM password "
+                  "is asked for (a wrong one counts toward locking the account); "
+                  "--password-stdin passes it on purpose.", file=sys.stderr)
+        return prompt_password(f"Password for {login_user}@{args.host}: ")
+    else:
+        # getpass reads the CONSOLE, not stdin, so a script with nobody at the
+        # keyboard would wait for ever
+        raise _UsageError(
+            "no password for the WinRM login: use --password-stdin, "
+            "TURBOSSH_PASSWORD or --use-stored (there is no terminal to ask on).")
+    pw = _resolve_password(args, login_user, args.host)
+    if source:
+        print(f"WinRM login as {login_user}: the password comes from {source}.",
+              file=sys.stderr)
+    return pw
 
 
 def _saved_session(name: str) -> dict:
@@ -534,6 +575,13 @@ def _build_config(args) -> SSHConfig:
         # copy only when it differs from the shared jump password
         from .gui.sessions import jump_password_for
         jump_password = jump_password or jump_password_for(name, base) or None
+        if jump_password is None and args.jump_host:
+            # a jump host named here, for a session saved without one: the
+            # session's own jump password if it has one (as 2.0.0 used), else
+            # the shared one from Settings
+            from .gui import settings
+            jump_password = (SessionStore.jump_password(name)
+                             or settings.jump_password() or None)
     policy = args.host_key_policy or (
         ("ignore" if base.get("ignore_hostkey", True) else "auto") if name else "auto")
     legacy = bool(args.legacy or base.get("legacy"))
@@ -553,6 +601,14 @@ def _build_config(args) -> SSHConfig:
         passwordless=args.passwordless, jump_host=jump, host_key_policy=policy,
         enable_legacy_algorithms=legacy,
     )
+
+
+def _cmd_safe_camera(name) -> str:
+    """A DirectShow camera name for a cmd.exe line, where it sits inside
+    ``video="…"``: a double quote would end that argument, and cmd (and
+    PowerShell's ``--%``) read a % as the start of a variable and a | as a pipe,
+    so those are dropped."""
+    return "".join(c for c in str(name) if c not in '"%|')
 
 
 def _command_line(words) -> str:
@@ -733,6 +789,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="read the password from the OS credential vault")
     p_inst.add_argument("--service", default="turbossh",
                         help="credential-vault namespace")
+    p_inst.add_argument("--timeout", type=float, default=None, metavar="SECONDS",
+                        help="how long the remote install step may run "
+                             "(default 600)")
 
     # --- local port forward (ssh -L) through this connection / jump ---
     p_fwd = sub.add_parser("forward",
@@ -955,24 +1014,17 @@ def _main(argv=None) -> int:
     if args.cmd == "install-ssh-remote":
         from .winrm_bootstrap import enable_openssh_via_winrm_offline
         login_user = f"{args.domain}\\{args.user}" if args.domain else args.user
-        pw = _resolve_password(args, login_user, args.host)
-        if pw is None:
-            # WinRM needs a password. getpass reads the CONSOLE, not stdin, so a
-            # script with nobody at the keyboard would wait for ever: ask only
-            # when someone can answer.
-            if not (sys.stdin is not None and sys.stdin.isatty()):
-                raise _UsageError(
-                    "no password for the WinRM login: use --password-stdin, "
-                    "TURBOSSH_PASSWORD or --use-stored (there is no terminal to "
-                    "ask on).")
-            pw = prompt_password(f"Password for {login_user}@{args.host}: ")
+        if args.timeout is not None and not args.timeout > 0:
+            raise _UsageError("--timeout must be a number of seconds above 0.")
+        pw = _winrm_password(args, login_user)
         openssh_dir = os.path.join(os.path.dirname(_setup_script_path()), "openssh")
+        extra = {} if args.timeout is None else {"command_timeout": args.timeout}
         try:
             res = enable_openssh_via_winrm_offline(
                 args.host, args.user, pw.reveal(), openssh_dir,
                 domain=args.domain, ssh_port=args.ssh_port,
                 winrm_port=args.winrm_port,
-                log=lambda m: print(m, file=sys.stderr))
+                log=lambda m: print(m, file=sys.stderr), **extra)
             print(f"OpenSSH installed on {args.host} (sshd: {res.get('status')}).")
             return 0
         except Exception as exc:
@@ -1018,23 +1070,30 @@ def _main(argv=None) -> int:
                             ssh.webcam_release(ffmpeg_marker="turbossh", safe=True)
                         except Exception:
                             pass
-                    lines = (ssh.run('powershell -NoProfile -Command "$env:TEMP"')
-                             .text or "").splitlines()
+                    # These are cmd.exe lines: _cmd_line makes them run under the
+                    # remote default shell (PowerShell too) and keeps cmd /c from
+                    # stripping the first and last quote of a line starting with one.
+                    lines = (ssh.run(ssh._cmd_line(
+                        'powershell -NoProfile -Command "$env:TEMP"')).text or ""
+                    ).splitlines()
                     rtmp = (lines[-1].strip() if lines else r"C:\Windows\Temp")
                     rpath = rtmp.rstrip("\\") + "\\turbossh_grab" + \
                         (".jpg" if snapshot else ".mp4")
+                    exe = str(args.remote_ffmpeg).replace('"', "")
+                    camera = _cmd_safe_camera(args.camera)
                     if snapshot:
                         # warm the camera up (~1.5s) and keep the last frame —
                         # `-frames:v 1` alone often grabs before any frame arrives.
-                        cmd = (f'"{args.remote_ffmpeg}" -y -hide_banner -loglevel error '
-                               f'-f dshow -i video="{args.camera}" -t 1.5 -update 1 '
+                        cmd = (f'"{exe}" -y -hide_banner -loglevel error '
+                               f'-f dshow -i video="{camera}" -t 1.5 -update 1 '
                                f'"{rpath}"')
                     else:
-                        cmd = (f'"{args.remote_ffmpeg}" -y -hide_banner -loglevel error '
-                               f'-f dshow -i video="{args.camera}" -t {args.seconds} -an '
+                        cmd = (f'"{exe}" -y -hide_banner -loglevel error '
+                               f'-f dshow -i video="{camera}" -t {args.seconds} -an '
                                f"-vf \"scale='min(iw,{args.width})':-2\" -r {args.fps} "
                                f'-c:v libx264 -preset veryfast -pix_fmt yuv420p "{rpath}"')
-                    grab = ssh.run(cmd, timeout=max(40.0, args.seconds + 25))
+                    grab = ssh.run(ssh._cmd_line(cmd),
+                                   timeout=max(40.0, args.seconds + 25))
                     if not grab.ok:
                         # report ffmpeg's own error, not a later "file not found"
                         raise SSHError(
@@ -1042,7 +1101,7 @@ def _main(argv=None) -> int:
                             f"{(grab.stderr or grab.stdout).strip()[:400]}")
                     ssh.pull(rpath, args.out)
                     try:
-                        ssh.run(f'cmd /c del "{rpath}"', timeout=10)
+                        ssh.run(ssh._cmd_line(f'del "{rpath}"'), timeout=10)
                     except Exception:
                         pass
             except SSHError as exc:

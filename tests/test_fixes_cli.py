@@ -243,30 +243,41 @@ def test_a_remote_command_that_never_ends_is_stopped(winrm_fake):
     assert proto.calls == ["open", "run", "cleanup", "close"]     # stopped, shell closed
 
 
-def _offline_reply(install_output):
+_STAGE_DIR = "C:\\Users\\O'Brien\\AppData\\Local\\Temp\\turbossh_ossh"
+
+
+def _offline_reply(install_output, stage=_STAGE_DIR):
+    """The remote end of the offline install. Console output comes back in the
+    remote OEM code page (cp850 here), as WinRM returns it; base64 is ASCII."""
     def reply(script):
         if "Expand-Archive" in script:               # the install script
             return install_output
         if "OSArchitecture" in script:
             return b"X64\r\n"
         if "New-Item -ItemType Directory" in script:
-            return b"C:\\Users\\O'Brien\\AppData\\Local\\Temp\\turbossh_ossh\r\n"
+            if "ToBase64String" in script:
+                return base64.b64encode(stage.encode("utf-8")) + b"\r\n"
+            return stage.encode("cp850") + b"\r\n"
         return b"OK\r\n"
     return reply
 
 
-def test_offline_install_quotes_the_remote_temp_path(winrm_fake, monkeypatch, tmp_path):
-    """An account like O'Brien broke the install script after the whole upload."""
+def test_offline_install_keeps_the_remote_temp_path_out_of_the_script(
+        winrm_fake, monkeypatch, tmp_path):
+    """An account like O'Brien broke the install script after the whole upload:
+    the ZIP's path is now built on the remote side, so it never is in the script."""
     from turbossh import winrm_bootstrap as w
     (tmp_path / "OpenSSH-Win64.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
-    monkeypatch.setattr(w, "_smb_copy", lambda *a, **kw: True)
+    copied = []
+    monkeypatch.setattr(w, "_smb_copy", lambda *a, **kw: copied.append(a[4]) or True)
     proto = winrm_fake(_offline_reply(b"STATUS:Running\r\n"))
     res = w.enable_openssh_via_winrm_offline("h", "u", "pw", str(tmp_path),
                                              transport="basic")
     assert res["ok"] and res["status"] == "Running"
+    assert copied == [_STAGE_DIR + "\\openssh.zip"]
     install = next(s for s in proto.scripts.values() if "Expand-Archive" in s)
-    assert ("$zip = 'C:\\Users\\O''Brien\\AppData\\Local\\Temp\\turbossh_ossh"
-            "\\openssh.zip'") in install
+    assert "$zip = Join-Path $env:TEMP 'turbossh_ossh\\openssh.zip'" in install
+    assert "O'Brien" not in install
     if _powershell():
         script = tmp_path / "install.ps1"
         script.write_text(install, encoding="utf-8")
@@ -322,9 +333,12 @@ def test_a_stalled_serial_write_times_out_and_says_how_much_went(monkeypatch):
                                            write_timeout=1.0)
     handler.open()
     assert opened["write_timeout"] == 1.0
-    # 1200 baud, 1 s: pieces of 60 bytes; two go out, then the port stalls
+    # 1200 baud, 1 s: pieces of 15 bytes (an eighth of the timeout); seven go
+    # out, then the port stalls. This port does not say how much of the eighth
+    # piece went (only Windows does), so the error says it may have.
     with pytest.raises(serial_handler.SerialError,
-                       match=r"timed out after 1 s: 120 of 1000 bytes were sent"):
+                       match=r"timed out after 1 s: 105 of 1000 bytes were sent, "
+                             r"and perhaps part of the next 15"):
         handler.write_bytes(b"x" * 1000)
     res = handler.write_line("x", safe=True)
     assert not res.success and isinstance(res.error, serial_handler.SerialError)

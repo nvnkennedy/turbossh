@@ -49,7 +49,9 @@ With none of these, TurboSSH logs in with your SSH key (`--key`, the SSH agent,
 or the default keys in `~/.ssh`) and, failing that, tries a blank password, which
 is what many lab targets use. `--passwordless` restricts it to keys.
 
-A jump host's password comes from `TURBOSSH_JUMP_PASSWORD` or the saved session.
+A jump host's password comes from `TURBOSSH_JUMP_PASSWORD` or, with `--session`,
+the session's own jump password, else the shared one from the GUI's Settings
+(also when `--jump-host` adds a jump host to a session saved without one).
 
 ```bash
 echo "$PW" | turbossh run --host 10.0.0.5 --user root --password-stdin uname -a
@@ -403,12 +405,17 @@ turbossh setup-server --port 2222
 
 Install OpenSSH Server on *another* Windows machine over WinRM, uploading the
 bundled copy. The account must be a local administrator there, and WinRM must be
-reachable. The password comes from the same places as for every other command
-(see [Credentials](#credentials)): `--use-stored`, `--password`,
-`--password-stdin` or `TURBOSSH_PASSWORD`. With none of them it is asked for with
-a hidden prompt, or, when there is no terminal to ask on (a script, CI), the
-command stops with exit code 2. A remote step that runs for more than ten
-minutes is stopped and reported as an error.
+reachable. The password comes from `--use-stored`, `--password` or
+`--password-stdin` (see [Credentials](#credentials)); without one of them it is
+asked for with a hidden prompt. `TURBOSSH_PASSWORD` is used only when there is
+no terminal to ask on (a script, CI): it is usually set for the SSH targets, and
+a wrong password sent to a domain account counts toward locking it. With no
+password and no terminal the command stops with exit code 2. Where the password
+came from is printed on standard error.
+
+The install step is stopped after `--timeout` seconds (default 600), each
+smaller step (a probe, one upload piece) after two minutes, and reported as an
+error.
 
 ```bash
 turbossh install-ssh-remote --host 10.0.0.9 --user admin --domain CORP
@@ -426,6 +433,7 @@ echo "$PW" | turbossh install-ssh-remote --host 10.0.0.9 --user admin --password
 | `--password-stdin` | read the password from standard input |
 | `--use-stored` | read the password from the OS credential vault |
 | `--service NAME` | credential-vault namespace, default `turbossh` |
+| `--timeout SECONDS` | how long the remote install step may run, default 600 |
 
 ### `turbossh diagnose`
 

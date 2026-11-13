@@ -7,6 +7,7 @@ push/pull/listing surface of SSHHandler and returns the same result objects.
 from __future__ import annotations
 
 import os
+import shutil
 import ssl
 import time
 import uuid
@@ -22,6 +23,43 @@ from .results import TransferResult, OperationResult
 from .exceptions import FTPError
 
 
+def _option(value, config, name: str, default):
+    """*value* if given, else the config's field *name* (an FTPConfig without
+    that field, or with it unset, gives *default*)."""
+    if value is None:
+        value = getattr(config, name, None)
+    return default if value is None else value
+
+
+def _put_in_place(tmp: str, dest: str) -> None:
+    """Swap the finished download *tmp* in as *dest*.
+
+    A file held open without delete sharing (a log viewer watching it) refuses
+    the swap on Windows, but usually not a write: then the data is copied into
+    it instead. Should even that fail, the download is kept and named in the
+    error rather than deleted."""
+    try:
+        _replace_with_retry(tmp, dest)
+        return
+    except OSError as exc:
+        refused = exc
+    try:
+        shutil.copyfile(tmp, dest)
+    except OSError as exc:
+        raise FTPError(
+            f"FTP download finished, but {dest} could not be replaced ({refused}) "
+            f"nor written ({exc}); the downloaded file is kept as {tmp}") from exc
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+
+# X509_V_ERR_HOSTNAME_MISMATCH / X509_V_ERR_IP_ADDRESS_MISMATCH: the certificate
+# is good, but not for the name or address the server was reached by
+_NAME_MISMATCH = (62, 64)
+
+
 class FTPHandler:
     """
     >>> with FTPHandler(FTPConfig(host="ftp.example.com", username="u",
@@ -31,17 +69,26 @@ class FTPHandler:
 
     With FTPS (``use_tls``) the server's certificate and host name are checked
     against the system's trusted CAs, or against ``ca_file`` (a PEM bundle, e.g.
-    a lab's own CA). ``verify_tls=False`` turns the check off, for a self-signed
+    a lab's own CA). ``check_hostname=False`` still checks the certificate but
+    not the name in it (a server reached by an IP address its certificate does
+    not list). ``verify_tls=False`` turns the whole check off, for a self-signed
     lab server only: without it anyone on the path can read the password.
+    Each of the three can be given here or on the FTPConfig; a value given
+    here wins.
     """
 
     def __init__(self, config: FTPConfig, *,
                  log_callback: Optional[Callable[[str], None]] = None,
                  logger: Optional[logging.Logger] = None, safe: bool = False,
-                 verify_tls: bool = True, ca_file: Optional[str] = None):
+                 verify_tls: Optional[bool] = None, ca_file: Optional[str] = None,
+                 check_hostname: Optional[bool] = None):
         self.config = config
-        self.verify_tls = verify_tls
-        self.ca_file = ca_file
+        # None: what the config says (FTPConfig.verify_tls / ca_file /
+        # check_hostname), and the safe choice when it does not say
+        self.verify_tls = bool(_option(verify_tls, config, "verify_tls", True))
+        self.ca_file = _option(ca_file, config, "ca_file", None) or None
+        self.check_hostname = bool(_option(check_hostname, config,
+                                           "check_hostname", True))
         self._safe_default = safe
         self._log_callback = log_callback
         if logger is None:
@@ -83,7 +130,37 @@ class FTPHandler:
             ctx.verify_mode = ssl.CERT_NONE
             return ctx
         cafile = os.path.expanduser(self.ca_file) if self.ca_file else None
-        return ssl.create_default_context(cafile=cafile)
+        try:
+            ctx = ssl.create_default_context(cafile=cafile)
+        except (ssl.SSLError, OSError, ValueError) as exc:
+            # ssl names neither the file nor the setting ("[Errno 2] No such
+            # file or directory", "[X509] no certificate or crl found")
+            if isinstance(exc, FileNotFoundError):
+                raise FTPError(f"The FTPS CA file {cafile} (ca_file) was not "
+                               f"found.") from exc
+            raise FTPError(f"The FTPS CA file {cafile} (ca_file) could not be "
+                           f"loaded as PEM certificates: {exc}") from exc
+        if not self.check_hostname:
+            ctx.check_hostname = False      # the certificate itself is still checked
+        return ctx
+
+    @staticmethod
+    def _tls_hint(exc) -> str:
+        """What to do about a certificate the check refused, naming the options
+        and where they go."""
+        if not isinstance(exc, ssl.SSLCertVerificationError):
+            return ""
+        def how(option: str) -> str:
+            return f"FTPConfig(..., {option}) or FTPHandler(config, {option})"
+        if getattr(exc, "verify_code", None) in _NAME_MISMATCH:
+            return (" (the certificate is good but not issued for this host name "
+                    "or address: connect by a name it lists, or keep checking the "
+                    "certificate but not the name with "
+                    + how("check_hostname=False") + ")")
+        return (" (the server's TLS certificate could not be verified: give the "
+                "CA that signed it, as a PEM file, with "
+                + how("ca_file='lab-ca.pem'") + "; for a self-signed lab server "
+                "only, turn the check off with " + how("verify_tls=False") + ")")
 
     def _connect(self):
         cfg = self.config
@@ -98,12 +175,8 @@ class FTPHandler:
             self._ftp.set_pasv(cfg.passive)
             self._emit(logging.INFO, f"Connected to ftp://{cfg.username}@{cfg.host}.")
         except all_errors as exc:
-            hint = ""
-            if isinstance(exc, ssl.SSLCertVerificationError):
-                hint = (" (the server's TLS certificate could not be verified: pass "
-                        "ca_file= with the CA that signed it, or verify_tls=False "
-                        "for a self-signed lab server)")
-            raise FTPError(f"FTP connect/login failed for {cfg.host}: {exc}{hint}") from exc
+            raise FTPError(f"FTP connect/login failed for {cfg.host}: "
+                           f"{exc}{self._tls_hint(exc)}") from exc
         return self
 
     def disconnect(self):
@@ -190,7 +263,10 @@ class FTPHandler:
         """Download a single file (RETR)."""
         def _do():
             lp = os.path.expanduser(local_path)
-            parent = os.path.dirname(lp)
+            # a link is written through, to the file it points at (replacing
+            # the link with a plain file would cut it off from its target)
+            dest = os.path.realpath(lp) if os.path.islink(lp) else lp
+            parent = os.path.dirname(dest)
             if parent and not os.path.exists(parent):
                 os.makedirs(parent, exist_ok=True)
             start = time.time()
@@ -198,7 +274,7 @@ class FTPHandler:
             # Into a temporary file next to the target, swapped in only once it
             # is complete: writing the target itself destroyed the good copy
             # already there when the transfer broke off part-way (a VPN drop).
-            tmp = os.path.join(parent, f".{os.path.basename(lp)}."
+            tmp = os.path.join(parent, f".{os.path.basename(dest)}."
                                        f"{uuid.uuid4().hex[:8]}.part")
             try:
                 with open(tmp, "xb") as fh:
@@ -207,7 +283,6 @@ class FTPHandler:
                         if callback:
                             callback(len(data))
                     self._require().retrbinary(f"RETR {remote_path}", _cb)
-                _replace_with_retry(tmp, lp)
             except BaseException as exc:
                 # nothing partial is left behind, and the old file is untouched
                 try:
@@ -217,8 +292,10 @@ class FTPHandler:
                 if isinstance(exc, all_errors):
                     raise FTPError(f"FTP download failed: {exc}") from exc
                 raise
+            # the download is complete: from here on it is never thrown away
+            _put_in_place(tmp, dest)
             return TransferResult(remote_path, lp, "pull", "ftp",
-                                  os.path.getsize(lp), time.time() - start)
+                                  os.path.getsize(dest), time.time() - start)
         return self._guard("pull", _do, safe=safe)
 
     def __enter__(self):

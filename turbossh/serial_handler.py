@@ -34,6 +34,22 @@ class SerialError(SSHError):
     """A serial-port operation failed."""
 
 
+# The write timeout of a port without flow control: one that takes no data for
+# this long is stalled (a wedged USB adapter), since nothing else can hold it off.
+DEFAULT_WRITE_TIMEOUT = 5.0
+
+
+class _Auto:
+    """``write_timeout``'s default: DEFAULT_WRITE_TIMEOUT, or none at all (wait
+    as long as it takes, as pyserial does) when flow control is on."""
+
+    def __repr__(self):
+        return "auto"
+
+
+_AUTO = _Auto()
+
+
 def list_serial_ports() -> list[dict]:
     """Return available COM ports: [{'device','description','hwid'}, ...]."""
     if not _HAS_SERIAL:
@@ -49,9 +65,15 @@ class SerialHandler:
     ...     res = s.stream(match="login:", stop_on_match=True,
     ...                    save_to="console.log", on_line=print)
 
-    A write that the port stops taking (flow control holding it off, a stalled
-    USB adapter) raises SerialError after ``write_timeout`` seconds without
-    progress; ``write_timeout=None`` waits for ever, as pyserial does by default.
+    ``write_timeout`` is how long a write may go without a byte going out
+    before it fails with SerialError (which says how many bytes were sent). A
+    slow link that keeps moving is waited for, however long the whole write
+    takes. By default it is 5 s on a port without flow control, where only a
+    stalled adapter stops the data, and none (wait as long as it takes) with
+    ``rtscts``, ``xonxoff`` or ``dsrdtr``, where a busy device (a flash erase)
+    may hold the port off for longer. ``write_timeout=None`` always waits.
+    (Windows reports how much of an interrupted write went out; elsewhere a
+    write also fails when the rate drops more than eightfold all at once.)
     """
 
     def __init__(self, port: str, baudrate: int = 115200, *, bytesize: int = 8,
@@ -59,7 +81,8 @@ class SerialHandler:
                  rtscts: bool = False, xonxoff: bool = False,
                  log_callback: Optional[Callable[[str], None]] = None,
                  logger: Optional[logging.Logger] = None, safe: bool = False,
-                 quiet: bool = False, write_timeout: Optional[float] = 5.0):
+                 quiet: bool = False, write_timeout: Optional[float] = _AUTO,
+                 dsrdtr: bool = False):
         if not _HAS_SERIAL:
             raise SerialError(
                 "pyserial is required for serial support. "
@@ -67,11 +90,15 @@ class SerialHandler:
         self.port = port
         self.baudrate = baudrate
         # write_timeout: without one, pyserial's write() blocks until every byte
-        # is out, so a port held off by XOFF/RTS or a wedged adapter froze the
-        # caller (the GUI's UI thread, a test script) with no way out
+        # is out, so a wedged adapter froze the caller (the GUI's UI thread, a
+        # test script) with no way out. With flow control the device decides
+        # when data may flow, so there the wait stays unlimited (as in 2.0.0).
+        if write_timeout is _AUTO:
+            write_timeout = (None if (rtscts or xonxoff or dsrdtr)
+                             else DEFAULT_WRITE_TIMEOUT)
         self._kw = dict(bytesize=bytesize, parity=parity, stopbits=stopbits,
                         timeout=timeout, rtscts=rtscts, xonxoff=xonxoff,
-                        write_timeout=write_timeout)
+                        dsrdtr=dsrdtr, write_timeout=write_timeout)
         self._safe_default = safe
         self._log_callback = log_callback
         self._quiet = quiet
@@ -128,30 +155,81 @@ class SerialHandler:
         return self._ser
 
     # --- write ---
+    def _baud(self, ser) -> int:
+        """The port's baud rate as a number: pyserial normalises it (it accepts
+        "115200" too), so ask the port first and fall back to what was given."""
+        for value in (getattr(ser, "baudrate", None), self.baudrate):
+            try:
+                baud = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if baud > 0:
+                return baud
+        return 9600
+
+    @staticmethod
+    def _moved(ser, size: int) -> Optional[int]:
+        """How many bytes of a write() that timed out went out, or None when the
+        platform does not tell. pyserial's timeout exception leaves the count
+        out; on Windows it stays in the write's OVERLAPPED structure, which is
+        where GetOverlappedResult read it from."""
+        try:
+            moved = int(getattr(ser, "_overlapped_write").InternalHigh)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return moved if 0 <= moved < size else None
+
     def _write(self, payload: bytes) -> int:
         ser = self._require()
         timeout = self._kw.get("write_timeout")
-        # The timeout applies to each write() call. Pieces that take about half
-        # of it at this baud rate (10 bits a byte) mean a slow but moving link
-        # never times out, a stalled one does, and the error can say how much
-        # got out — pyserial's timeout exception does not.
-        step = (max(1, int(self.baudrate / 10 * timeout / 2)) if timeout
-                else max(1, len(payload)))
-        sent = 0
-        try:
-            for i in range(0, len(payload), step):
-                piece = payload[i:i + step]
+        total = len(payload)
+        if not timeout:     # None: wait as long as it takes (0: pyserial's non-blocking)
+            try:
+                n = ser.write(payload)
+            except (serial.SerialException, OSError) as exc:
+                raise SerialError(f"Write to {self.port} failed: {exc}") from exc
+            return total if n is None else n
+        # pyserial's timeout is a deadline for the whole write() call (Windows:
+        # WriteTotalTimeoutConstant), so the payload goes in pieces that take
+        # about an eighth of it at the rate the port last managed (at first the
+        # baud rate, 10 bits a byte): a slow link that keeps moving never runs
+        # into it. When one does run out, the bytes it moved still count; only
+        # a piece that moved nothing for the whole timeout is a stall.
+        first = max(1, int(self._baud(ser) / 10 * timeout / 8))
+        step, sent = first, 0
+        while sent < total:
+            piece = payload[sent:sent + step]
+            started = time.perf_counter()
+            try:
                 n = ser.write(piece)
-                sent += len(piece) if n is None else n
-                if n is not None and n < len(piece):
-                    break               # the write was cancelled (cancel_write)
-        except serial.SerialTimeoutException as exc:
-            raise SerialError(
-                f"Write to {self.port} timed out after {timeout:g} s: {sent} of "
-                f"{len(payload)} bytes were sent (the port is not taking data: "
-                f"flow control holding it off, or a stalled adapter)") from exc
-        except (serial.SerialException, OSError) as exc:
-            raise SerialError(f"Write to {self.port} failed: {exc}") from exc
+            except serial.SerialTimeoutException as exc:
+                moved = self._moved(ser, len(piece))
+                if moved is None:
+                    raise SerialError(
+                        f"Write to {self.port} timed out after {timeout:g} s: "
+                        f"{sent} of {total} bytes were sent, and perhaps part of "
+                        f"the next {len(piece)} (the port is not taking data, or "
+                        f"far more slowly than before: flow control holding it "
+                        f"off, or a stalled adapter)") from exc
+                sent += moved
+                if moved == 0:
+                    raise SerialError(
+                        f"Write to {self.port} timed out after {timeout:g} s: "
+                        f"{sent} of {total} bytes were sent (no byte went out "
+                        f"for {timeout:g} s: flow control holding the port off, "
+                        f"or a stalled adapter)") from exc
+                # slow, but moving: go on in pieces this rate gets through in time
+                step = max(1, moved // 8)
+                continue
+            except (serial.SerialException, OSError) as exc:
+                raise SerialError(f"Write to {self.port} failed: {exc}") from exc
+            done = len(piece) if n is None else n
+            sent += done
+            if done < len(piece):
+                break                   # the write was cancelled (cancel_write)
+            elapsed = time.perf_counter() - started
+            if elapsed > 0:
+                step = max(1, min(first, int(done / elapsed * timeout / 8)))
         return sent
 
     def write(self, data: str, *, safe=None):
