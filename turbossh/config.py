@@ -96,6 +96,12 @@ class SSHConfig:
     # --- remote OS hint: "auto" | "linux" | "windows" ---
     remote_os: str = "auto"
 
+    # --- SFTP ---
+    # Seconds one SFTP request may go unanswered before it fails (None = wait
+    # for ever, Paramiko's default — which hung a transfer or a file listing
+    # indefinitely on a link that went silent, e.g. a dropped VPN).
+    sftp_timeout: Optional[float] = 60.0
+
     _HOST_KEY_POLICIES = ("auto", "reject", "warn", "ignore")
 
     def __post_init__(self):

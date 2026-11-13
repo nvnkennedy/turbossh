@@ -10,10 +10,12 @@ Designed for three consumers from one object:
 
 from __future__ import annotations
 
+import base64
+import errno
 import os
 import shlex
+import shutil
 import socket
-import stat
 import time
 import logging
 import posixpath
@@ -27,6 +29,7 @@ from .config import SSHConfig
 from .credentials import Secret, mask
 from .results import CommandResult, TransferResult, ShellResult, OperationResult
 from .exceptions import (
+    SSHError,
     SSHConnectionError,
     SSHAuthenticationError,
     SSHTimeoutError,
@@ -43,9 +46,266 @@ from .exceptions import (
 _SERIAL_PS_TAG = "#turbossh-serial\n\n"
 
 
+def _ps_b64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+
+
 def _serial_ps_tag_b64() -> str:
-    import base64
-    return base64.b64encode(_SERIAL_PS_TAG.encode("utf-16-le")).decode("ascii")
+    return _ps_b64(_SERIAL_PS_TAG)
+
+
+def _ps_tag_line(text: str) -> str:
+    """A ``#text`` comment line padded to a multiple of 3 characters (6 UTF-16
+    bytes -> 8 base64 characters), so a header made of such lines still encodes
+    to an exact prefix of the -EncodedCommand argument."""
+    line = "#" + text
+    return line + " " * (-(len(line) + 1) % 3) + "\n"
+
+
+def _port_key(device: str) -> str:
+    """The per-port key in PID-file names and process tags (ASCII letters and
+    digits only, so it is the same in a file name, a tag and a shell word)."""
+    return "".join(c for c in str(device) if c.isascii() and c.isalnum()) or "port"
+
+
+def _serial_ps_header(port_key: str, run: Optional[str] = None) -> str:
+    """The comment header of a serial PowerShell: the TurboSSH tag, then the
+    port, then (for a stream) a per-run id. Its base64 is a prefix of the
+    process's command line, so a force open finds the holders of THIS port only
+    (it used to kill every TurboSSH serial reader on the machine, all ports), and
+    a stream that ends can stop exactly its own reader."""
+    head = _SERIAL_PS_TAG + _ps_tag_line("port=" + port_key.upper())
+    if run:
+        head += _ps_tag_line("run=" + run)
+    return head
+
+
+# PowerShell treats U+2018..U+201B as single quotes too, so a curly apostrophe
+# (pasted from Word or Jira) ends a '...' literal just like ' does.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+
+# Shared PowerShell fragments ($pf = the port's PID file). The tracked holder is
+# killed only if it is still a TurboSSH serial PowerShell (any version: the tag
+# is the common prefix), so a PID Windows has since reused is never touched.
+_PS_KILL_TRACKED = (
+    "if(Test-Path -LiteralPath $pf){"
+    "$old=[string](Get-Content -LiteralPath $pf|Select-Object -First 1);"
+    "if($old -match '^\\s*(\\d+)\\s*$'){$op=[int]$Matches[1];"
+    "if($op -ne $PID){$w=Get-CimInstance Win32_Process -Filter \"ProcessId=$op\";"
+    "if($w -and $w.Name -eq 'powershell.exe' -and $w.CommandLine -like '*__ANYTAG__*'){"
+    "try{Stop-Process -Id $op -Force}catch{};Start-Sleep -Milliseconds 200}}}};"
+)
+# remove the PID file only while it still names this process
+_PS_DROP_OWN_PIDFILE = (
+    "try{if([string](Get-Content -LiteralPath $pf|Select-Object -First 1) -eq "
+    "[string]$PID){Remove-Item -LiteralPath $pf -Force}}catch{}"
+)
+# unwrap PowerShell's MethodInvocationException to the .NET exception
+_PS_INNER = "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
+
+# The ffmpeg kill script for the remote camera. TsHas = case-insensitive
+# "contains" (a short name like H would lose to PowerShell's alias for
+# Get-History: aliases win over functions).
+_PS_FFMPEG_KILL = (
+    "$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue';"
+    "$n=0;function TsHas($s,$m){[bool]$s -and $s.IndexOf($m,"
+    "[StringComparison]::OrdinalIgnoreCase) -ge 0};"
+    "Get-CimInstance Win32_Process -Filter \"Name='ffmpeg.exe'\"|ForEach-Object{"
+    "$c=[string]$_.CommandLine;$x=[string]$_.ExecutablePath;"
+    "if(__COND__){try{Stop-Process -Id $_.ProcessId -Force;$n++}catch{}}};"
+    # give dshow a moment to let go of the camera before it is opened again
+    "if($n){Start-Sleep -Milliseconds 700}"
+)
+
+# How many bytes of a camera ffmpeg's stderr are kept for diagnostics (the
+# Camera tab shows up to 1500 characters of it).
+_FFMPEG_STDERR_KEEP = 1500
+# Outstanding read requests per SFTP download (OpenSSH's sftp uses 64 too).
+# Paramiko's default queues a request for the WHOLE file at once, which swamps
+# small embedded sftp servers and buffers the file in memory on a slow link.
+_SFTP_PREFETCH = 64
+
+
+def _get_takes_prefetch_limit() -> bool:
+    """SFTPClient.get grew max_concurrent_prefetch_requests in Paramiko 3.3."""
+    import inspect
+    try:
+        return ("max_concurrent_prefetch_requests"
+                in inspect.signature(paramiko.SFTPClient.get).parameters)
+    except (TypeError, ValueError):
+        return False
+
+
+_GET_TAKES_PREFETCH_LIMIT = _get_takes_prefetch_limit()
+
+_S_IFMT, _S_IFDIR, _S_IFLNK = 0o170000, 0o040000, 0o120000
+
+
+def _file_type(mode) -> int:
+    """The file-type bits of an SFTP st_mode. stat.S_ISDIR / S_ISLNK raise
+    OverflowError on Windows for modes above 0xFFFF (QNX servers send those) and
+    TypeError for None (servers that send no mode)."""
+    try:
+        return int(mode or 0) & _S_IFMT
+    except (TypeError, ValueError):
+        return 0
+
+
+_WIN_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
+                 | {f"{p}{n}" for p in ("COM", "LPT")
+                    for n in list("0123456789") + ["\u00b9", "\u00b2", "\u00b3"]})
+
+
+def _safe_local_name(name: str, windows: Optional[bool] = None) -> str:
+    """A remote file name made safe to create on this machine. On Windows the
+    characters it forbids (``<>:"/\\|?*`` and control characters) become ``_``
+    (a ':' would otherwise write an NTFS alternate stream and report success),
+    trailing dots and spaces (which Windows silently drops) become ``_``, and a
+    reserved device name (CON, NUL, COM1, LPT1.txt …) gets a ``_`` prefix.
+    Everywhere, a separator or a '.' / '..' name can never leave the folder."""
+    if windows is None:
+        windows = os.name == "nt"
+    bad = '<>:"/\\|?*' if windows else "/"
+    out = "".join("_" if (c in bad or c == "\0" or (windows and ord(c) < 32))
+                  else c for c in str(name))
+    if windows:
+        kept = out.rstrip(" .")
+        out = kept + "_" * (len(out) - len(kept))
+        if out.split(".")[0].rstrip(" ").upper() in _WIN_RESERVED:
+            out = "_" + out
+    if out in ("", ".", ".."):
+        out = "_" * max(1, len(out))
+    return out
+
+
+def _quiet_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _replace_local(tmp: str, target: str) -> None:
+    """Move a finished download over *target*. Windows refuses the rename while
+    another program holds *target* open without delete sharing (a log viewer);
+    the complete local copy is then written over it in place instead."""
+    try:
+        os.replace(tmp, target)
+    except PermissionError:
+        if not os.path.isfile(target):
+            raise
+        shutil.copyfile(tmp, target)
+        _quiet_remove(tmp)
+
+
+_KNOWN_HOSTS_LOCK = threading.Lock()
+
+
+class _RememberHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """AutoAddPolicy for a configured known_hosts file that APPENDS the new key.
+
+    Paramiko's AutoAddPolicy calls save_host_keys(), which re-reads the file
+    (raising on lines it cannot parse, e.g. @cert-authority) and then rewrites
+    it from memory — dropping every line it skipped, and with parallel connects
+    (SSHPool) one thread truncating the file while another writes it."""
+
+    def __init__(self, path: str, warn: Callable[[str], None]):
+        self.path, self.warn = path, warn
+
+    def missing_host_key(self, client, hostname, key):
+        client.get_host_keys().add(hostname, key.get_name(), key)
+        line = f"{hostname} {key.get_name()} {key.get_base64()}"
+        with _KNOWN_HOSTS_LOCK:
+            try:
+                try:
+                    with open(self.path, encoding="utf-8", errors="replace") as fh:
+                        existing = fh.read()
+                except FileNotFoundError:
+                    existing = ""
+                if line in (ln.strip() for ln in existing.splitlines()):
+                    return                  # a parallel connect just added it
+                parent = os.path.dirname(self.path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+                    if existing and not existing.endswith("\n"):
+                        fh.write("\n")
+                    fh.write(line + "\n")
+            except OSError as exc:
+                self.warn(f"Could not remember the host key of {hostname} in "
+                          f"{self.path}: {exc}")
+
+
+class _StderrTail:
+    """Reads a channel's stderr on a background thread while the channel is
+    open, keeping only the last *keep* bytes.
+
+    stderr shares the channel's flow-control window with stdout: left unread,
+    ~2 MB of it (ffmpeg repeating "real-time buffer too full" over a long
+    session) stalls the channel and the picture freezes. The channel's
+    ``recv_stderr_ready`` / ``recv_stderr`` are redirected to the kept tail, so
+    code that reads stderr after a failure (the Camera tab's diagnosis) still
+    gets the latest messages."""
+
+    def __init__(self, chan, keep: int = _FFMPEG_STDERR_KEEP):
+        cls = type(chan)
+        self._chan, self._keep = chan, keep
+        self._ready = lambda: cls.recv_stderr_ready(chan)
+        self._recv = lambda n: cls.recv_stderr(chan, n)
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        chan.recv_stderr_ready = self.ready
+        chan.recv_stderr = self.recv
+        chan._stderr_tail = self
+        threading.Thread(target=self._run, name="turbossh-stderr",
+                         daemon=True).start()
+
+    def _pump(self) -> bool:
+        got = False
+        with self._lock:
+            try:
+                while self._ready():
+                    data = self._recv(65536)
+                    if not data:
+                        break
+                    self._buf += data
+                    got = True
+            except Exception:
+                pass
+            extra = len(self._buf) - self._keep
+            if extra > 0:
+                del self._buf[:extra]
+                nl = self._buf.find(b"\n")         # start on a whole line
+                if 0 <= nl < len(self._buf) - 1:
+                    del self._buf[:nl + 1]
+        return got
+
+    def _run(self) -> None:
+        chan = self._chan
+        while not chan.closed:
+            if not self._pump():
+                if chan.eof_received:
+                    break
+                time.sleep(0.2)
+        self._pump()                     # whatever arrived just before the end
+
+    def ready(self) -> bool:
+        self._pump()
+        with self._lock:
+            return bool(self._buf)
+
+    def recv(self, nbytes: int) -> bytes:
+        self._pump()
+        with self._lock:
+            out = bytes(self._buf[:nbytes])
+            del self._buf[:nbytes]
+        return out
+
+    def text(self) -> str:
+        """The kept stderr, without consuming it."""
+        self._pump()
+        with self._lock:
+            return self._buf.decode("utf-8", errors="replace")
 
 
 try:  # optional SCP support
@@ -234,9 +494,17 @@ class SSHHandler:
         # Serialises connect / reconnect / disconnect, so two threads that find
         # the link down don't both reconnect (and leak one of the clients).
         self._conn_lock = threading.RLock()
+        # Set by disconnect(), cleared by connect(): a worker still running after
+        # a teardown must not auto-reconnect (nobody would close that connection).
+        self._closed = False
+        self._kh_warned = False
         self._remote_os: Optional[str] = (
             None if config.remote_os == "auto" else config.remote_os
         )
+        self._shell: Optional[str] = None    # remote Windows default shell (cached)
+        # markers of the camera streams THIS handler started (see webcam_release)
+        self._cam_tokens: set = set()
+        self._cam_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Logging (secret-aware)
@@ -280,22 +548,31 @@ class SSHHandler:
     # ------------------------------------------------------------------ #
     # State
     # ------------------------------------------------------------------ #
+    # self._client is read ONCE into a local everywhere below: a disconnect() on
+    # another thread can set it to None between two reads.
     @property
     def is_connected(self) -> bool:
-        if self._client is None:
+        client = self._client
+        if client is None:
             return False
-        t = self._client.get_transport()
+        t = client.get_transport()
         return bool(t and t.is_active())
 
     @property
     def client(self) -> paramiko.SSHClient:
         """The underlying paramiko SSHClient (for anything not wrapped here)."""
         self._ensure_connected()
-        return self._client
+        client = self._client
+        if client is None:
+            raise SSHNotConnectedError(f"Disconnected from {self.config.host}.")
+        return client
 
     @property
     def transport(self) -> paramiko.Transport:
-        return self.client.get_transport()
+        t = self.client.get_transport()
+        if t is None:
+            raise SSHNotConnectedError(f"Disconnected from {self.config.host}.")
+        return t
 
     def _ensure_connected(self) -> None:
         if self.is_connected:
@@ -303,6 +580,10 @@ class SSHHandler:
         with self._conn_lock:
             if self.is_connected:          # another thread reconnected meanwhile
                 return
+            if self._closed:
+                raise SSHNotConnectedError(
+                    f"The connection to {self.config.host} was closed with "
+                    f"disconnect(); call connect() to open it again.")
             if self.config.auto_reconnect:
                 self._emit(logging.WARNING, "Session not active; reconnecting…")
                 self._connect_with_retries()
@@ -313,7 +594,46 @@ class SSHHandler:
     # Connect / disconnect
     # ------------------------------------------------------------------ #
     def connect(self, *, safe: Optional[bool] = None):
-        return self._guard("connect", self._connect_with_retries, safe=safe)
+        """Connect (with retries). On a handler that is already connected this
+        does nothing — it used to open a second connection and leak the first
+        (``ssh.connect()`` followed by ``with ssh:``)."""
+        return self._guard("connect", self._connect_explicit, safe=safe)
+
+    def _connect_explicit(self) -> "SSHHandler":
+        with self._conn_lock:
+            self._closed = False
+            if self.is_connected:
+                return self
+            return self._connect_with_retries()
+
+    @staticmethod
+    def _request(chan, timeout: Optional[float], fn, *args, **kwargs):
+        """Run a channel request (get_pty / exec_command / invoke_shell /
+        invoke_subsystem) bounded by *timeout*. Paramiko waits for the server's
+        reply with no limit, so a link that went silent (a VPN drop) hung the
+        caller until TCP noticed. Closing the channel wakes that wait."""
+        if not timeout:
+            return fn(*args, **kwargs)
+        fired = threading.Event()
+
+        def expire():
+            fired.set()
+            try:
+                chan.close()
+            except Exception:
+                pass
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            return fn(*args, **kwargs)
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            if fired.is_set():
+                raise SSHTimeoutError(f"The server did not answer within "
+                                      f"{timeout:g}s.") from exc
+            raise
+        finally:
+            timer.cancel()
 
     # Legacy KEX / host-key / cipher / MAC names old embedded and automotive SSH
     # servers still need, each with the Transport table that says whether this
@@ -382,17 +702,54 @@ class SSHHandler:
             # devices whose host keys rotate (avoids BadHostKeyException).
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             return client
-        if self.config.known_hosts:
-            try:
-                client.load_host_keys(os.path.expanduser(self.config.known_hosts))
-            except FileNotFoundError:
-                self._emit(logging.WARNING,
-                           f"known_hosts not found: {self.config.known_hosts}")
-        else:
-            client.load_system_host_keys()
+        # Loaded into the client's own HostKeys (never with load_host_keys, which
+        # arms Paramiko's save-on-add; see _RememberHostKeyPolicy). Nothing here
+        # may fail the connect: a known_hosts line Paramiko can't parse used to
+        # make EVERY connect raise InvalidHostKey.
+        configured = self.config.known_hosts
+        path = os.path.expanduser(configured or "~/.ssh/known_hosts")
+        try:
+            self._load_known_hosts(client.get_host_keys(), path)
+        except FileNotFoundError:
+            if configured:
+                self._emit(logging.WARNING, f"known_hosts not found: {configured}")
+        except Exception as exc:
+            self._emit(logging.WARNING, f"Could not read known_hosts {path}: {exc}")
+        if self.config.host_key_policy == "auto" and configured:
+            client.set_missing_host_key_policy(_RememberHostKeyPolicy(
+                path, lambda m: self._emit(logging.WARNING, m)))
+            return client
         policy = self._POLICIES.get(self.config.host_key_policy, paramiko.AutoAddPolicy)
         client.set_missing_host_key_policy(policy())
         return client
+
+    def _load_known_hosts(self, keys: paramiko.HostKeys, path: str) -> None:
+        """Read a known_hosts file line by line, skipping what Paramiko can't use
+        (@cert-authority / @revoked markers, corrupt keys) instead of failing."""
+        from paramiko.hostkeys import HostKeyEntry
+        skipped = []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("@"):
+                    skipped.append(lineno)
+                    continue
+                try:
+                    entry = HostKeyEntry.from_line(line, lineno)
+                except Exception:
+                    skipped.append(lineno)
+                    continue
+                if entry is not None:            # None: a key type Paramiko lacks
+                    for name in entry.hostnames:
+                        keys.add(name, entry.key.get_name(), entry.key)
+        if skipped and not self._kh_warned:
+            self._kh_warned = True
+            self._emit(logging.WARNING,
+                       f"known_hosts {path}: ignored {len(skipped)} line(s) this "
+                       f"SSH library can't use (e.g. @cert-authority / @revoked) "
+                       f"— first at line {skipped[0]}.")
 
     def _open_jump_channel(self):
         """Return a NEW direct-tcpip channel to the target through the jump host.
@@ -506,7 +863,7 @@ class SSHHandler:
                 self._emit(logging.DEBUG, f"Auth attempt ({label}) as "
                                           f"{cfg.auth_username}…")
                 client.connect(**kwargs)
-                self._client = client
+                self._install_client(client)
                 self._post_connect()
                 self._emit(logging.INFO,
                            f"Connected to {cfg.auth_username}@{cfg.host}:{cfg.port} "
@@ -784,20 +1141,40 @@ class SSHHandler:
 
         return self._guard("bootstrap_sshd_via_winrm", _do, safe=safe)
 
+    def _install_client(self, client: paramiko.SSHClient) -> None:
+        """Make *client* the connection, closing the one it replaces (a reconnect
+        after the link died) and that connection's SFTP session."""
+        old, self._client = self._client, client
+        self._drop_shared_sftp()
+        if old is not None and old is not client:
+            try:
+                old.close()
+            except Exception:
+                pass
+
+    def _drop_shared_sftp(self, only=None) -> None:
+        """Forget (and close) the shared SFTP client — or only if it is *only*."""
+        with self._conn_lock:
+            sftp = self._sftp
+            if sftp is None or (only is not None and sftp is not only):
+                return
+            self._sftp = None
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
     def _post_connect(self) -> None:
         t = self._client.get_transport()
         if t and self.config.keepalive_interval > 0:
             t.set_keepalive(self.config.keepalive_interval)
-        self._sftp = None
 
     def disconnect(self) -> None:
+        """Close the connection. Sticky: until the next connect(), nothing on
+        this handler reconnects by itself (auto_reconnect included)."""
         with self._conn_lock:
-            if self._sftp is not None:
-                try:
-                    self._sftp.close()
-                except Exception:
-                    pass
-                self._sftp = None
+            self._closed = True
+            self._drop_shared_sftp()
             if self._client is not None:
                 try:
                     self._client.close()
@@ -920,10 +1297,10 @@ class SSHHandler:
                                            3600.0) if t)
             chan = transport.open_session(timeout=open_timeout)
             if get_pty:
-                chan.get_pty()
+                self._request(chan, open_timeout, chan.get_pty)
             if environment:
                 chan.update_environment(environment)
-            chan.exec_command(command)
+            self._request(chan, open_timeout, chan.exec_command, command)
 
             replied, rejected = False, False
             exit_seen = None          # when the exit status was first observed
@@ -1031,16 +1408,21 @@ class SSHHandler:
         >>> for line in ssh.iter_lines("tail -f /var/log/syslog"):
         ...     print(line)
         """
-        chan = self.transport.open_session(timeout=self.config.connect_timeout)
-        if get_pty:
-            chan.get_pty()
-        # merge stderr into stdout so error messages and tools that log to
-        # stderr (slog2info, dmesg, many QNX utilities) are actually shown —
-        # otherwise the stream looks empty and the command seems "not to run".
-        # (Disabled for serial_stream: PowerShell's stderr is CLIXML noise.)
-        if combine_stderr:
-            chan.set_combine_stderr(True)
-        chan.exec_command(command)
+        to = self.config.connect_timeout
+        chan = self.transport.open_session(timeout=to)
+        try:
+            if get_pty:
+                self._request(chan, to, chan.get_pty)
+            # merge stderr into stdout so error messages and tools that log to
+            # stderr (slog2info, dmesg, many QNX utilities) are actually shown —
+            # otherwise the stream looks empty and the command seems "not to
+            # run". (Disabled for serial_stream: PowerShell's stderr is CLIXML.)
+            if combine_stderr:
+                chan.set_combine_stderr(True)
+            self._request(chan, to, chan.exec_command, command)
+        except BaseException:
+            chan.close()
+            raise
         chan.settimeout(idle_poll)
         self._emit(logging.INFO, f"$ {command}  (streaming)")
         start = time.time()
@@ -1129,15 +1511,55 @@ class SSHHandler:
     def _ps_encode(script: str) -> str:
         """Encode a PowerShell script for `powershell -EncodedCommand` (UTF-16LE
         base64) - sidesteps all quoting issues over SSH -> cmd -> powershell."""
-        import base64
-        return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return _ps_b64(script)
 
     @staticmethod
     def _ps_sq(value: str) -> str:
-        """Escape a value for embedding inside a single-quoted PowerShell string
-        (a single quote is doubled). Prevents a device/port name that contains a
-        quote from breaking out of the command."""
-        return str(value).replace("'", "''")
+        """Escape a value for embedding inside a single-quoted PowerShell string.
+        PowerShell ends such a string at ANY of the quotes U+0027 and
+        U+2018..U+201B and reads a doubled one as that character, so each is
+        doubled: a curly apostrophe pasted from Word or Jira can't break out."""
+        return "".join(c + c if c in _PS_SINGLE_QUOTES else c for c in str(value))
+
+    @staticmethod
+    def _is_windows_port(device: str, mode: str) -> bool:
+        return mode == "windows" or (mode == "auto"
+                                     and str(device).upper().startswith("COM"))
+
+    # Where the Linux / QNX serial bridge records its reader / writer PIDs.
+    _POSIX_PID_DIR = "/tmp"
+
+    def _posix_pidfile(self, device: str) -> str:
+        return posixpath.join(self._POSIX_PID_DIR,
+                              f"turbossh_ser_{_port_key(device)}.pid")
+
+    @staticmethod
+    def _posix_kill_tracked() -> str:
+        """sh: kill the processes listed in "$__pf" (the two cats of an earlier
+        bridge on this port) and remove it. On Linux a PID is killed only while
+        /proc says it is still a cat, so a PID reused since is left alone."""
+        return ("for __p in $(cat \"$__pf\" 2>/dev/null); do "
+                "case $__p in ''|*[!0-9]*) continue;; esac; "
+                "if [ -r /proc/$__p/cmdline ]; then "
+                "case $(tr '\\000' ' ' < /proc/$__p/cmdline 2>/dev/null) in "
+                "cat*|*/cat*) ;; *) continue;; esac; fi; "
+                "kill $__p 2>/dev/null; done; rm -f \"$__pf\"; ")
+
+    # Windows: stop every TurboSSH serial PowerShell holding THIS port (force):
+    # found by the port tag, or — for a reader started by 2.0 (whose header has
+    # no port line) — by the port name in its decoded script.
+    _PS_KILL_PORT = (
+        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\"|"
+        "Where-Object{$_.ProcessId -ne $PID -and "
+        "$_.CommandLine -like '*__ANYTAG__*'}|ForEach-Object{$hit="
+        "$_.CommandLine -like '*__PORTTAG__*';"
+        "if(-not $hit -and $_.CommandLine -match 'EncodedCommand\\s+(\\S+)'){"
+        "try{$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("
+        "$Matches[1]));$q=[char]39;$hit=$s.IndexOf('#port=') -lt 0 -and "
+        "$s.Contains($q+'__DEVSQ__'+$q)}catch{}};"
+        "if($hit){try{Stop-Process -Id $_.ProcessId -Force}catch{}}};"
+        "Start-Sleep -Milliseconds 300;"
+    )
 
     def serial_stream(self, device: str = "/dev/ttyUSB0", *, baudrate: int = 115200,
                       mode: str = "auto", on_line=None, on_match=None, match=None,
@@ -1161,41 +1583,48 @@ class SSHHandler:
         >>> # Linux device file on the remote machine:
         >>> ssh.serial_stream("/dev/ttyUSB0", baudrate=115200, on_line=print)
         """
-        is_windows = (mode == "windows" or
-                      (mode == "auto" and device.upper().startswith("COM")))
-        if is_windows:
+        run = None
+        if self._is_windows_port(device, mode):
             # Force UTF-8 console output so our UTF-8 reader doesn't get mojibake,
             # and read whatever bytes are available (robust to any line ending)
             # rather than ReadLine (which hangs if the device's EOL differs).
-            # Track our PID in a per-port file (same scheme as serial_bridge) so
-            # serial_release() can kill this reader — closing the SSH exec channel
-            # does NOT terminate a no-PTY child on Windows OpenSSH, which otherwise
-            # left the COM port locked after the stream ended.
-            dev = self._ps_sq(device)
-            safekey = "".join(c for c in device if c.isalnum()) or "port"
+            # Same port lifecycle as serial_bridge: the tracked stale holder (a
+            # reader an earlier stream left behind: closing the exec channel does
+            # NOT end a no-PTY child on Windows OpenSSH) is killed first, the PID
+            # file is written only once the port is open and removed only while it
+            # still names this reader, and the reader is stopped when the stream
+            # ends. (The PID file used to be written before Open() and deleted on
+            # failure: a retry on a busy port erased the record of the real
+            # holder, which then kept the port until a reboot.)
+            key = _port_key(device)
+            run = os.urandom(6).hex()
             ps = (
                 "$ErrorActionPreference='SilentlyContinue';"
                 "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
-                f"$pf=Join-Path $env:TEMP 'turbossh_ser_{safekey}.pid';"
-                "Set-Content -LiteralPath $pf -Value $PID;"
-                f"$p=New-Object System.IO.Ports.SerialPort '{dev}',{int(baudrate)},"
-                "'None',8,'One';"
-                "$p.Encoding=[System.Text.Encoding]::UTF8;"
+                "$dev='__DEV__';"
+                "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
+                + _PS_KILL_TRACKED +
+                "$p=New-Object System.IO.Ports.SerialPort $dev,__BAUD__,'None',8,'One';"
+                "$p.Encoding=[System.Text.Encoding]::UTF8;$ok=$false;$why='';"
+                "for($i=0;$i -lt 3;$i++){try{$p.Open();$ok=$true;break}catch{"
+                + _PS_INNER + "$why=$e.Message;Start-Sleep -Milliseconds 350}};"
                 # say so and stop if the port will not open — otherwise the loop
                 # below just spins on a closed port and the stream looks empty
-                "try{$p.Open()}catch{"
-                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue;"
-                "[Console]::Out.WriteLine('[serial] cannot open the port: '"
-                "+$_.Exception.Message);[Console]::Out.Flush();exit 2};"
+                "if(-not $ok){[Console]::Out.WriteLine('[serial] cannot open '+$dev"
+                "+': '+$why);[Console]::Out.Flush();exit 2};"
+                "Set-Content -LiteralPath $pf -Value $PID;"
                 "try{while($true){"
                 "if($p.BytesToRead -gt 0){"
                 "$s=$p.ReadExisting();[Console]::Out.Write($s);[Console]::Out.Flush()}"
                 "else{Start-Sleep -Milliseconds 30}}}"
-                "finally{try{$p.Close()}catch{};"
-                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue}"
+                "finally{try{$p.Close()}catch{};" + _PS_DROP_OWN_PIDFILE + "}"
             )
+            ps = (ps.replace("__ANYTAG__", _serial_ps_tag_b64())
+                    .replace("__KEY__", key)
+                    .replace("__BAUD__", str(int(baudrate)))
+                    .replace("__DEV__", self._ps_sq(device)))
             cmd = ("powershell -NoProfile -EncodedCommand "
-                   + self._ps_encode(_SERIAL_PS_TAG + ps))
+                   + self._ps_encode(_serial_ps_header(key, run) + ps))
         else:
             dev = shlex.quote(device)
             if configure:
@@ -1203,10 +1632,41 @@ class SSHHandler:
                        f"2>/dev/null; cat {dev}")
             else:
                 cmd = f"cat {dev}"
-        return self.stream(cmd, on_line=on_line, on_match=on_match, match=match,
-                           stop_on_match=stop_on_match, save_to=save_to, clean=clean,
-                           timeout=timeout, stop_event=stop_event,
-                           combine_stderr=False, safe=safe)
+        try:
+            return self.stream(cmd, on_line=on_line, on_match=on_match, match=match,
+                               stop_on_match=stop_on_match, save_to=save_to,
+                               clean=clean, timeout=timeout, stop_event=stop_event,
+                               combine_stderr=False, safe=safe)
+        finally:
+            if run is not None:
+                self._serial_stop_run(device, run)
+
+    def _serial_stop_run(self, device: str, run: str) -> None:
+        """Stop the Windows reader of one serial_stream run (found by the run id
+        in its command line, never another holder of the port) and drop the PID
+        file if it names that reader. Skipped when the link is gone: the next
+        open's tracked-holder kill frees the port then."""
+        if not self.is_connected:
+            return
+        key = _port_key(device)
+        ps = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
+            "$own=[string](Get-Content -LiteralPath $pf|Select-Object -First 1);"
+            "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\"|"
+            "Where-Object{$_.ProcessId -ne $PID -and "
+            "$_.CommandLine -like '*__RUNTAG__*'}|ForEach-Object{"
+            "try{Stop-Process -Id $_.ProcessId -Force}catch{};"
+            "if($own.Trim() -eq [string]$_.ProcessId){"
+            "Remove-Item -LiteralPath $pf -Force}};'stopped'"
+        ).replace("__KEY__", key).replace(
+            "__RUNTAG__", _ps_b64(_serial_ps_header(key, run)))
+        try:
+            self._run(f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}",
+                      timeout=15, check=False, get_pty=False, environment=None,
+                      encoding="utf-8")
+        except Exception as exc:
+            self._emit(logging.DEBUG, f"Stopping the serial reader failed: {exc}")
 
     def serial_write(self, device: str, data: str, *, baudrate: int = 115200,
                      mode: str = "auto", newline: bool = True,
@@ -1215,23 +1675,38 @@ class SSHHandler:
         Write a line to a serial port on the remote host (over SSH/jump).
         Opens, writes, and closes the port (don't run while serial_stream holds
         it open on Windows - the port can't be shared).
+
+        A port that can't be opened or written raises :class:`SSHCommandError`
+        with the reason in its stderr (``safe=True``: a failed OperationResult);
+        it used to report success with nothing sent.
         """
-        is_windows = (mode == "windows" or
-                      (mode == "auto" and device.upper().startswith("COM")))
-        if is_windows:
-            payload = data.replace("'", "''")
-            meth = "WriteLine" if newline else "Write"
+        raw = data + ("\n" if newline else "")
+        if self._is_windows_port(device, mode):
+            # The bytes travel base64-encoded (no payload can break the quoting)
+            # and are written as UTF-8 (SerialPort's default encoding is ASCII,
+            # which turned every non-ASCII character into '?').
             ps = (
-                f"$p=New-Object System.IO.Ports.SerialPort '{self._ps_sq(device)}',"
-                f"{int(baudrate)},'None',8,'One';"
-                f"$p.Open();$p.{meth}('{payload}');Start-Sleep -Milliseconds 200;"
-                "$p.Close()"
+                "$ErrorActionPreference='Stop';"
+                "try{$b=[Convert]::FromBase64String('__DATA__');"
+                "$p=New-Object System.IO.Ports.SerialPort '__DEV__',__BAUD__,"
+                "'None',8,'One';$p.WriteTimeout=5000;$p.Open();"
+                "try{$p.Write($b,0,$b.Length);Start-Sleep -Milliseconds 200}"
+                "finally{$p.Close()}}"
+                "catch{" + _PS_INNER +
+                "[Console]::Error.WriteLine('serial write failed: '+$e.Message);exit 3}"
             )
+            ps = (ps.replace("__DATA__",
+                             base64.b64encode(raw.encode("utf-8")).decode("ascii"))
+                    .replace("__BAUD__", str(int(baudrate)))
+                    .replace("__DEV__", self._ps_sq(device)))
             cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
-            return self.run(cmd, safe=safe)
-        payload = data + ("\n" if newline else "")
-        dev = shlex.quote(device)
-        return self.run(f"printf %s {shlex.quote(payload)} > {dev}", safe=safe)
+        else:
+            dev = shlex.quote(device)
+            # `> dev` on a missing device would create a plain file there instead
+            cmd = (f"if [ -c {dev} ]; then printf %s {shlex.quote(raw)} > {dev}; "
+                   f"else echo 'serial write failed: '{dev}' is not a serial "
+                   f"device' >&2; exit 2; fi")
+        return self.run(cmd, timeout=60, check=True, safe=safe)
 
     def serial_bridge(self, device: str, *, baudrate: int = 115200,
                       mode: str = "auto", force: bool = False):
@@ -1248,41 +1723,36 @@ class SSHHandler:
         works). Closing the channel ends the bridge and releases the port; the
         PTY teardown also kills the process if the SSH link drops unexpectedly.
 
-        ``force=True`` clears a stale holder of the port first (kills the tracked
-        PID and any other turbossh serial PowerShell — recognised by the tag our
-        serial scripts start with, so no unrelated PowerShell on that machine is
-        touched), then retries — use it only after the user confirms taking a
-        port that's already in use.
+        ``force=True`` clears a stale holder of the port first, then retries:
+        on Windows the tracked PID and any other TurboSSH serial PowerShell
+        holding THIS port (recognised by the port tag its command line starts
+        with, so readers of other ports and unrelated PowerShells are never
+        touched); on Linux / QNX ``fuser -k`` on the device. Use it only after
+        the user confirms taking a port that's already in use.
         """
         self._ensure_connected()
-        is_windows = (mode == "windows" or
-                      (mode == "auto" and device.upper().startswith("COM")))
-        if is_windows:
-            safe = "".join(c for c in device if c.isalnum()) or "port"
-            forceblock = (
-                "Get-CimInstance Win32_Process|Where-Object{"
-                "$_.Name -eq 'powershell.exe' -and $_.ProcessId -ne $PID -and "
-                "$_.CommandLine -like '*__TAG__*'}|ForEach-Object{"
-                "try{Stop-Process -Id $_.ProcessId -Force}catch{}};"
-                "Start-Sleep -Milliseconds 300;"
-            ) if force else ""
+        key = _port_key(device)
+        if self._is_windows_port(device, mode):
+            forceblock = self._PS_KILL_PORT if force else ""
             retries = "15" if force else "3"
             ps = (
                 "$ErrorActionPreference='SilentlyContinue';"
                 "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
                 "$dev='__DEV__';"
-                "$pf=Join-Path $env:TEMP 'turbossh_ser___SAFE__.pid';"
+                "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
                 # always clear our own tracked stale holder for this port
-                "if(Test-Path $pf){$old=Get-Content $pf;"
-                "if($old){$pp=Get-Process -Id ([int]$old) -ErrorAction SilentlyContinue;"
-                "if($pp -and $pp.ProcessName -eq 'powershell'){"
-                "try{Stop-Process -Id ([int]$old) -Force}catch{};Start-Sleep -Milliseconds 200}}};"
+                + _PS_KILL_TRACKED +
                 "__FORCEKILL__"
                 "$p=New-Object System.IO.Ports.SerialPort $dev,__BAUD__,'None',8,'One';"
-                "$p.ReadTimeout=50;$p.WriteTimeout=500;$ok=$false;"
+                "$p.ReadTimeout=50;$p.WriteTimeout=500;$ok=$false;$why=$null;"
                 "for($i=0;$i -lt __RETRIES__;$i++){try{$p.Open();$ok=$true;break}"
-                "catch{Start-Sleep -Milliseconds 350}};"
-                "if(-not $ok){[Console]::Out.Write('BUSY:'+$dev);[Console]::Out.Flush();exit 2};"
+                "catch{" + _PS_INNER + "$why=$e;Start-Sleep -Milliseconds 350}};"
+                # BUSY only when another process holds the port (access denied);
+                # a missing / unplugged port says what is wrong instead
+                "if(-not $ok){if($why -is [System.UnauthorizedAccessException]){"
+                "[Console]::Out.Write('BUSY:'+$dev)}else{[Console]::Out.Write("
+                "'[serial] cannot open '+$dev+': '+$why.Message)};"
+                "[Console]::Out.Flush();exit 2};"
                 "Set-Content -LiteralPath $pf -Value $PID;"
                 # RAW console input: no line buffering, no echo, Ctrl-C as a byte
                 "try{$t=Add-Type -Name TSio -Namespace TS -PassThru -MemberDefinition "
@@ -1302,39 +1772,70 @@ class SSHHandler:
                 "if($n -le 0){break};try{$p.Write($ib,0,$n)}catch{};"
                 "$ar=$in.BeginRead($ib,0,4096,$null,$null)};"
                 "Start-Sleep -Milliseconds 5}}"
-                "finally{try{$p.Close()}catch{};"
-                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue}"
+                "finally{try{$p.Close()}catch{};" + _PS_DROP_OWN_PIDFILE + "}"
             )
             ps = (ps.replace("__FORCEKILL__", forceblock)
                     .replace("__RETRIES__", retries)
-                    .replace("__DEV__", self._ps_sq(device))
                     .replace("__BAUD__", str(int(baudrate)))
-                    .replace("__SAFE__", safe)
-                    .replace("__TAG__", _serial_ps_tag_b64()))
+                    .replace("__KEY__", key)
+                    .replace("__ANYTAG__", _serial_ps_tag_b64())
+                    .replace("__PORTTAG__", _ps_b64(_serial_ps_header(key)))
+                    .replace("__DEVSQ__", self._ps_sq(device))
+                    .replace("__DEV__", self._ps_sq(device)))
             cmd = ("powershell -NoProfile -EncodedCommand "
-                   + self._ps_encode(_SERIAL_PS_TAG + ps))
+                   + self._ps_encode(_serial_ps_header(key) + ps))
         else:
             dev = shlex.quote(device)
+            baud = int(baudrate)
             fk = f"fuser -k {dev} 2>/dev/null; " if force else ""
-            cmd = (f"{fk}"
-                   f"stty -F {dev} {int(baudrate)} raw -echo 2>/dev/null; "
-                   f"cat {dev} & __r=$!; cat > {dev}; kill $__r 2>/dev/null")
-        chan = self.transport.open_session(timeout=self.config.connect_timeout)
-        # PTY -> stdin delivered interactively (input works). Wide so the remote
-        # conpty doesn't hard-wrap the device's output.
-        chan.get_pty(term="xterm", width=250, height=50)
-        chan.exec_command(cmd)
+            # The PTY (needed for interactive input) starts out cooked: it echoed
+            # every keystroke a second time, held input back until Enter, and made
+            # Ctrl-C a SIGINT that killed the bridge. So stdin goes raw as well
+            # (-isig: Ctrl-C is just byte 0x03 for the device). QNX's stty has no
+            # -F; it configures the device given as stdin. The two cats' PIDs are
+            # recorded so serial_release() stops exactly this bridge (it used to
+            # `fuser -k` every process holding the device). The writer reads a
+            # copy of stdin on fd 3: a background job's stdin is /dev/null in a
+            # non-interactive shell. __drop removes the PID file only while it
+            # still names this bridge.
+            cmd = (
+                f"__pf={shlex.quote(self._posix_pidfile(device))}; "
+                + self._posix_kill_tracked() + fk +
+                f"stty -F {dev} {baud} raw -echo 2>/dev/null || "
+                f"stty {baud} raw -echo < {dev} 2>/dev/null; "
+                "stty raw -echo -isig 2>/dev/null || stty raw -echo 2>/dev/null; "
+                "__drop() { [ \"$(cat \"$__pf\" 2>/dev/null)\" = \"$__r $__w\" ] "
+                "&& rm -f \"$__pf\"; }; "
+                "exec 3<&0; "
+                f"cat {dev} & __r=$!; cat <&3 > {dev} & __w=$!; "
+                "echo \"$__r $__w\" > \"$__pf\"; "
+                "trap 'kill $__r $__w 2>/dev/null; __drop; exit' HUP INT TERM; "
+                "wait $__w; kill $__r 2>/dev/null; __drop"
+            )
+        to = self.config.connect_timeout
+        chan = self.transport.open_session(timeout=to)
+        try:
+            # PTY -> stdin delivered interactively (input works). Wide so the
+            # remote conpty doesn't hard-wrap the device's output.
+            self._request(chan, to, chan.get_pty, term="xterm", width=250, height=50)
+            self._request(chan, to, chan.exec_command, cmd)
+        except BaseException:
+            chan.close()
+            raise
         return chan
 
     def serial_in_use(self, device: str, *, mode: str = "auto",
                       safe: Optional[bool] = None) -> bool:
-        """Return True if *device* is currently in use (can't be opened). Used to
-        ask the user before forcibly taking a port that's already busy."""
-        is_windows = (mode == "windows" or
-                      (mode == "auto" and device.upper().startswith("COM")))
-        if is_windows:
-            ps = (f"$p=New-Object System.IO.Ports.SerialPort '{self._ps_sq(device)}',"
-                  "9600;try{$p.Open();$p.Close();'FREE'}catch{'BUSY'}")
+        """Return True if *device* is currently in use (another process holds
+        it). Used to ask the user before forcibly taking a port that's already
+        busy. A missing or unplugged port is not "in use": opening it then
+        reports the real reason."""
+        if self._is_windows_port(device, mode):
+            ps = ("$p=New-Object System.IO.Ports.SerialPort '__DEV__',9600;"
+                  "try{$p.Open();$p.Close();'FREE'}catch{" + _PS_INNER +
+                  "if($e -is [System.UnauthorizedAccessException]){'BUSY'}"
+                  "else{'UNAVAILABLE: '+$e.Message}}"
+                  ).replace("__DEV__", self._ps_sq(device))
             cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
             res = self.run(cmd, timeout=15, safe=False)
         else:
@@ -1342,32 +1843,40 @@ class SSHHandler:
             res = self.run(f"fuser {dev} >/dev/null 2>&1 && echo BUSY || echo FREE",
                            timeout=15, safe=False)
         text = getattr(res, "text", "") or ""
-        return "BUSY" in text
+        return any(line.strip() == "BUSY" for line in text.splitlines())
 
-    def serial_release(self, device: str, *, mode: str = "auto",
+    def serial_release(self, device: str, *, mode: str = "auto", force: bool = False,
                        safe: Optional[bool] = None):
         """
         Forcibly release a serial port opened by :meth:`serial_bridge` — kill the
         bridge process (tracked in a per-port PID file) so the OS frees the port.
         Call this on close: relying on stdin-EOF alone can leave the remote
         PowerShell orphaned (Windows OpenSSH), keeping the port locked.
+
+        Only TurboSSH's own bridge is stopped. ``force=True`` also stops any other
+        holder: on Windows every TurboSSH serial reader of this port, on Linux /
+        QNX every process holding the device (``fuser -k``).
         """
-        is_windows = (mode == "windows" or
-                      (mode == "auto" and device.upper().startswith("COM")))
-        if is_windows:
-            safekey = "".join(c for c in device if c.isalnum()) or "port"
+        key = _port_key(device)
+        if self._is_windows_port(device, mode):
             ps = (
-                "$pf=Join-Path $env:TEMP 'turbossh_ser_" + safekey + ".pid';"
-                "if(Test-Path $pf){$o=Get-Content $pf;if($o){"
-                "$pp=Get-Process -Id ([int]$o) -ErrorAction SilentlyContinue;"
-                "if($pp -and $pp.ProcessName -eq 'powershell'){"
-                "try{Stop-Process -Id ([int]$o) -Force}catch{}}};"
-                "Remove-Item $pf -Force -ErrorAction SilentlyContinue};'released'"
+                "$ErrorActionPreference='SilentlyContinue';"
+                "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
+                + _PS_KILL_TRACKED +
+                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue;"
+                + (self._PS_KILL_PORT if force else "") + "'released'"
             )
+            ps = (ps.replace("__KEY__", key)
+                    .replace("__ANYTAG__", _serial_ps_tag_b64())
+                    .replace("__PORTTAG__", _ps_b64(_serial_ps_header(key)))
+                    .replace("__DEVSQ__", self._ps_sq(device)))
             cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
             return self.run(cmd, timeout=15, safe=safe)
         dev = shlex.quote(device)
-        return self.run(f"fuser -k {dev} 2>/dev/null; true", timeout=15, safe=safe)
+        cmd = (f"__pf={shlex.quote(self._posix_pidfile(device))}; "
+               + self._posix_kill_tracked()
+               + (f"fuser -k {dev} 2>/dev/null; " if force else "") + "echo released")
+        return self.run(cmd, timeout=15, safe=safe)
 
     def remote_serial_ports(self, *, safe: Optional[bool] = None):
         """
@@ -1442,13 +1951,46 @@ class SSHHandler:
     # ------------------------------------------------------------------ #
     # Remote webcam (ffmpeg/dshow on the remote -> MJPEG over SSH)
     # ------------------------------------------------------------------ #
+    def _remote_shell(self) -> str:
+        """The remote Windows OpenSSH default shell: 'powershell' or 'cmd'
+        (cached). bootstrap_sshd_via_winrm(set_powershell_default=True) makes it
+        PowerShell, where cmd.exe syntax ("quoted exe" args, A & B) is a parse
+        error. Anything not positively PowerShell counts as cmd."""
+        if self._shell is None:
+            try:
+                r = self._run("echo $PSHOME", timeout=15, check=False, get_pty=False,
+                              environment=None, encoding="utf-8")
+            except SSHTimeoutError:
+                return "cmd"                       # unknown: don't cache a guess
+            out = (r.stdout or "").strip().lower()
+            self._shell = ("powershell" if r.ok and "powershell" in out
+                           and "$pshome" not in out else "cmd")
+            self._emit(logging.DEBUG, f"Remote default shell: {self._shell}")
+        return self._shell
+
+    def _cmd_line(self, command: str) -> str:
+        """A cmd.exe command line, made to run under the remote default shell.
+
+        A line that starts with a quote gets a harmless first command: handed to
+        ``cmd /c`` as is, cmd strips the first AND the last quote of such a line
+        (``"exe" -i video="Cam"`` became ``exe" -i video="Cam``). Under PowerShell
+        the line goes to ``cmd /s /c`` behind PowerShell's stop-parsing token
+        (``--%``), which passes it on verbatim."""
+        if command.startswith('"'):
+            command = "ver >nul & " + command
+        if self._remote_shell() == "powershell":
+            return f'cmd /s /c --% "{command}"'
+        return command
+
     def list_cameras(self, *, ffmpeg: str = "ffmpeg", safe: Optional[bool] = None):
         """List DirectShow video capture devices on the remote (Windows) host.
         ``ffmpeg`` is the remote ffmpeg path. Returns a list of camera names."""
         def _do():
             self._ensure_connected()
+            exe = str(ffmpeg).replace('"', "")
             # ffmpeg prints the device list to stderr; -list_devices then exits.
-            cmd = (f'"{ffmpeg}" -hide_banner -list_devices true -f dshow -i dummy')
+            cmd = self._cmd_line(f'"{exe}" -hide_banner -list_devices true '
+                                 f'-f dshow -i dummy')
             r = self._run(cmd, timeout=20, check=False, get_pty=False,
                           environment=None, encoding="utf-8")
             return parse_dshow_devices((r.stdout or "") + "\n" + (r.stderr or ""))
@@ -1484,6 +2026,30 @@ class SSHHandler:
                 break
         return None
 
+    def _webcam_kill_cmd(self, *, tokens=(), camera: Optional[str] = None,
+                         marker: Optional[str] = None, report: bool = False) -> str:
+        """An encoded PowerShell (works under either default shell) that stops
+        the remote ffmpeg processes whose command line carries one of *tokens*
+        (streams this handler started), names *camera* (whoever holds it), or
+        whose command line / path contains *marker*. Silent unless *report*: it
+        also runs ahead of an ffmpeg whose stdout is the video."""
+        conds = [f"(TsHas $c '{self._ps_sq(t)}')" for t in tokens]
+        if camera:
+            needle = self._ps_sq('video="%s"' % camera)
+            conds.append(f"(TsHas $c '{needle}')")
+        if marker:
+            m = self._ps_sq(marker)
+            conds.append(f"(TsHas $c '{m}') -or (TsHas $x '{m}')")
+        ps = _PS_FFMPEG_KILL.replace("__COND__", " -or ".join(conds) or "$false")
+        if report:
+            ps += ";'released '+$n"
+        return f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
+
+    def _webcam_kill(self, **what):
+        return self._run(self._webcam_kill_cmd(report=True, **what), timeout=30,
+                         check=False, get_pty=False, environment=None,
+                         encoding="utf-8")
+
     def webcam_channel(self, camera: str, *, ffmpeg: str = "ffmpeg",
                        width: int = 640, height: int = 480, fps: int = 15,
                        quality: int = 6, force: bool = False):
@@ -1491,7 +2057,9 @@ class SSHHandler:
         JPEG frames from with ``.recv()``; close it to stop. The returned channel
         carries a ``_prebuf`` (bytes already read while verifying) that the reader
         must replay first, and ``_ffmpeg_exec`` (the ffmpeg process channel, for
-        stderr/teardown).
+        stderr/teardown). ffmpeg's stderr is read continuously in the background
+        (unread, it stalls the channel after ~2 MB and the picture freezes); its
+        latest ~1.5 KB stay readable with ``recv_stderr`` on the ffmpeg channel.
 
         Transport is **self-selecting and verified**: we try a binary-clean SSH
         direct-tcpip TUNNEL first (ffmpeg serves MJPEG on a loopback TCP port), and
@@ -1502,29 +2070,50 @@ class SSHHandler:
         Capture is in the camera's DEFAULT mode (raw — reliably opens over SSH; a
         specific `-vcodec` gave "Could not set video options" on some cams) and is
         only ever scaled DOWN (`min(iw,W)`, never up; upscaling + full-fps encoding
-        overran the capture buffer). The ffmpeg path carries the ``turbossh_cam``
-        marker so :meth:`webcam_release` / ``force`` can target only our process.
+        overran the capture buffer).
+
+        Every stream carries its own marker, so :meth:`webcam_release` stops only
+        the streams of THIS handler (two Camera tabs on one machine used to kill
+        each other's streams). An ffmpeg this handler left running is cleared
+        first; ``force=True`` also stops any ffmpeg on that machine holding THIS
+        camera (a stuck one from an earlier session).
         """
-        import random
         self._ensure_connected()
         # dshow device names sit inside double quotes (`-i video="Name"`); strip any
         # stray double quote so a crafted name can't break out of the argument.
         camera = str(camera).replace('"', "")
-        marker = "turbossh_cam"
-        transport = self._client.get_transport()
-        # ALWAYS clear a stale ffmpeg first. Closing an SSH exec channel doesn't
-        # kill the (no-PTY) child on Windows, so a previous attempt can leave an
-        # ffmpeg holding the camera -> next open fails "device in use / I/O error".
-        # force=True clears ALL ffmpeg; otherwise only our own (turbossh_cam path).
-        filt = "$_.Name -eq 'ffmpeg.exe'"
-        if not force:
-            filt += (f" -and ($_.CommandLine -like '*{marker}*' "
-                     f"-or $_.ExecutablePath -like '*{marker}*')")
-        forcekill = (
-            'powershell -NoProfile -Command "Get-CimInstance Win32_Process | '
-            f'Where-Object {{ {filt} }} | ForEach-Object {{ try {{ Stop-Process '
-            '-Id $_.ProcessId -Force } catch {} }; '
-            'Start-Sleep -Milliseconds 700" & ')
+        exe = str(ffmpeg).replace('"', "")
+        to = self.config.connect_timeout
+        token = f"turbossh_cam_{os.urandom(5).hex()}"
+        # Clear a stale ffmpeg first: closing an SSH exec channel doesn't kill the
+        # (no-PTY) child on Windows, so an earlier stream can still hold the camera.
+        # The kill runs on the remote right before ffmpeg, in the same command.
+        with self._cam_lock:
+            earlier = list(self._cam_tokens)
+            self._cam_tokens.add(token)
+        first_kill = (self._webcam_kill_cmd(tokens=earlier,
+                                            camera=camera if force else None)
+                      if earlier or force else "")
+        try:
+            return self._webcam_open(camera, exe, token, width, fps, to, first_kill,
+                                     earlier)
+        except BaseException:
+            # the last attempt's ffmpeg is still running: release the camera
+            if self.is_connected:
+                try:
+                    self._webcam_kill(tokens=[token])
+                except Exception:
+                    pass
+            self._forget_cam_tokens([token])
+            raise
+
+    def _forget_cam_tokens(self, tokens) -> None:
+        with self._cam_lock:
+            self._cam_tokens.difference_update(tokens)
+
+    def _webcam_open(self, camera, exe, token, width, fps, to, first_kill, earlier):
+        import random
+        transport = self.transport
         # Pick a SHARP capture mode. The raw default is only 640x480 -> blurry when
         # shown larger. Most webcams expose higher-res MJPEG modes; enumerate them
         # and take the largest MJPEG at/below the requested width, then stream it
@@ -1533,9 +2122,10 @@ class SSHHandler:
         # downscale + light re-encode if the camera has no MJPEG mode.
         chosen = None
         try:
-            lst = self._run(f'"{ffmpeg}" -hide_banner -list_options true -f dshow '
-                            f'-i video="{camera}"', timeout=20, check=False,
-                            get_pty=False, environment=None, encoding="utf-8")
+            lst = self._run(self._cmd_line(f'"{exe}" -hide_banner -list_options true '
+                                           f'-f dshow -i video="{camera}"'),
+                            timeout=20, check=False, get_pty=False, environment=None,
+                            encoding="utf-8")
             mj = [m for m in parse_dshow_modes((lst.stdout or "") + "\n" +
                                                (lst.stderr or "")) if "jpeg" in m["codec"]]
             if mj:
@@ -1544,34 +2134,56 @@ class SSHHandler:
                           else min(mj, key=lambda m: m["w"] * m["h"]))
         except Exception:
             chosen = None
+        # `-metadata comment=<token>` does nothing to an MJPEG stream; it is how
+        # this stream's process is found again (webcam_release / the next start).
         if chosen:
             # use the mode's OWN framerate — dshow needs an exact (size, fps) match,
             # so a reduced -framerate on a 30-only mode fails "could not set options".
             cfps = chosen["fps"] or 30
-            cap_base = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow '
+            cap_base = (f'"{exe}" -hide_banner -loglevel error -f dshow '
                         f'-rtbufsize 100M -vcodec mjpeg '
                         f'-video_size {chosen["w"]}x{chosen["h"]} -framerate {cfps} '
-                        f'-i video="{camera}" -an -c:v copy -f mjpeg ')
+                        f'-i video="{camera}" -an -c:v copy -metadata comment={token} '
+                        f'-f mjpeg ')
         else:
-            cap_base = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow -rtbufsize 200M '
+            cap_base = (f'"{exe}" -hide_banner -loglevel error -f dshow -rtbufsize 200M '
                         f'-i video="{camera}" -an '
                         f"-vf \"scale='min(iw,{int(width)})':-2\" "
-                        f'-r {int(fps)} -f mjpeg -q:v 3 ')
+                        f'-r {int(fps)} -metadata comment={token} -f mjpeg -q:v 3 ')
+
+        kill = [first_kill]
+
+        def start(command):
+            # cmd.exe syntax: the kill (an encoded PowerShell) runs first, then
+            # ffmpeg — on a retry the previous attempt's ffmpeg, which outlives
+            # its channel on Windows and would keep the camera busy
+            prefix = f"{kill[0]} & " if kill[0] else ""
+            kill[0] = self._webcam_kill_cmd(tokens=[token])
+            chan = transport.open_session(timeout=to)
+            try:
+                self._request(chan, to, chan.exec_command,
+                              self._cmd_line(prefix + command))
+            except BaseException:
+                chan.close()
+                raise
+            self._forget_cam_tokens(earlier)      # stopped by the first start
+            _StderrTail(chan)
+            return chan
 
         # --- Transport A: binary-clean direct-tcpip tunnel (verified) ---
         for _ in range(2):
             port = random.randint(20001, 60000)
-            cmd = (forcekill + cap_base +
-                   f'"tcp://127.0.0.1:{port}?listen=1&listen_timeout=30000"')
-            exec_chan = transport.open_session()
-            exec_chan.exec_command(cmd)
+            exec_chan = start(cap_base +
+                              f'"tcp://127.0.0.1:{port}?listen=1&listen_timeout=30000"')
             data_chan = None
-            for _ in range(75):                         # ~15s for ffmpeg to bind
+            bind_until = time.monotonic() + 15           # ~15s for ffmpeg to bind
+            while time.monotonic() < bind_until:
                 if exec_chan.exit_status_ready():
                     break
                 try:
                     data_chan = transport.open_channel(
-                        "direct-tcpip", ("127.0.0.1", port), ("127.0.0.1", 0))
+                        "direct-tcpip", ("127.0.0.1", port), ("127.0.0.1", 0),
+                        timeout=max(1.0, min(to, bind_until - time.monotonic())))
                     break
                 except Exception:
                     time.sleep(0.2)
@@ -1588,8 +2200,7 @@ class SSHHandler:
 
         # --- Transport B: ffmpeg stdout over the exec channel (verified fallback) ---
         for _ in range(2):
-            chan = transport.open_session()
-            chan.exec_command(forcekill + cap_base + '-')   # MJPEG -> stdout
+            chan = start(cap_base + '-')                # MJPEG -> stdout
             prebuf = self._wait_for_jpeg(chan, 7.0)
             if prebuf is not None:
                 chan._prebuf = prebuf                       # exec chan IS the data chan
@@ -1597,12 +2208,6 @@ class SSHHandler:
             try: chan.close()
             except Exception: pass
 
-        # The last attempt's ffmpeg is still running (closing an exec channel
-        # does not kill it on Windows) — release the camera before giving up.
-        try:
-            self.webcam_release(safe=True)
-        except Exception:
-            pass
         raise SSHConnectionError(
             "The remote camera opens, but no video frames came through over SSH "
             "(tried both a forwarded tunnel and stdout). That usually means another "
@@ -1610,18 +2215,30 @@ class SSHHandler:
             "blocking it. Close other camera apps and check Settings -> Privacy -> "
             "Camera -> 'Let desktop apps access your camera'.")
 
-    def webcam_release(self, *, ffmpeg_marker: str = "turbossh_cam",
-                       safe: Optional[bool] = None):
-        """Kill the remote ffmpeg started by :meth:`webcam_channel` (matched by
-        the pushed-ffmpeg path marker) so the camera is released cleanly."""
-        ps = (
-            "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "
-            f"'ffmpeg.exe' -and ($_.CommandLine -like '*{ffmpeg_marker}*' "
-            f"-or $_.ExecutablePath -like '*{ffmpeg_marker}*') }} | "
-            "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} };"
-            "Start-Sleep -Milliseconds 300;'released'")
-        cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
-        return self.run(cmd, timeout=15, safe=safe)
+    def webcam_release(self, *, ffmpeg_marker: Optional[str] = None,
+                       force: bool = False, safe: Optional[bool] = None):
+        """Stop the remote ffmpeg of the streams :meth:`webcam_channel` started
+        on THIS handler, so the camera is released cleanly — and nothing else:
+        each Camera tab has its own handler, and releasing used to kill every
+        TurboSSH camera stream on the machine (the other tabs' too).
+
+        ``force=True`` (or an explicit ``ffmpeg_marker``) is the machine-wide
+        clean-up: every ffmpeg whose path or command line contains the marker
+        (default ``turbossh_cam``, the folder the GUI pushes ffmpeg to)."""
+        def _do():
+            with self._cam_lock:
+                tokens = list(self._cam_tokens)
+            wide = force or ffmpeg_marker is not None
+            if not tokens and not wide:
+                return CommandResult("webcam_release", 0, "released 0\n", "", 0.0,
+                                     host=self.config.host)
+            res = self._webcam_kill(
+                tokens=tokens,
+                marker=(ffmpeg_marker or "turbossh_cam") if wide else None)
+            if res.ok:
+                self._forget_cam_tokens(tokens)
+            return res
+        return self._guard("webcam_release", _do, safe=safe)
 
     def sudo(self, command: str, password: Optional[Union[str, Secret]] = None,
              *, timeout: Optional[float] = None, check: bool = False,
@@ -1670,8 +2287,17 @@ class SSHHandler:
                    height: int = 50, safe: Optional[bool] = None):
         """Open a persistent interactive ShellSession (PTY)."""
         def _do():
-            self._ensure_connected()
-            chan = self._client.invoke_shell(term=term, width=width, height=height)
+            # SSHClient.invoke_shell would wait up to an hour for the channel and
+            # without limit for the PTY / shell replies
+            to = self.config.connect_timeout
+            chan = self.transport.open_session(timeout=to)
+            try:
+                self._request(chan, to, chan.get_pty, term=term, width=width,
+                              height=height)
+                self._request(chan, to, chan.invoke_shell)
+            except BaseException:
+                chan.close()
+                raise
             return ShellSession(chan)
         return self._guard("open_shell", _do, safe=safe)
 
@@ -1684,18 +2310,65 @@ class SSHHandler:
 
         One SFTPClient must not be used from two threads at once — Paramiko can
         hand one thread's reply to the other, which then waits forever. A worker
-        thread should open its own (``handler.client.open_sftp()``) and pass it
-        to :meth:`push` / :meth:`pull` as ``sftp=``.
+        thread should open its own (:meth:`open_sftp`) and pass it to
+        :meth:`push` / :meth:`pull` as ``sftp=``.
+
+        Every request on it is bounded by ``config.sftp_timeout``. A target with
+        no SFTP server raises :class:`SSHTransferError`.
         """
-        self._ensure_connected()
-        with self._conn_lock:
-            if self._sftp is not None:
-                chan = self._sftp.get_channel()
-                if chan is None or chan.closed:
+        for _ in range(3):
+            self._ensure_connected()
+            with self._conn_lock:
+                cur, client = self._sftp, self._client
+                if cur is not None:
+                    chan = cur.get_channel()
+                    if chan is not None and not chan.closed:
+                        return cur
                     self._sftp = None
-            if self._sftp is None:
-                self._sftp = self._client.open_sftp()
-            return self._sftp
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if client is None:
+                continue
+            # opened OUTSIDE the lock: it is several round trips, and holding the
+            # lock blocked connect / disconnect (and every reconnect) meanwhile
+            new = self._new_sftp(client)
+            with self._conn_lock:
+                if self._client is client and self._sftp is None:
+                    self._sftp = new
+                    return new
+            new.close()               # another thread won, or the link was replaced
+        raise SSHNotConnectedError(f"Not connected to {self.config.host}.")
+
+    def open_sftp(self) -> paramiko.SFTPClient:
+        """A NEW SFTP client of the caller's own (close it when done) — for a
+        worker thread; same timeouts and errors as :meth:`sftp`."""
+        return self._new_sftp(self.client)
+
+    def _new_sftp(self, client: paramiko.SSHClient) -> paramiko.SFTPClient:
+        t = client.get_transport()
+        if t is None or not t.is_active():
+            raise SSHNotConnectedError(f"Disconnected from {self.config.host}.")
+        to = self.config.connect_timeout
+        try:
+            chan = t.open_session(timeout=to)
+            try:
+                self._request(chan, to, chan.invoke_subsystem, "sftp")
+                # bounds every SFTP request, the version handshake below included
+                # (Paramiko's default is to wait for ever on a silent link)
+                chan.settimeout(self.config.sftp_timeout or None)
+                return paramiko.SFTPClient(chan)
+            except BaseException:
+                chan.close()
+                raise
+        except SSHError:
+            raise
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            raise SSHTransferError(
+                f"Could not start SFTP on {self.config.host}: {exc or type(exc).__name__}"
+                f" (is an SFTP server enabled on that machine?)") from exc
 
     # How many symlinked folders deep a recursive walk follows. A link loop is
     # normally caught by comparing real paths, but that relies on the server's
@@ -1705,17 +2378,15 @@ class SSHHandler:
     def _entry_kind(self, sftp, entry, path: str):
         """``(kind, is_link)`` for a listdir_attr entry: kind is 'dir' or 'file'
         after following a symlink (one extra stat), or None for a dangling link.
-        Tolerates servers that send no st_mode."""
+        Tolerates servers that send no st_mode, or one above 0xFFFF (QNX)."""
         mode = entry.st_mode
-        is_link = mode is not None and stat.S_ISLNK(mode)
+        is_link = _file_type(mode) == _S_IFLNK
         if is_link:
             try:
                 mode = sftp.stat(path).st_mode
             except IOError:
                 return None, True
-        if mode is None:
-            return "file", is_link
-        return ("dir" if stat.S_ISDIR(mode) else "file"), is_link
+        return ("dir" if _file_type(mode) == _S_IFDIR else "file"), is_link
 
     @staticmethod
     def _real_dir(sftp, path: str) -> str:
@@ -1728,9 +2399,13 @@ class SSHHandler:
     def _rnorm(path: str) -> str:
         return path.replace("\\", "/")
 
+    # A request that timed out is not "no such file" (socket.timeout is an
+    # IOError too): it is raised, so it fails the operation as what it is.
     def _remote_is_dir(self, sftp, path: str) -> bool:
         try:
-            return stat.S_ISDIR(sftp.stat(path).st_mode)
+            return _file_type(sftp.stat(path).st_mode) == _S_IFDIR
+        except socket.timeout:
+            raise
         except IOError:
             return False
 
@@ -1738,6 +2413,8 @@ class SSHHandler:
         try:
             sftp.stat(path)
             return True
+        except socket.timeout:
+            raise
         except IOError:
             return False
 
@@ -1879,6 +2556,10 @@ class SSHHandler:
     # ------------------------------------------------------------------ #
     # Push / Pull (SFTP) with TransferResult
     # ------------------------------------------------------------------ #
+    # A file is transferred under a temporary name next to its target and
+    # renamed over it only once complete: Paramiko truncates the destination
+    # before the first byte moves, so an interrupted push or pull over an
+    # existing file used to destroy the good copy.
     def push(self, local_path: str, remote_path: str, *, recursive: bool = False,
              make_dirs: bool = True, callback=None, sftp=None,
              safe: Optional[bool] = None):
@@ -1886,20 +2567,43 @@ class SSHHandler:
 
         ``callback(bytes_done, bytes_total)`` is called per file as it moves;
         raising from it aborts the transfer. ``sftp`` lets a worker thread use
-        its own SFTP client instead of the shared one (see :meth:`sftp`)."""
+        its own SFTP client instead of the shared one (see :meth:`sftp`). A file
+        that fails or is aborted part-way leaves the remote file as it was."""
         return self._guard("push", self._push, local_path, remote_path,
                            recursive=recursive, make_dirs=make_dirs,
                            callback=callback, sftp=sftp, safe=safe)
+
+    @staticmethod
+    def _part_name(path: str) -> str:
+        return f"{path}.part-{os.urandom(3).hex()}"
+
+    @staticmethod
+    def _remote_remove_quiet(sftp, path: str) -> None:
+        try:
+            sftp.remove(path)
+        except Exception:
+            pass
+
+    def _transfer_failed(self, exc, sftp, shared: bool, what: str):
+        """The SSHTransferError for a failed push / pull. A request that timed out
+        leaves the shared SFTP client mid-conversation, so it is dropped (the
+        next call opens a fresh one)."""
+        if shared and sftp is not None and isinstance(exc, socket.timeout):
+            self._drop_shared_sftp(only=sftp)
+        return SSHTransferError(f"Failed to {what}: {exc or type(exc).__name__}")
 
     def _push(self, local_path, remote_path, *, recursive, make_dirs, callback,
               sftp=None):
         local_path = os.path.expanduser(local_path)
         remote_path = self._rnorm(remote_path)
-        sftp = sftp or self.sftp()
         if not os.path.exists(local_path):
             raise SSHTransferError(f"Local path does not exist: {local_path}")
         start = time.time()
+        shared = sftp is None
         try:
+            # inside the try: a target without an SFTP server, or a link that
+            # dies here, is a transfer error like any other
+            sftp = sftp or self.sftp()
             if os.path.isdir(local_path):
                 if not recursive:
                     raise SSHTransferError(f"{local_path} is a directory; "
@@ -1911,13 +2615,13 @@ class SSHHandler:
                     if parent:
                         self._mkdir_p(sftp, parent)
                 self._emit(logging.INFO, f"PUSH {local_path} -> {remote_path}")
-                sftp.put(local_path, remote_path, callback=callback)
+                self._put_file(sftp, local_path, remote_path, callback)
                 size, count = os.path.getsize(local_path), 1
-        except SSHTransferError:
+        except SSHError:
             raise
-        except (IOError, OSError, paramiko.SSHException) as exc:
-            raise SSHTransferError(f"Failed to push {local_path} -> {remote_path}: "
-                                   f"{exc}") from exc
+        except (IOError, OSError, EOFError, paramiko.SSHException) as exc:
+            raise self._transfer_failed(
+                exc, sftp, shared, f"push {local_path} -> {remote_path}") from exc
         return TransferResult(local_path, remote_path, "push", "sftp", size,
                               time.time() - start, count)
 
@@ -1933,10 +2637,76 @@ class SSHHandler:
                 count += c
             else:
                 self._emit(logging.INFO, f"PUSH {lpath} -> {rpath}")
-                sftp.put(lpath, rpath, callback=callback)
+                self._put_file(sftp, lpath, rpath, callback)
                 total += os.path.getsize(lpath)
                 count += 1
         return total, count
+
+    def _put_file(self, sftp, local, remote, callback) -> None:
+        """Upload *local* to a temporary name next to *remote* and rename it over
+        *remote* once complete, keeping the old file's permissions (an executable
+        stays executable). On failure the temporary is removed and *remote* is
+        left as it was. A symlink is written through, as before (a rename would
+        replace the link itself), and so is a file in a folder we may not create
+        files in."""
+        try:
+            old = sftp.lstat(remote)
+        except IOError:
+            old = None
+        kind = _file_type(old.st_mode) if old is not None else 0
+        if kind == _S_IFLNK:
+            sftp.put(local, remote, callback=callback)
+            return
+        if kind == _S_IFDIR:
+            raise IOError(errno.EISDIR, f"{remote} is a folder")
+        tmp = self._part_name(remote)
+        try:
+            sftp.put(local, tmp, callback=callback)
+        except IOError as exc:
+            self._remote_remove_quiet(sftp, tmp)
+            if old is not None and getattr(exc, "errno", None) == errno.EACCES:
+                self._emit(logging.DEBUG, f"Cannot create files next to {remote}; "
+                                          f"writing it in place.")
+                sftp.put(local, remote, callback=callback)
+                return
+            raise
+        except BaseException:
+            self._remote_remove_quiet(sftp, tmp)
+            raise
+        if old is not None and old.st_mode is not None:
+            try:
+                sftp.chmod(tmp, int(old.st_mode) & 0o7777)
+            except Exception:
+                pass
+        self._remote_replace(sftp, tmp, remote, existed=old is not None)
+
+    def _remote_replace(self, sftp, tmp: str, dst: str, *, existed: bool) -> None:
+        """Rename the finished upload *tmp* over *dst*. posix-rename replaces in
+        one step; it is an OpenSSH extension, and the plain SFTP rename won't
+        overwrite, so without it the old file is removed first."""
+        try:
+            sftp.posix_rename(tmp, dst)
+            return
+        except IOError:
+            pass
+        try:
+            sftp.rename(tmp, dst)
+            return
+        except IOError:
+            if not existed:
+                self._remote_remove_quiet(sftp, tmp)
+                raise
+        try:
+            sftp.remove(dst)
+        except BaseException:
+            self._remote_remove_quiet(sftp, tmp)     # the old file is still intact
+            raise
+        try:
+            sftp.rename(tmp, dst)
+        except IOError as exc:
+            # the old file is gone: keep the complete new copy, and say where
+            raise IOError(f"removed the old {dst} but could not rename the new "
+                          f"copy into place; it is at {tmp} ({exc})") from exc
 
     def pull(self, remote_path: str, local_path: str, *, recursive: bool = False,
              make_dirs: bool = True, callback=None, sftp=None,
@@ -1944,35 +2714,54 @@ class SSHHandler:
         """Download a file or directory (SFTP). Returns TransferResult.
 
         ``callback`` and ``sftp`` work as in :meth:`push`. A file that fails or is
-        aborted part-way is removed rather than left half-written."""
+        aborted part-way leaves no partial file behind and an existing local file
+        as it was. A recursive pull never writes outside *local_path*: remote
+        names that aren't valid here (``a:b``, ``CON``, a trailing dot on
+        Windows) are saved under a safe name, with a warning."""
         return self._guard("pull", self._pull, remote_path, local_path,
                            recursive=recursive, make_dirs=make_dirs,
                            callback=callback, sftp=sftp, safe=safe)
 
+    @staticmethod
+    def _sftp_get(sftp, remote: str, local: str, callback) -> None:
+        if _GET_TAKES_PREFETCH_LIMIT and isinstance(sftp, paramiko.SFTPClient):
+            sftp.get(remote, local, callback=callback,
+                     max_concurrent_prefetch_requests=_SFTP_PREFETCH)
+        else:
+            sftp.get(remote, local, callback=callback)
+
     def _get_file(self, sftp, remote_path, local_path, callback) -> None:
-        """sftp.get that never leaves a partial / empty local file behind."""
-        existed = os.path.exists(local_path)
+        """Download to a temporary name next to *local_path* and move it into
+        place only when complete (keeping the old file's permissions): a failed
+        or aborted download leaves an existing file untouched and no partial
+        file behind. Through a symlink, the file it points to is replaced."""
+        target = (os.path.realpath(local_path) if os.path.islink(local_path)
+                  else local_path)
+        tmp = self._part_name(target)
         try:
-            sftp.get(remote_path, local_path, callback=callback)
-        except BaseException:
-            if not existed and os.path.exists(local_path):
+            self._sftp_get(sftp, remote_path, tmp, callback)
+            if os.path.exists(target):
                 try:
-                    os.remove(local_path)
+                    shutil.copymode(target, tmp)
                 except OSError:
                     pass
+            _replace_local(tmp, target)
+        except BaseException:
+            _quiet_remove(tmp)
             raise
 
     def _pull(self, remote_path, local_path, *, recursive, make_dirs, callback,
               sftp=None):
         remote_path = self._rnorm(remote_path)
         local_path = os.path.expanduser(local_path)
-        sftp = sftp or self.sftp()
         start = time.time()
-        # Verify the remote path exists FIRST, so a missing source never leaves
-        # behind an empty local file (sftp.get opens the local file before fetch).
-        if not self._remote_exists(sftp, remote_path):
-            raise SSHTransferError(f"Remote path does not exist: {remote_path}")
+        shared = sftp is None
         try:
+            sftp = sftp or self.sftp()
+            # Verify the remote path exists FIRST, so a missing source never
+            # leaves anything behind locally.
+            if not self._remote_exists(sftp, remote_path):
+                raise SSHTransferError(f"Remote path does not exist: {remote_path}")
             if self._remote_is_dir(sftp, remote_path):
                 if not recursive:
                     raise SSHTransferError(f"{remote_path} is a directory; "
@@ -1986,26 +2775,60 @@ class SSHHandler:
                 self._emit(logging.INFO, f"PULL {remote_path} -> {local_path}")
                 self._get_file(sftp, remote_path, local_path, callback)
                 size, count = os.path.getsize(local_path), 1
-        except SSHTransferError:
+        except SSHError:
             raise
-        except (IOError, OSError, paramiko.SSHException) as exc:
-            raise SSHTransferError(f"Failed to pull {remote_path} -> {local_path}: "
-                                   f"{exc}") from exc
+        except (IOError, OSError, EOFError, paramiko.SSHException) as exc:
+            raise self._transfer_failed(
+                exc, sftp, shared, f"pull {remote_path} -> {local_path}") from exc
         return TransferResult(remote_path, local_path, "pull", "sftp", size,
                               time.time() - start, count)
 
+    @staticmethod
+    def _inside(root: str, path: str) -> bool:
+        try:
+            common = os.path.commonpath([root, os.path.abspath(path)])
+        except ValueError:                  # another drive
+            return False
+        return os.path.normcase(common) == os.path.normcase(root)
+
+    def _local_names(self, entries, remote_dir: str) -> dict:
+        """{remote name: local name} for one folder listing. A name that isn't
+        valid here gets a safe one (see _safe_local_name) that collides with no
+        other name in the folder."""
+        taken = {os.path.normcase(e.filename) for e in entries}
+        out = {}
+        for e in entries:
+            name = _safe_local_name(e.filename)
+            if name != e.filename:
+                base, n = name, 1
+                while os.path.normcase(name) in taken:
+                    name, n = f"{base}~{n}", n + 1
+                taken.add(os.path.normcase(name))
+                self._emit(logging.WARNING,
+                           f"Saving {posixpath.join(remote_dir, e.filename)!r} as "
+                           f"{name!r}: that name is not valid on this machine.")
+            out[e.filename] = name
+        return out
+
     def _pull_dir(self, sftp, remote_dir, local_dir, callback, _seen=None,
-                  _links=0):
+                  _links=0, _root=None):
         seen = set() if _seen is None else _seen
+        root = _root or os.path.abspath(local_dir)
         real = self._real_dir(sftp, remote_dir)
         if real in seen:                    # a symlink loop: already copied
             return 0, 0
         seen.add(real)
         os.makedirs(local_dir, exist_ok=True)
         total, count = 0, 0
-        for entry in sftp.listdir_attr(remote_dir):
+        entries = sftp.listdir_attr(remote_dir)
+        names = self._local_names(entries, remote_dir)
+        for entry in entries:
             rpath = posixpath.join(remote_dir, entry.filename)
-            lpath = os.path.join(local_dir, entry.filename)
+            lpath = os.path.join(local_dir, names[entry.filename])
+            if not self._inside(root, lpath):     # never write outside the target
+                self._emit(logging.WARNING,
+                           f"Skipping {rpath!r}: it would be written outside {root}")
+                continue
             kind, is_link = self._entry_kind(sftp, entry, rpath)
             if kind is None:
                 self._emit(logging.WARNING, f"Skipping dangling link {rpath}")
@@ -2016,7 +2839,7 @@ class SSHHandler:
                                f"Skipping {rpath}: too many nested symlinked "
                                f"folders (a link loop?)")
                     continue
-                s, c = self._pull_dir(sftp, rpath, lpath, callback, seen, hops)
+                s, c = self._pull_dir(sftp, rpath, lpath, callback, seen, hops, root)
                 total += s
                 count += c
             else:
