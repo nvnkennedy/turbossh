@@ -78,6 +78,13 @@ def parse(argv: Optional[Sequence[str]]):
 def validate(parser: argparse.ArgumentParser, args) -> None:
     if not is_hosted(args) and (args.hide or args.theme or args.camera):
         parser.error("--hide, --theme and --camera need --embed or --control")
+    if args.theme:
+        # here, not when the window is built: by then a hosted run has claimed
+        # stdio, and the error would reach the host as a dead process
+        from .theme import THEME_NAMES          # no Qt in there either
+        if args.theme != "inherit" and args.theme not in THEME_NAMES:
+            parser.error(f"--theme: unknown theme {args.theme!r}; one of "
+                         f"{', '.join(THEME_NAMES)} or inherit")
 
 
 def is_hosted(args) -> bool:

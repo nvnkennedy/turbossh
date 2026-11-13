@@ -1,14 +1,21 @@
 """Persisted app settings (theme, fonts, defaults) in <state dir>/settings.json.
 
-Written atomically; an unreadable file is copied aside (see ``load_problem``)
-rather than silently replaced by defaults on the next save."""
+Written atomically, and merged: ``save`` re-reads the file and writes only the
+keys this process changed, so two TurboSSH processes (the desktop app and one
+hosted in another application, or two windows) never wipe out each other's
+saved machines or jump host. A file that cannot be read is never written over:
+a damaged one only once a copy of it is kept (see ``load_problem``), a locked
+one not at all (see ``save_problem``)."""
 
 from __future__ import annotations
 
 import copy
+import json
+import os
+import time
 
 from .. import paths
-from .._jsonstore import atomic_write_json, read_json
+from .._jsonstore import atomic_write_json, read_json, set_aside
 
 _DIR = paths.state_dir()
 _FILE = paths.state_path("settings.json")
@@ -82,10 +89,15 @@ def set_jump_password(value: str):
 # file on EVERY call — and theme.emoji_icon() calls get() for every icon, so
 # building a menu/ribbon/tab fired a burst of disk reads and made the UI sluggish.
 _cache: dict | None = None
-# Set when settings.json existed but could not be read (it was copied aside), or
-# when the last save failed — so the app can say so instead of failing silently.
+# Set when settings.json existed but could not be read (it was copied aside, or,
+# for a passing lock — the problem's ``transient`` — left as it was), or when the
+# last save failed — so the app can say so instead of failing silently. Either way
+# save() re-reads the file first and never writes the defaults in memory over it.
 load_problem: str | None = None
 save_problem: str | None = None
+# Changes a save could not write yet (the file was locked): written with the next
+# save that can read the file, so nothing the user chose is dropped on the way.
+_unsaved: dict = {}
 
 
 def _read_from_disk() -> dict:
@@ -109,20 +121,97 @@ def load() -> dict:
 
 
 def save(data: dict) -> None:
-    # Start from the CURRENT config (defaults + whatever is already saved), not
-    # bare DEFAULTS — so saving a partial dict (e.g. only the settings a dialog
-    # exposes) preserves keys it didn't touch (compact_ribbon, …).
-    global _cache, save_problem
-    merged = load()
-    merged.update(data)
+    """Change the settings in *data* (a partial dict is fine).
+
+    Only the keys whose value differs from what this process last saw are
+    written, on top of the file as it is NOW. Callers often pass the whole dict
+    back (``cfg = load(); cfg[k] = v; save(cfg)``, the Settings dialog's every
+    field): writing all of it would undo whatever another TurboSSH process saved
+    since this one read the file."""
+    global _cache, save_problem, load_problem
+    seen = load()
+    changed = {key: copy.deepcopy(value) for key, value in data.items()
+               if key not in seen or seen[key] != value}
+    _unsaved.update(changed)
+    on_disk, problem = _read_for_save()
+    if problem is not None:
+        save_problem = problem
+        # the running app stays consistent (a live theme switch still applies)
+        _cache.update(copy.deepcopy(changed))
+        return
+    if on_disk:
+        load_problem = None          # whatever went wrong at start-up, it reads now
+    on_disk.update(copy.deepcopy(_unsaved))
     try:
-        atomic_write_json(_FILE, merged)
-        save_problem = None
+        atomic_write_json(_FILE, on_disk)
     except Exception as exc:
         save_problem = f"settings could not be saved: {exc}"
-    # Keep the in-memory copy authoritative even if the write failed, so the
-    # running app stays consistent (e.g. a live theme switch still takes effect).
+    else:
+        save_problem = None
+        _unsaved.clear()
+    merged = copy.deepcopy(DEFAULTS)
+    merged.update(on_disk)           # what other processes saved meanwhile, too
     _cache = merged
+
+
+def _read_bytes() -> bytes:
+    """The file's bytes, riding out a short-lived lock (an antivirus or indexer
+    holding it, another process saving)."""
+    for attempt in range(3):
+        try:
+            with open(_FILE, "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            raise
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def _read_for_save():
+    """``(the saved settings on disk now, None)``, or ``(None, why the file must
+    not be written over)``. A damaged file is replaced only once its content is
+    kept in a ``.corrupt-*`` copy; one that cannot be read at all (locked by
+    another program, also when start-up could not read it: the defaults in
+    memory then are not what it holds) is left alone."""
+    try:
+        raw = _read_bytes()
+    except FileNotFoundError:
+        return {}, None
+    except OSError as exc:
+        return None, (f"settings.json could not be read ({exc}), so it was not "
+                      f"written over: the change lasts until TurboSSH closes "
+                      f"unless a later save can read it")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):   # UnicodeDecodeError is a ValueError
+        value = None
+    if isinstance(value, dict):
+        return value, None
+    if _kept_aside(raw) or set_aside(_FILE):
+        return {}, None
+    return None, ("settings.json is damaged and could not be copied aside, so it "
+                  "was not written over")
+
+
+def _kept_aside(raw: bytes) -> bool:
+    """Whether a ``.corrupt-*`` copy of exactly this content exists already
+    (start-up made one when it could not read the file): no copy per save."""
+    folder, base = os.path.split(_FILE)
+    try:
+        names = [n for n in os.listdir(folder) if n.startswith(base + ".corrupt-")]
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(folder, name), "rb") as fh:
+                if fh.read() == raw:
+                    return True
+        except OSError:
+            pass
+    return False
 
 
 def reload() -> dict:

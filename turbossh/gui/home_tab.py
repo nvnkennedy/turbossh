@@ -104,7 +104,9 @@ class HomeTab(QWidget):
     def refresh(self):
         """Bring the cards and the saved-session list up to date."""
         self._place_cards()
-        self.sessions.clear()
+        current = self.sessions.currentItem()
+        keep = current.data(Qt.UserRole) if current is not None else None
+        self.sessions.clear()            # rebuilt: keep the user's selection
         for s in self._store.sessions:
             t = s.get("type")
             if t == "serial":
@@ -117,6 +119,8 @@ class HomeTab(QWidget):
             it = QListWidgetItem(f"{icon}   {s.get('name')}    —  {host}   ·  {sub}")
             it.setData(Qt.UserRole, s.get("name"))
             self.sessions.addItem(it)
+            if keep is not None and s.get("name") == keep:
+                self.sessions.setCurrentItem(it)
 
     def _open_item(self, item):
         name = item.data(Qt.UserRole)

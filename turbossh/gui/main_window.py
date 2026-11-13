@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from . import theme, qtutil
 from .. import __version__
 from .log_panel import LogPanel
-from .sessions import SessionStore
+from .sessions import SessionStore, jump_password_for, jump_secret_to_store
 from .session_dialog import SessionDialog
 from .settings_dialog import SettingsDialog
 # NB: session_widgets pulls in paramiko (via ..core) — import it lazily, inside
@@ -117,6 +117,7 @@ class MainWindow(QMainWindow):
     # for an embedding application (see embed.py)
     session_opened = pyqtSignal(object, str)    # page widget, name
     session_closed = pyqtSignal(object)         # page widget
+    current_page_changed = pyqtSignal(object)   # the tab now in front (None: no tab)
     theme_changed = pyqtSignal(str)
     camera_enabled_changed = pyqtSignal(bool)
 
@@ -388,12 +389,19 @@ class MainWindow(QMainWindow):
         self.log_panel.append(f"[..] Installing OpenSSH on {vals['host']} over WinRM "
                               f"(offline upload — this can take a few minutes)…")
         self.statusBar().showMessage(f"Installing OpenSSH on {vals['host']} over WinRM…")
-        self._remote_install = _RemoteInstallThread(vals, openssh_dir)
-        self._remote_install.progress.connect(
-            lambda m: self.log_panel.append(f"    {m}"))
-        self._remote_install.done.connect(
+        thread = _RemoteInstallThread(vals, openssh_dir)
+        thread.progress.connect(lambda m: self.log_panel.append(f"    {m}"))
+        thread.done.connect(
             lambda ok, msg: self._on_remote_install_done(ok, msg, vals["host"]))
-        self._remote_install.start()
+        # every install is held until it ends: a second one used to replace the
+        # only reference to a first still running, and Qt aborts the process
+        # when a running QThread is destroyed
+        if not hasattr(self, "_remote_installs"):
+            self._remote_installs = set()
+        self._remote_installs.add(thread)
+        thread.finished.connect(lambda t=thread: self._remote_installs.discard(t))
+        self._remote_install = thread
+        thread.start()
 
     def _on_remote_install_done(self, ok, msg, host):
         if ok:
@@ -412,6 +420,9 @@ class MainWindow(QMainWindow):
                 f"local admin. If WinRM isn't available, run TurboSSH (or "
                 f"'turbossh-setup') directly on that machine instead.")
 
+    _SSHD_POLL_MS = 2000        # how often the setup's result file is looked for
+    _SSHD_POLLS = 90            # … and for how long (~3 min)
+
     def _setup_ssh_server_local(self):
         """Install + start OpenSSH Server on THIS machine, offline, from the
         bundled package. Self-elevates to Administrator."""
@@ -419,31 +430,37 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "SSH server setup",
                                     "This sets up OpenSSH Server and is Windows-only.")
             return
-        r = QMessageBox.question(
-            self, "Set up SSH server on this PC",
-            "This installs and starts OpenSSH Server on THIS Windows machine "
-            "(offline — from the OpenSSH bundled with TurboSSH, no internet "
-            "needed) and opens the firewall on port 22.\n\n"
-            "Use this on the RDP machine so TurboSSH can reach its COM ports.\n\n"
-            "Windows will prompt for Administrator. Continue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if r != QMessageBox.Yes:
-            return
+        import time
+        if self._sshd_pending():
+            # a second launch used to start a second poll next to the first: the
+            # old one re-showed "SSH server ready" every few seconds for minutes
+            waited = int(time.time() - self._sshd_launch_t)
+            if QMessageBox.question(
+                    self, "Set up SSH server on this PC",
+                    f"The setup started {waited} s ago is still running: TurboSSH "
+                    f"is waiting for its result.\n\nStart it again? Only if you "
+                    f"closed or declined the Administrator prompt.",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+        else:
+            r = QMessageBox.question(
+                self, "Set up SSH server on this PC",
+                "This installs and starts OpenSSH Server on THIS Windows machine "
+                "(offline — from the OpenSSH bundled with TurboSSH, no internet "
+                "needed) and opens the firewall on port 22.\n\n"
+                "Use this on the RDP machine so TurboSSH can reach its COM ports.\n\n"
+                "Windows will prompt for Administrator. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r != QMessageBox.Yes:
+                return
         try:
-            import time
             from ..cli import launch_setup_server, sshd_result_file
             if launch_setup_server():
                 self.log_panel.append("[..] OpenSSH Server setup launched — "
                                       "approve the Administrator prompt.")
                 self.statusBar().showMessage("Setting up OpenSSH Server… "
                                              "(approve the Administrator prompt)")
-                # poll the result file the elevated script writes when it finishes
-                self._sshd_result_path = sshd_result_file()
-                self._sshd_launch_t = time.time()
-                self._sshd_polls = 0
-                self._sshd_timer = QTimer(self)
-                self._sshd_timer.timeout.connect(self._poll_sshd_result)
-                self._sshd_timer.start(2000)
+                self._watch_sshd_setup(sshd_result_file())
             else:
                 QMessageBox.warning(self, "SSH server setup",
                                     "Couldn't launch the setup. Run "
@@ -451,13 +468,35 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "SSH server setup", f"Setup failed: {exc}")
 
+    def _sshd_pending(self) -> bool:
+        timer = getattr(self, "_sshd_timer", None)
+        return timer is not None and timer.isActive()
+
+    def _watch_sshd_setup(self, result_path):
+        """Poll the result file the elevated script writes when it finishes. One
+        poll at a time: the window owns a single timer for it."""
+        import time
+        self._stop_sshd_poll()
+        self._sshd_result_path = result_path
+        self._sshd_launch_t = time.time()
+        self._sshd_polls = 0
+        self._sshd_timer = QTimer(self)
+        self._sshd_timer.timeout.connect(self._poll_sshd_result)
+        self._sshd_timer.start(self._SSHD_POLL_MS)
+
+    def _stop_sshd_poll(self):
+        timer, self._sshd_timer = getattr(self, "_sshd_timer", None), None
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+
     def _poll_sshd_result(self):
         """Watch for the result file the (elevated) setup writes, then report
         the outcome in the GUI. Times out after ~3 minutes."""
         import os as _os
         self._sshd_polls += 1
-        if self._sshd_polls > 90:                      # ~3 min
-            self._sshd_timer.stop()
+        if self._sshd_polls > self._SSHD_POLLS:
+            self._stop_sshd_poll()
             self.statusBar().showMessage("SSH server setup: no result yet — "
                                          "check the setup window.", 8000)
             return
@@ -467,12 +506,14 @@ class MainWindow(QMainWindow):
                 return
             if _os.path.getmtime(path) < self._sshd_launch_t - 2:
                 return                                 # stale result from before
-            with open(path, "r", encoding="utf-8") as fh:
+            # utf-8-sig: Windows PowerShell 5.1 wrote it with a BOM, which made
+            # the first key "﻿status" — success was reported as a failure
+            with open(path, "r", encoding="utf-8-sig") as fh:
                 info = dict(l.strip().split("=", 1) for l in fh
                             if "=" in l)
         except Exception:
             return
-        self._sshd_timer.stop()
+        self._stop_sshd_poll()           # before the modal box: no second report
         ok = info.get("status") == "OK"
         port = info.get("port", "22")
         if ok:
@@ -569,7 +610,7 @@ class MainWindow(QMainWindow):
         from . import settings as _s
         self._compact_ribbon = not self._compact_ribbon
         self._apply_ribbon_density()
-        cfg = _s.load(); cfg["compact_ribbon"] = self._compact_ribbon; _s.save(cfg)
+        _s.save({"compact_ribbon": self._compact_ribbon})
 
     def _ribbon_icon(self, emoji):
         if emoji == "split":
@@ -585,7 +626,7 @@ class MainWindow(QMainWindow):
         """Ribbon one-click theme switch — persists + applies everywhere instantly."""
         from . import settings as _s
         new = theme.counterpart(theme.current_name())
-        cfg = _s.load(); cfg["theme"] = new; _s.save(cfg)
+        _s.save({"theme": new})
         self.apply_theme(new)
         self.log_panel.append(f"[OK] theme switched to {new}")
 
@@ -675,6 +716,8 @@ class MainWindow(QMainWindow):
         self.tabs.setElideMode(Qt.ElideNone)        # show full names (scroll, don't truncate)
         self.tabs.setUsesScrollButtons(True)
         self.tabs.tabBar().setExpanding(False)
+        self._hosting = None             # a page being added: announced once registered
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tabs.tabBar().customContextMenuRequested.connect(self._tab_menu)
@@ -695,15 +738,30 @@ class MainWindow(QMainWindow):
         """Add a session/camera widget either to the tab bar or, when the split
         (tiled) view is active, into the grid — otherwise a session opened while
         split connected but appeared nowhere (self.tabs is detached while tiled)."""
-        if getattr(self, "_tiled", False):
+        tiled = getattr(self, "_tiled", False)
+        before = None if tiled else self.tabs.currentWidget()
+        if tiled:
             self._tiled_items.append((w, title))
             self._build_tiles()
         else:
-            idx = self.tabs.addTab(w, title)
-            if make_current:
-                self.tabs.setCurrentIndex(idx)
+            # The new tab is current before session_opened has registered it (the
+            # first tab is current as soon as it is added): announced then, it was
+            # "no session" for every embedder, and the new one never came.
+            self._hosting = w
+            try:
+                idx = self.tabs.addTab(w, title)
+                if make_current:
+                    self.tabs.setCurrentIndex(idx)
+            finally:
+                self._hosting = None
         self._update_summary()
         self.session_opened.emit(w, name or title)
+        if not tiled and self.tabs.currentWidget() is not before:
+            self.current_page_changed.emit(self.tabs.currentWidget())
+
+    def _on_tab_changed(self, index):
+        if self._hosting is None:        # else _host_session_widget announces it
+            self.current_page_changed.emit(self.tabs.widget(index))
 
     def activate_session_widget(self, w):
         """Bring a session to the front and give it the keyboard."""
@@ -803,6 +861,7 @@ class MainWindow(QMainWindow):
 
     # ---- sessions ----
     def refresh_sessions(self):
+        keep = self._selected_name()    # a rebuild must not lose the user's selection
         self.session_list.clear()
         for s in self.store.sessions:
             t = s.get("type")
@@ -815,6 +874,8 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(f"{icon}  {s.get('name')}   ·  {sub}")
             it.setData(Qt.UserRole, s.get("name"))
             self.session_list.addItem(it)
+            if keep is not None and s.get("name") == keep:
+                self.session_list.setCurrentItem(it)
         self._filter_sessions(self.quick.text())
         self._refresh_home()        # keep the Home tab's session list in sync
 
@@ -859,14 +920,29 @@ class MainWindow(QMainWindow):
         if not s:
             return
         s["name"] = self.store.unique_name(s.get("name", "session") + " (copy)")
-        self.store.save(s, SessionStore.password(name) or "",
-                        SessionStore.jump_password(name) or "")
+        if not self._change_store(
+                "Duplicating the session", self.store.save, s,
+                SessionStore.password(name) or "",
+                jump_secret_to_store(s, SessionStore.jump_password(name) or "")):
+            return
         self.refresh_sessions()
         self.log_panel.append(f"[OK] Duplicated '{name}'")
 
     def _selected_name(self):
         it = self.session_list.currentItem()
         return it.data(Qt.UserRole) if it else None
+
+    def _change_store(self, what, change, *args) -> bool:
+        """Change the saved sessions, or say why it did not happen: sessions.json
+        in use by another program is not written over (SessionStoreError), and a
+        full or read-only disk is no "unexpected error" either."""
+        try:
+            change(*args)
+            return True
+        except OSError as exc:
+            self.log_panel.append(f"[ERROR] {what} failed: {exc}")
+            QMessageBox.warning(self, "Saved sessions", f"{what} failed:\n\n{exc}")
+            return False
 
     def new_session(self, *_, prefill_host=None, prefer_type=None):
         dlg = SessionDialog(self)
@@ -896,7 +972,10 @@ class MainWindow(QMainWindow):
                     return
                 if answer == QMessageBox.No:
                     s["name"] = other
-            self.store.save(s, dlg.password_value(), dlg.jump_password_value())
+            if not self._change_store(
+                    "Saving the session", self.store.save, s, dlg.password_value(),
+                    jump_secret_to_store(s, dlg.jump_password_value())):
+                return
             self.refresh_sessions()
             self.log_panel.append(f"[OK] Saved session '{s['name']}'")
             # select it in the list and auto-connect
@@ -1005,14 +1084,18 @@ class MainWindow(QMainWindow):
                         f"A session named '{s['name']}' already exists — pick "
                         f"another name.")
                     return
-                self.store.rename(name, s["name"])
-            self.store.save(s, dlg.password_value(), dlg.jump_password_value())
+                if not self._change_store("Renaming the session", self.store.rename,
+                                          name, s["name"]):
+                    return
+            self._change_store("Saving the session", self.store.save, s,
+                               dlg.password_value(),
+                               jump_secret_to_store(s, dlg.jump_password_value()))
             self.refresh_sessions()
 
     def delete_session(self):
         name = self._selected_name()
         if name and QMessageBox.question(self, "Delete", f"Delete '{name}'?") == QMessageBox.Yes:
-            self.store.delete(name)
+            self._change_store("Deleting the session", self.store.delete, name)
             self.refresh_sessions()
 
     def open_selected(self):
@@ -1027,8 +1110,9 @@ class MainWindow(QMainWindow):
         s = self.store.get(name)
         if not s:
             return None
+        # its own jump password, else the shared one from Settings
         return self.open_session_config(s, SessionStore.password(name) or "",
-                                        SessionStore.jump_password(name) or "")
+                                        jump_password_for(name, s))
 
     def open_session_config(self, s, pw="", jpw=""):
         """Open a session from its description, saved or not. Returns its page, or
@@ -1276,11 +1360,10 @@ class MainWindow(QMainWindow):
     def stop_background_work(self):
         """Workers this window started must not be destroyed while running, and
         its polling timer must not outlive the window."""
-        for attr in ("_remote_install", "_update_thread"):
-            qtutil.park_thread(getattr(self, attr, None))
-        timer = getattr(self, "_sshd_timer", None)
-        if timer is not None:
-            timer.stop()
+        for thread in list(getattr(self, "_remote_installs", ())) + [
+                getattr(self, "_update_thread", None)]:
+            qtutil.park_thread(thread)
+        self._stop_sshd_poll()
 
     def shut_down(self):
         """Close every session and stop all background work: no questions, no

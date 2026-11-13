@@ -11,10 +11,13 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QTableWidget, QTableWidgetItem, QHeaderView, QWidget,
                              QListWidget, QListWidgetItem, QStackedWidget,
                              QApplication)
+from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QFont
 
 from . import settings as settings_mod
 from . import theme
+
+_LIVE_THEME_MS = 200     # the theme list applies once it rests, not on every step
 
 
 def _wrap(text: str) -> QLabel:
@@ -127,7 +130,14 @@ class SettingsDialog(QDialog):
         w = QWidget(); f = QFormLayout(w)
         self.theme = QComboBox(); self.theme.addItems(theme.THEME_NAMES)
         self.theme.setCurrentText(theme.current_name())
-        self.theme.currentTextChanged.connect(self._apply_theme_live)   # LIVE
+        # LIVE, but arrowing through the list restyled the whole window and
+        # re-drew the log once per step: apply when the choice rests
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.setInterval(_LIVE_THEME_MS)
+        self._theme_timer.timeout.connect(
+            lambda: self._apply_theme_live(self.theme.currentText()))
+        self.theme.currentTextChanged.connect(lambda _name: self._theme_timer.start())
         if self._theme_locked:
             self.theme.setEnabled(False)
             self.theme.setToolTip("Set by the application TurboSSH is embedded in.")
@@ -209,9 +219,16 @@ class SettingsDialog(QDialog):
 
     # ---- live theme: applies AND persists the instant you pick it (so it sticks
     #      without OK, and Cancel doesn't undo it — theme is an immediate setting) ----
+    def done(self, result):
+        # a theme picked just before OK / Cancel still applies (and sticks)
+        if self._theme_timer.isActive():
+            self._theme_timer.stop()
+            self._apply_theme_live(self.theme.currentText())
+        super().done(result)
+
     def _apply_theme_live(self, name):
         # persist immediately so the choice survives Cancel / closing the dialog
-        cfg = settings_mod.load(); cfg["theme"] = name; settings_mod.save(cfg)
+        settings_mod.save({"theme": name})
         if self._win is not None and hasattr(self._win, "apply_theme"):
             try:
                 self._win.apply_theme(name)        # styles + log + icons everywhere
@@ -232,7 +249,14 @@ class SettingsDialog(QDialog):
             self._update_manage_label()
 
     def result_settings(self) -> dict:
-        settings_mod.set_jump_password(self.jpass.text())     # password -> OS vault
+        old, new = settings_mod.jump_password(), self.jpass.text()
+        if old and new != old:
+            # sessions saved before 2.1 kept their own copy of the shared jump
+            # password: a changed (or cleared) one would leave them on the old
+            # password, locking the account after a few tries
+            from .sessions import SessionStore
+            SessionStore().forget_jump_copies(old)
+        settings_mod.set_jump_password(new)     # password -> OS vault
         result = {
             "machines": self._machines,
             "term_font": self.font.currentFont().family(),

@@ -20,6 +20,13 @@ Windows a waiting call keeps answering the window messages the embedded window
 sends to this thread, so calling from your UI thread cannot deadlock the two.
 Events arrive on a background thread: use ``on_event`` callbacks (marshal to
 your UI thread yourself), or ``poll_events()`` from a UI timer.
+
+Two threads read for you. One reads TurboSSH's output and does nothing else: it
+hands every answer to the call waiting for it. The other runs your ``on_event``
+and ``call_async`` callbacks, one at a time, in the order things arrived — so a
+callback may itself ``call()`` or ``wait_for()``: the answer is read meanwhile.
+(Both used to run on the one reader, so a call from a callback waited for an
+answer only it could read, for the whole timeout.)
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ import importlib.util
 import itertools
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -119,9 +127,13 @@ class TurboSSHProcess:
         self._callbacks: List[Callable[[dict], None]] = []
         self._stderr: collections.deque = collections.deque(maxlen=200)
         self.ready: dict = {}
+        # (callback, argument) for the dispatcher, in arrival order; None ends it
+        self._dispatch: queue.Queue = queue.Queue()
         self._stderr_reader = threading.Thread(target=self._drain_stderr,
                                                name="turbossh-stderr", daemon=True)
         self._stderr_reader.start()
+        threading.Thread(target=self._run_callbacks, name="turbossh-callbacks",
+                         daemon=True).start()
         threading.Thread(target=self._read, name="turbossh-events", daemon=True).start()
 
     # ---- starting ----
@@ -191,20 +203,32 @@ class TurboSSHProcess:
             with self._lock:
                 pending = self._pending.pop(message.get("id"), None)
             if pending is not None:
-                pending.message = message
-                pending.done.set()
-                if pending.callback is not None:
-                    self._safe(pending.callback, self._outcome(message))
+                self._answer(pending, message)
         # the process is gone: nobody will answer what is still waiting. Let its
         # last words on stderr arrive first, so errors can quote them.
         self._stderr_reader.join(2.0)
         with self._lock:
             waiting, self._pending = list(self._pending.values()), {}
         for pending in waiting:
-            pending.message = {"ok": False, "error": "TurboSSH has exited",
-                               "type": "Exited"}
-            pending.done.set()
+            self._answer(pending, {"ok": False, "error": "TurboSSH has exited",
+                                   "type": "Exited"})
         self._on_event({"event": "exited"}, final=True)
+        self._dispatch.put(None)
+
+    def _answer(self, pending: "_Pending", message: dict) -> None:
+        pending.message = message
+        pending.done.set()               # a waiting call() returns now
+        if pending.callback is not None:
+            self._dispatch.put((pending.callback, self._outcome(message)))
+
+    def _run_callbacks(self) -> None:
+        """The host's callbacks, one at a time, in order, off the reader thread:
+        a callback that calls TurboSSH waits for an answer the reader delivers."""
+        while True:
+            item = self._dispatch.get()
+            if item is None:
+                return
+            self._safe(*item)
 
     def _drain_stderr(self) -> None:
         for raw in self.process.stderr:
@@ -213,10 +237,10 @@ class TurboSSHProcess:
     def _on_event(self, message: dict, final: bool = False) -> None:
         if final and any(e.get("event") == "exited" for e in list(self._history)[-3:]):
             return                       # it already said so itself
-        self._history.append(message)
+        self._history.append(message)    # here: wait_for() sees it at once
         self._inbox.append(message)
         for callback in list(self._callbacks):
-            self._safe(callback, message)
+            self._dispatch.put((callback, message))
 
     @staticmethod
     def _safe(fn, arg) -> None:
@@ -270,12 +294,14 @@ class TurboSSHProcess:
 
     def call_async(self, cmd: str, callback: Optional[Callable] = None, **args) -> None:
         """Send a request without waiting. ``callback(result_or_TurboSSHError)``
-        runs on the event thread."""
+        runs on the callback thread (with the events, in order); it also runs,
+        with an error, if TurboSSH exits first."""
         self._send(cmd, args, callback)
 
     # ---- events ----
     def on_event(self, callback: Callable[[dict], None]) -> None:
-        """``callback(event_dict)`` for every event, on the event thread."""
+        """``callback(event_dict)`` for every event, on the callback thread: one
+        at a time, in order. It may ``call()`` TurboSSH and ``wait_for()``."""
         self._callbacks.append(callback)
 
     def poll_events(self) -> List[dict]:

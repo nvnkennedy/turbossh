@@ -146,10 +146,10 @@ def _migrate_settings_once():
             return
         cfg = s.load()
         if (cfg.get("term_font") or "") == "Consolas":
-            cfg["term_font"] = "Cascadia Mono"
+            change = {"term_font": "Cascadia Mono"}
             if int(cfg.get("term_font_size") or 10) < 11:
-                cfg["term_font_size"] = 11
-            s.save(cfg)
+                change["term_font_size"] = 11
+            s.save(change)               # only these keys (settings.save merges)
         os.makedirs(_FLAG_DIR, exist_ok=True)
         with open(flag, "w") as fh:
             fh.write("1")

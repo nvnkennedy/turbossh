@@ -91,8 +91,10 @@ python -m turbossh.gui --embed <handle> --control stdio …        (with PyQt5 i
 
 `--hide` takes a comma-separated list of `menu_bar`, `ribbon`, `sidebar`,
 `log_dock`, `status_bar`, `home`. `--theme` takes a theme name or `inherit`.
-`--camera on|off` decides the Camera for the user. The exe ships in the wheel at
-`turbossh/bin/turbossh-gui.exe` (Windows); it needs no Python.
+`--camera on|off` decides the Camera for the user. A wrong option ends it at once
+with exit code 2 and the reason on stderr, before anything is sent on stdout.
+The exe ships in the wheel at `turbossh/bin/turbossh-gui.exe` (Windows); it needs
+no Python.
 
 **The keyboard.** A click inside TurboSSH gives it the keyboard (it joins its
 input to your window's thread, as Windows does for a parent and child window), and
@@ -124,6 +126,10 @@ same id:
 
 Everything else on stdout is an event: `{"event": "<name>", …}`.
 
+Arguments are checked by type: a flag is JSON `true` / `false` (not `"false"`, not
+`0`), and a number is finite and within its range (no `Infinity`, `NaN` or
+`1e999`). Anything else is refused with a `ProtocolError`.
+
 TurboSSH answers every request immediately; what the request does to the window
 happens right after the answer has gone. The one exception is a command whose
 result only exists later — `run` and `confirm_close` — which is answered when it
@@ -136,7 +142,10 @@ delivers *sent* window messages, as .NET's `WaitOne` on an STA thread does and a
 focus changes in it can send messages to your thread.
 
 Session ids are strings (`"s1"`, `"s2"` …), also for tabs the user opens
-themselves.
+themselves. The id an open request answers with is always the one its
+`session_opened` carries, even when several opens are under way at once (one
+waiting on a question to the user, say); an id that ends up with no session gets
+`session_failed` and `session_closed`.
 
 Read stdout continuously (a background reader, as in the examples), not only
 while you wait for an answer. If you fall far behind, TurboSSH drops `log`
@@ -162,7 +171,7 @@ events rather than wait for you; answers and the other events are never dropped.
 | `send` | `session`, and `text` *or* `data_base64` | `{}` — type into the terminal (raw bytes base64-encoded, e.g. `"Aw=="` for Ctrl-C). An SSH / serial session must be connected |
 | `send_line` | `session`, `text` | `{}` — type a line and press Enter |
 | `screen_text` | `session` | `{"text"}` — what the terminal shows now |
-| `run` | `session`, `command`, optional `timeout` (s, default 60) | `{"exit_code", "stdout", "stderr", "duration"}` — runs on the session's SSH connection in a channel of its own (the terminal is not touched); answered when it ends |
+| `run` | `session`, `command`, optional `timeout` (s, default 60, at most 86400) | `{"exit_code", "stdout", "stderr", "duration"}` — runs on the session's SSH connection in a channel of its own (the terminal is not touched); answered when it ends |
 | `activate` | `session` | `{}` — bring the tab forward and give it the keyboard |
 | `close_session` | `session` | `{}` |
 | `focus` | — | `{}` — give TurboSSH the keyboard |
@@ -178,7 +187,13 @@ events rather than wait for you; answers and the other events are never dropped.
 | `action_names` | — | `["session", "local", …]` (see [Action names](#joining-the-hosts-menus-and-toolbars)) |
 | `trigger_action` | `name` | `{}` — as if the ribbon button was clicked |
 | `confirm_close` | — | `true` when nothing is open or the user agreed to close; answered when they have |
-| `shutdown` | optional `wait` (s, default 6) | `{}` — closes every session (waiting up to `wait` for remote ports and cameras to be released) and ends the process |
+| `shutdown` | optional `wait` (s, default 6, 0 to 60) | `{}` — closes every session (waiting up to `wait` for remote ports and cameras to be released, and no longer) and ends the process |
+
+Once TurboSSH has shut down (by `shutdown`, or any of the ways under
+[Ending it](#ending-it)), it answers only `ping`, `shutdown` and the queries
+(`sessions`, `current_session`, `saved_session_names`, `camera_enabled`,
+`current_theme`, `action_names`, `window`); every other request gets a
+`ProtocolError` until the process has ended.
 
 ### Events
 
@@ -190,7 +205,7 @@ events rather than wait for you; answers and the other events are never dropped.
 | `session_disconnected` | `session`, `message` | the link dropped; an SSH tab retries by itself for 30 s |
 | `session_failed` | `session`, `message` | it could not connect, or could not be opened at all |
 | `session_closed` | `session` | the tab is gone, by any route |
-| `current_session_changed` | `session` (or `null`) | the user switched tabs |
+| `current_session_changed` | `session` (or `null`) | another tab came to the front: the user switched tabs, or a new one opened (then right after its `session_opened`) |
 | `log` | `text` | every line of TurboSSH's log |
 | `theme_changed` | `theme` | |
 | `camera_enabled_changed` | `enabled` | |
@@ -201,11 +216,16 @@ events rather than wait for you; answers and the other events are never dropped.
 ### Ending it
 
 Any of these closes every session cleanly (remote COM ports and cameras are
-released) and ends the process with exit code 0:
+released) and ends the process with exit code 0, sending `exited` last:
 
 - the `shutdown` request (wait for the process to exit afterwards);
 - closing TurboSSH's stdin, or your process ending;
-- destroying the window TurboSSH lives in.
+- destroying the window TurboSSH lives in;
+- closing TurboSSH's own window: a `WM_CLOSE` sent to it, or, without `--embed`,
+  the user closing it (who is asked first when sessions are open).
+
+Nothing else ends it. In particular, without `--embed`, closing one of
+TurboSSH's dialogs while its window is hidden (`set_visible`) does not.
 
 ## From Python: `turbossh.embed_client`
 
@@ -229,11 +249,11 @@ gui.close()
 |---|---|
 | `launch(parent=None, *, hide=(), theme=None, camera=None, command=None, env=None, cwd=None, timeout=60)` | Class method, `TurboSSHProcess.launch(…)`: start TurboSSH (in `parent`, or as its own window) and wait for `ready`. `command` overrides how it is started, e.g. `["C:/tools/turbossh-gui.exe"]`. |
 | `call(cmd, *, timeout=30, **args)` | Any command of the table above; returns its result or raises `TurboSSHError` (with `.type`). |
-| `call_async(cmd, callback=None, **args)` | The same without waiting; `callback(result_or_error)` runs on the event thread. |
+| `call_async(cmd, callback=None, **args)` | The same without waiting; `callback(result_or_error)` runs on the callback thread (also, with an error, if TurboSSH exits first). |
 | `connect_ssh`, `open_serial`, `open_serial_over_ssh`, `open_saved`, `open_local_terminal`, `open_camera` | Return the new session's id. |
 | `sessions`, `current_session`, `saved_session_names`, `send`, `send_line`, `screen_text`, `run`, `activate`, `close_session` | As the commands (`send` takes `str` or `bytes`). |
 | `focus`, `set_geometry`, `fill_parent`, `set_visible`, `set_theme`, `set_camera_enabled`, `set_chrome`, `trigger_action`, `show_settings`, `new_session_dialog` | As the commands. |
-| `on_event(callback)` | `callback(event)` for every event, on a background thread. |
+| `on_event(callback)` | `callback(event)` for every event, on the callback thread. |
 | `poll_events()` | The events since the last poll — call it from a UI timer (Tk `after`, a `QTimer` …). |
 | `wait_for(event, session=None, *, timeout=30)` | The first such event, including one that already arrived. |
 | `window`, `version`, `ready`, `is_running`, `stderr_tail()` | TurboSSH's own handle, version, `ready` event, whether it runs, its last stderr lines. |
@@ -242,6 +262,14 @@ gui.close()
 
 Waiting calls keep delivering the window messages the embedded window sends to
 your thread, so they are safe on your UI thread.
+
+**The callback thread.** One background thread only reads TurboSSH's output and
+hands each answer to the call waiting for it; another runs your `on_event` and
+`call_async` callbacks, one at a time and in the order they arrived. So a
+callback may call TurboSSH itself (`call`, `send_line`, `wait_for` …): the answer
+is read meanwhile. A slow callback holds up the callbacks after it, never the
+answers. Marshal to your UI thread from a callback as usual (Tk `after`,
+`QMetaObject.invokeMethod` …), or use `poll_events()` instead.
 
 ## From C# (.NET)
 
@@ -366,7 +394,7 @@ An unknown theme raises `ValueError` straight away.
 |---|---|---|
 | `session_opened` | `EmbeddedSession` | a tab was opened, from code or by the user |
 | `session_closed` | `EmbeddedSession` | a tab went away, by any route |
-| `current_session_changed` | `EmbeddedSession` or `None` | the user switched tabs (`None`: the Home tab) |
+| `current_session_changed` | `EmbeddedSession` or `None` | another tab came to the front: the user switched tabs (`None`: the Home tab), or a new one opened (then right after its `session_opened`) |
 | `log_message` | `str` | every line written to TurboSSH's log, also with the log dock hidden |
 | `theme_changed` | `str` | the theme changed |
 | `camera_enabled_changed` | `bool` | the Camera was shown or hidden |
@@ -393,7 +421,7 @@ Each returns an [`EmbeddedSession`](#embeddedsession) and shows the new tab.
 |---|---|
 | `sessions()` | Every open tab, in the order they were opened. |
 | `current_session()` | The tab the user is working in, or `None`. In split view, the pane with the keyboard focus. |
-| `saved_session_names()` | Names of the sessions saved in TurboSSH, re-read from disk (so sessions saved meanwhile in the desktop app count too; `open_saved` does the same). |
+| `saved_session_names()` | Names of the sessions saved in TurboSSH, re-read from disk when the file has changed (so sessions saved meanwhile in the desktop app count too; `open_saved` does the same). Cheap to poll: the sidebar and Home lists are rebuilt only on a change, and keep the user's selection. |
 
 ### Camera and look
 
@@ -450,7 +478,8 @@ for menu in turbo.menus():
 You do not have to call `shutdown()`. It happens by itself when:
 
 - the application quits (`QApplication.aboutToQuit`; it then waits up to 6 s for
-  remote ports and cameras to be released),
+  remote ports and cameras to be released, unless your last `shutdown(wait=…)`
+  already waited),
 - the widget is deleted: `deleteLater()`, a deleted parent, or the last Python
   reference to its parent dropped,
 - the widget is shown as a window of its own and the user closes it.

@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 import webbrowser
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
 from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QPushButton,
                              QPlainTextEdit, QFileDialog, QComboBox, QLabel)
@@ -20,6 +20,8 @@ _RANK = {"DEBUG": 0, "INFO": 1, "SUCCESS": 1, "OK": 1,
          "WARN": 2, "WARNING": 2, "stderr": 2, "ERROR": 3}
 # the filter choices -> minimum rank shown
 _FILTERS = [("All", 0), ("Info and up", 1), ("Warnings and up", 2), ("Errors only", 3)]
+_TIME_COLOR = "#7a828c"         # the dim timestamp
+_RECOLOR_MS = 150               # theme changes this close together re-draw once
 
 
 class LogPanel(QGroupBox):
@@ -32,6 +34,7 @@ class LogPanel(QGroupBox):
         self.view.setReadOnly(True)
         self.view.setFont(QFont("Cascadia Mono", 9))
         self.view.setMaximumBlockCount(50000)
+        self.view.setUndoRedoEnabled(False)  # a read-only log: no undo copy of every line
 
         self._entries = []          # (rank, level, text) for re-rendering on filter
         self._min_rank = 0
@@ -39,6 +42,13 @@ class LogPanel(QGroupBox):
             self._colors = theme.log_colors(theme.current_name())
         except Exception:
             self._colors = theme.LOG_COLORS
+        self._fmts = None           # char formats for _colors, made when first needed
+        # A theme change re-draws the whole log; stepping through the Settings
+        # theme list (or clicking the ribbon toggle repeatedly) does it once.
+        self._recolor = QTimer(self)
+        self._recolor.setSingleShot(True)
+        self._recolor.setInterval(_RECOLOR_MS)
+        self._recolor.timeout.connect(self._render_all)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Show:"))
@@ -84,15 +94,27 @@ class LogPanel(QGroupBox):
         self.appended.emit(text)
 
     def set_theme(self, name: str):
-        """Re-colour the log for a new app theme (light needs darker hues)."""
+        """Re-colour the log for a new app theme (light needs darker hues). New
+        lines take the colours at once; the lines already shown are re-drawn
+        shortly after, once however many changes come in a row."""
         self._colors = theme.log_colors(name)
-        self._on_filter()                 # re-render all entries with new colours
+        self._fmts = None
+        self._recolor.start()
 
-    def _render(self, level: str, text: str, ts: str = ""):
-        color = self._colors.get(level, self._colors["INFO"])
-        fmt = QTextCharFormat(); fmt.setForeground(QColor(color))
-        tfmt = QTextCharFormat(); tfmt.setForeground(QColor("#7a828c"))   # dim time
-        cur = self.view.textCursor(); cur.movePosition(QTextCursor.End)
+    def _formats(self) -> dict:
+        """One char format per level (and the dim timestamp under None)."""
+        if self._fmts is None:
+            self._fmts = {}
+            for level, color in list(self._colors.items()) + [(None, _TIME_COLOR)]:
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(color))
+                self._fmts[level] = fmt
+        return self._fmts
+
+    @staticmethod
+    def _insert(cur, formats, level: str, text: str, ts: str = ""):
+        fmt = formats.get(level) or formats["INFO"]
+        tfmt = formats[None]
         lines = text.splitlines() or [""]
         pad = " " * (len(ts) + 1) if ts else ""
         for i, line in enumerate(lines):
@@ -104,6 +126,10 @@ class LogPanel(QGroupBox):
                 cur.insertText(ts + " ", tfmt)       # timestamp prefix (first line)
             cur.insertText(line, fmt)
         cur.insertText("\n")
+
+    def _render(self, level: str, text: str, ts: str = ""):
+        cur = self.view.textCursor(); cur.movePosition(QTextCursor.End)
+        self._insert(cur, self._formats(), level, text, ts)
         # follow new lines only if the user is at the bottom — don't yank the
         # view away from something they scrolled up to read
         bar = self.view.verticalScrollBar()
@@ -111,12 +137,37 @@ class LogPanel(QGroupBox):
             self.view.setTextCursor(cur)
             self.view.ensureCursorVisible()
 
+    def _render_all(self):
+        """Re-draw every entry the filter lets through, in one pass: one edit
+        block, with the view not repainting until it is done. Line by line (a
+        layout and a scroll each) a full log took 10 s, on every theme change."""
+        self._recolor.stop()
+        view, bar = self.view, self.view.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        position = bar.value()
+        formats = self._formats()
+        view.setUpdatesEnabled(False)
+        try:
+            view.clear()
+            cur = QTextCursor(view.document())
+            cur.beginEditBlock()
+            try:
+                for rank, level, text, ts in self._entries:
+                    if rank >= self._min_rank:
+                        self._insert(cur, formats, level, text, ts)
+            finally:
+                cur.endEditBlock()
+        finally:
+            view.setUpdatesEnabled(True)
+        if at_bottom:
+            view.moveCursor(QTextCursor.End)
+            view.ensureCursorVisible()
+        else:                            # a re-colour keeps what the user was reading
+            bar.setValue(min(position, bar.maximum()))
+
     def _on_filter(self):
         self._min_rank = self.level_filter.currentData() or 0
-        self.view.clear()
-        for rank, level, text, ts in self._entries:
-            if rank >= self._min_rank:
-                self._render(level, text, ts)
+        self._render_all()
 
     def clear(self):
         self._entries = []

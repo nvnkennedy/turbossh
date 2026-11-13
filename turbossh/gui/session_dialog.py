@@ -281,8 +281,14 @@ class SessionDialog(QDialog):
             self.juser.setText(s.get("jump_user") or "")
         if not self.jdomain.text():
             self.jdomain.setText(s.get("jump_domain") or "")
-        if not self.jpass.text():
-            self.jpass.setText(s.jump_password())
+        # Not the password itself: put in the field, it was saved as this
+        # session's own copy (even with the jump host off), and those copies went
+        # stale when the shared one changed. Empty means "the one in Settings".
+        if s.jump_password():
+            self.jpass.setPlaceholderText("the jump password from Settings")
+            self.jpass.setToolTip("Leave empty to use the jump password from Settings "
+                                  "(it follows when that one changes). Type one only "
+                                  "if this session needs a different one.")
 
     def _browse_key(self):
         import os
@@ -427,8 +433,10 @@ class SessionDialog(QDialog):
                     "and login above — then press Scan remote.")
                 return
             from .session_widgets import config_from_session
-            cfg = config_from_session(self.result_session(),
-                                      self.password_value(), self.jump_password_value())
+            from . import settings as settings_mod
+            cfg = config_from_session(self.result_session(), self.password_value(),
+                                      self.jump_password_value()
+                                      or settings_mod.jump_password())
             self.scan_btn.setEnabled(False)
             self.scan_status.setText("⏳ Scanning the remote machine's serial ports…")
             self._scan = _PortScanThread(cfg)
@@ -529,7 +537,10 @@ class SessionDialog(QDialog):
         self.baud.setCurrentText(str(s.get("baud", 115200)))
         self.ser_via_ssh.setChecked(s.get("via_ssh", False))
         self.password.setText(SessionStore.password(s.get("name", "")) or "")
-        self.jpass.setText(SessionStore.jump_password(s.get("name", "")) or "")
+        from . import settings as settings_mod
+        own = SessionStore.jump_password(s.get("name", "")) or ""
+        # a copy of the shared one is shown as what it is: "use the one in Settings"
+        self.jpass.setText("" if own == settings_mod.jump_password() else own)
 
     def result_session(self) -> dict:
         try:
@@ -570,4 +581,5 @@ class SessionDialog(QDialog):
         return self.password.text()
 
     def jump_password_value(self) -> str:
+        """What was typed for the jump password: "" means the one in Settings."""
         return self.jpass.text()

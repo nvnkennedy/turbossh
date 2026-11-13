@@ -39,13 +39,26 @@ _QUIT_WAIT = 6.0        # seconds a quitting host gives remote ports to be relea
 # its last reference, or deleted a parent, with sessions open.
 _LIVE: Dict[int, "TurboSSHWidget"] = {}
 _hooked_app = None
+# True once the last shutdown has waited for the teardowns as long as its caller
+# chose (``shutdown(wait=…)``, or control.py ending the process): quitting then
+# does not wait another 6 s on top of it.
+_teardowns_waited = False
 
 
 def _shutdown_all() -> None:
     """The application is quitting (a child widget never gets a closeEvent)."""
-    for widget in list(_LIVE.values()):
+    live = list(_LIVE.values())
+    for widget in live:
         widget.shutdown()
-    qtutil.wait_for_teardowns(_QUIT_WAIT)
+    if live or not _teardowns_waited:
+        qtutil.wait_for_teardowns(_QUIT_WAIT)
+
+
+def _quit_wait_done() -> None:
+    """The owner of the process has given the teardowns the time it chose (even
+    none): quitting must not add a wait of its own."""
+    global _teardowns_waited
+    _teardowns_waited = True
 
 
 def _reap(key: int) -> None:
@@ -64,7 +77,11 @@ def _install_crash_guard() -> None:
 
     def report(exc_type, exc, tb):
         text = "".join(traceback.format_exception(exc_type, exc, tb))
-        sys.stderr.write(text)
+        try:                             # None under pythonw or a windowed host
+            if sys.stderr is not None:
+                sys.stderr.write(text)
+        except Exception:
+            pass
         for widget in list(_LIVE.values()):
             try:
                 widget.log_message.emit(f"[ERROR] Unexpected error:\n{text.rstrip()}")
@@ -215,7 +232,7 @@ class TurboSSHWidget(QWidget):
 
         self._win.session_opened.connect(self._on_opened)
         self._win.session_closed.connect(self._on_closed)
-        self._win.tabs.currentChanged.connect(self._on_current_changed)
+        self._win.current_page_changed.connect(self._on_current_changed)
         self._win.log_panel.appended.connect(self.log_message)
         self._win.theme_changed.connect(self.theme_changed)
         self._win.camera_enabled_changed.connect(self.camera_enabled_changed)
@@ -295,10 +312,11 @@ class TurboSSHWidget(QWidget):
         return self._sessions.get(self._win.open_session_named(name))
 
     def _reload_saved(self) -> None:
-        """Re-read sessions.json: the desktop app or another widget may have saved
-        one since this widget was created."""
-        self._win.store.load()
-        self._win.refresh_sessions()
+        """Re-read sessions.json if it changed: the desktop app or another widget
+        may have saved one since this widget was created. Only then: a host
+        polling the names rebuilt the lists each time, losing the selection."""
+        if self._win.store.reload_if_changed():
+            self._win.refresh_sessions()
 
     def open_local_terminal(self) -> EmbeddedSession:
         """Open a shell on this machine in a tab."""
@@ -416,8 +434,10 @@ class TurboSSHWidget(QWidget):
         running. Safe to call twice, and done for you when the application quits
         or the widget is deleted. ``wait`` is how many seconds to block for remote
         ports and cameras to be released — pass some if the process is about to end."""
+        global _teardowns_waited
         if not self._is_shut_down:
             self._is_shut_down = True
+            _teardowns_waited = False    # new teardowns: nobody has waited for them
             _LIVE.pop(id(self), None)
             try:
                 self._win.shut_down()
@@ -431,6 +451,7 @@ class TurboSSHWidget(QWidget):
                 theme_mod.set_active(None)
         if wait > 0:
             qtutil.wait_for_teardowns(wait)
+            _teardowns_waited = True
 
     def _require_running(self) -> None:
         if self._is_shut_down:
@@ -467,5 +488,7 @@ class TurboSSHWidget(QWidget):
             except RuntimeError:         # the host already deleted this widget
                 pass
 
-    def _on_current_changed(self, index: int) -> None:
-        self.current_session_changed.emit(self._sessions.get(self._win.tabs.widget(index)))
+    def _on_current_changed(self, page) -> None:
+        """The tab in front changed (a new tab is announced after session_opened,
+        so it is known here: it used to come out as None)."""
+        self.current_session_changed.emit(self._sessions.get(page))

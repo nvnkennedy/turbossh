@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import inspect
 import json
+import math
 import os
 import queue
 import sys
@@ -36,6 +37,7 @@ from PyQt5.QtGui import QWindow
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from .. import __version__
+from . import embed as embed_mod
 from . import qtutil
 from . import theme as theme_mod
 from .embed import INHERIT_THEME, EmbeddedSession, TurboSSHWidget
@@ -46,10 +48,67 @@ _FOLLOW_MS = 50                 # how often the host's window size is checked
 _BACKLOG = 5000                 # unsent messages before log events are dropped
 _LATER = object()               # a command that answers by itself, later
 _CHROME = tuple(p for p in PARTS if p != "home")
+_QUIT_WAIT = 6.0                # s for remote ports / cameras to be released at the end
+_MAX_WAIT = 60.0                # the most a host may ask for that
+_MAX_RUN = 86400.0              # the longest timeout a `run` may have
+_MAX_PIXELS = 1_000_000         # beyond any screen: set_geometry's bound
+# what a host may still ask once TurboSSH has shut down; the rest is refused (it
+# used to be answered ok, then silently dropped)
+_AFTER_END = frozenset(("ping", "shutdown", "sessions", "current_session",
+                        "saved_session_names", "camera_enabled", "current_theme",
+                        "action_names", "window"))
 
 
 class ProtocolError(Exception):
     """A request that cannot be served (answered with ``ok: false``)."""
+
+
+def _shown(value) -> str:
+    text = json.dumps(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _flag(name: str, value) -> bool:
+    """A real JSON true / false. bool() turned "false" into True: the Camera came
+    on, and "ignore_host_key": "false" would have accepted any host key."""
+    if not isinstance(value, bool):
+        raise ProtocolError(f"{name} must be true or false, not {_shown(value)}")
+    return value
+
+
+def _number(name: str, value, low: float, high: float, whole: bool = False):
+    """A finite number from *low* to *high*. JSON also brings Infinity, NaN and
+    1e999: a wait of Infinity overflowed the join and the process never ended."""
+    ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if ok and isinstance(value, float):
+        ok = math.isfinite(value) and not whole
+    if not ok or not low <= value <= high:
+        kind = "a whole number" if whole else "a number"
+        raise ProtocolError(f"{name} must be {kind} from {low:g} to {high:g}, "
+                            f"not {_shown(value)}")
+    return value
+
+
+_OPEN_FLAGS = ("legacy_algorithms", "ignore_host_key")
+_OPEN_PORTS = ("port", "jump_port")
+_OPEN_TEXT = ("host", "device", "username", "password", "domain", "key_file", "name",
+              "jump_host", "jump_username", "jump_password", "jump_domain")
+
+
+def _check_open(options: dict) -> None:
+    """The arguments of an open request, by type (the opener checks the names)."""
+    for key, value in options.items():
+        if key in _OPEN_FLAGS:
+            _flag(key, value)
+        elif key in _OPEN_PORTS:
+            _number(key, value, 1, 65535, whole=True)
+        elif key == "baudrate":
+            _number(key, value, 1, 100_000_000, whole=True)
+        elif key == "quick_commands":
+            if not isinstance(value, list) or not all(isinstance(c, str) for c in value):
+                raise ProtocolError("quick_commands must be a list of strings")
+        elif key in _OPEN_TEXT and value is not None and not isinstance(value, str):
+            raise ProtocolError(f"{key} must be a string, not {_shown(value)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +366,28 @@ def claim_stdio():
     return proto_in, proto_out
 
 
+def end_process(widget: TurboSSHWidget, wait: float = _QUIT_WAIT) -> None:
+    """Close every session, give remote ports and cameras *wait* seconds to be
+    released, and quit. Quitting then adds no wait of its own: it used to block
+    another 6 s after the host's own wait, with the window unpainted."""
+    try:
+        widget.hide()                # not a frozen, unpainted window while it waits
+    except RuntimeError:
+        pass
+    widget.shutdown(wait=wait)
+    embed_mod._quit_wait_done()
+    QApplication.instance().quit()
+
+
+class _Opening:
+    """The id announced for the next session that opens while this is the
+    innermost request running: an open request's own id, or None (a fresh id)."""
+    __slots__ = ("sid",)
+
+    def __init__(self, sid):
+        self.sid = sid
+
+
 class ControlBridge(QObject):
     """Serves one host over a pair of byte streams (one JSON object per line)."""
 
@@ -325,10 +406,15 @@ class ControlBridge(QObject):
                                         daemon=True)
         self._writer.start()
         self._broken = False
+        self._finished = False
         self._ids = {}               # EmbeddedSession -> id
         self._by_id = {}             # id -> EmbeddedSession
         self._count = 0
-        self._pending = None         # the id the session being opened gets
+        # The requests running now, innermost last. Not one "pending id" slot: an
+        # open that asks a question ("Serial port in use") runs the next requests
+        # in the question's event loop, and those took or cleared that slot — the
+        # session came out under another id, or its id never heard a word.
+        self._frames: list = []
         self._jobs: set = set()
         self._line.connect(self._on_line)
         widget.session_opened.connect(self._on_session_opened)
@@ -398,7 +484,9 @@ class ControlBridge(QObject):
     def _on_line(self, raw: bytes) -> None:
         try:
             request = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+            # RecursionError: nested a few thousand levels deep, which escaped
+            # this handler and left the request without an answer
             self.reply(None, error=ProtocolError(f"not a JSON object: {exc}"))
             return
         if not isinstance(request, dict):
@@ -414,6 +502,9 @@ class ControlBridge(QObject):
         if not isinstance(args, dict):
             self.reply(rid, error=ProtocolError("args must be a JSON object"))
             return
+        if self.ended and name not in _AFTER_END:
+            self.reply(rid, error=ProtocolError(f"{name}: TurboSSH has shut down"))
+            return
         try:
             inspect.signature(handler).bind(rid, **args)
         except TypeError as exc:
@@ -427,16 +518,34 @@ class ControlBridge(QObject):
         if result is not _LATER:
             self.reply(rid, result)
 
-    def _later(self, fn, *args) -> None:
-        """UI work, after the answer has gone (see the module docstring)."""
+    @property
+    def ended(self) -> bool:
+        """Shut down: by a request, the host going away, or our window closing."""
+        return self._finished or self.widget.is_shut_down
+
+    def _later(self, fn, *args, on_skip=None) -> None:
+        """UI work, after the answer has gone (see the module docstring). If
+        TurboSSH has shut down by then, ``on_skip`` answers for it instead."""
         def run():
-            if self.widget.is_shut_down:
+            if self.ended:
+                if on_skip is not None:
+                    on_skip()
                 return
+            frame = _Opening(None)       # a session this opens gets an id of its own
+            self._frames.append(frame)
             try:
                 fn(*args)
             except Exception as exc:      # noqa: BLE001
                 self.send_event("error", text=f"{type(exc).__name__}: {exc}")
+            finally:
+                self._drop(frame)
         QTimer.singleShot(0, run)
+
+    def _drop(self, frame) -> None:
+        for i in range(len(self._frames) - 1, -1, -1):
+            if self._frames[i] is frame:
+                del self._frames[i]
+                return
 
     # ---- sessions ----
     def _new_id(self) -> str:
@@ -455,7 +564,15 @@ class ControlBridge(QObject):
                 "state": session.state}
 
     def _on_session_opened(self, session: EmbeddedSession) -> None:
-        sid, self._pending = self._pending or self._new_id(), None
+        # The innermost running request decides: an open request's own page is
+        # announced while it is innermost (its question, if any, comes before the
+        # page exists); anything opened by other requests run inside that
+        # question's event loop is innermost there itself.
+        frame = self._frames[-1] if self._frames else None
+        if frame is not None and frame.sid is not None:
+            sid, frame.sid = frame.sid, None
+        else:
+            sid = self._new_id()
         self._ids[session], self._by_id[sid] = sid, session
         session.connected.connect(lambda: self.send_event("session_connected", session=sid))
         session.disconnected.connect(
@@ -476,29 +593,37 @@ class ControlBridge(QObject):
         sid = self._new_id()
 
         def run():
-            self._pending = sid
+            frame = _Opening(sid)        # what this opens is announced as sid
+            self._frames.append(frame)
+            reason = "not opened (the user chose not to take over the port)"
             try:
-                session = opener(*args, **kwargs)
+                opener(*args, **kwargs)
             except Exception as exc:      # noqa: BLE001 - reported as an event
-                session = None
                 reason = f"{type(exc).__name__}: {exc}"
-            else:
-                reason = "not opened (the user chose not to take over the port)"
-            if session is None and self._pending == sid:   # nothing opened under it
-                self._pending = None
-                self.send_event("session_failed", session=sid, message=reason)
-                self.send_event("session_closed", session=sid)
-        self._later(run)
+            finally:
+                self._drop(frame)
+            if frame.sid is not None:    # nothing was opened under it
+                self._unopened(sid, reason)
+        self._later(run, on_skip=lambda: self._unopened(sid, "TurboSSH has shut down"))
         return {"session": sid}
+
+    def _unopened(self, sid, reason) -> None:
+        """An id that was answered but ended up with no session: the host hears
+        the end of it, as for any other session."""
+        self.send_event("session_failed", session=sid, message=reason)
+        self.send_event("session_closed", session=sid)
 
     # ---- commands: opening ----
     def cmd_connect_ssh(self, rid, host, **options):
+        _check_open(dict(options, host=host))
         return self._open(self.widget.connect_ssh, host, **options)
 
     def cmd_open_serial(self, rid, device, **options):
+        _check_open(dict(options, device=device))
         return self._open(self.widget.open_serial, device, **options)
 
     def cmd_open_serial_over_ssh(self, rid, device, host, **options):
+        _check_open(dict(options, device=device, host=host))
         return self._open(self.widget.open_serial_over_ssh, device, host, **options)
 
     def cmd_open_saved(self, rid, name):
@@ -564,6 +689,7 @@ class ControlBridge(QObject):
     def cmd_run(self, rid, session, command, timeout=60.0):
         """Run a command over the session's connection (its own channel: the
         terminal is not touched) and answer with its output when it ends."""
+        timeout = _number("timeout", timeout, 0.1, _MAX_RUN)
         handler = self._session(session).handler
         if handler is None or not hasattr(handler, "run"):
             raise ProtocolError(f"session {session!r} has no SSH connection to run on")
@@ -584,7 +710,7 @@ class ControlBridge(QObject):
         return self.widget.camera_enabled()
 
     def cmd_set_camera_enabled(self, rid, enabled):
-        self._later(self.widget.set_camera_enabled, bool(enabled))
+        self._later(self.widget.set_camera_enabled, _flag("enabled", enabled))
         return {}
 
     def cmd_current_theme(self, rid):
@@ -601,7 +727,8 @@ class ControlBridge(QObject):
         unknown = sorted(set(parts) - set(_CHROME))
         if unknown:
             raise ProtocolError(f"unknown part(s) {unknown}; choose from {list(_CHROME)}")
-        self._later(lambda: self.widget.set_chrome(**{k: bool(v) for k, v in parts.items()}))
+        parts = {k: _flag(k, v) for k, v in parts.items()}
+        self._later(lambda: self.widget.set_chrome(**parts))
         return {}
 
     def cmd_action_names(self, rid):
@@ -627,6 +754,9 @@ class ControlBridge(QObject):
 
     def cmd_set_geometry(self, rid, x, y, width, height):
         self._need_embedding()
+        x, y = (_number(n, v, -_MAX_PIXELS, _MAX_PIXELS) for n, v in (("x", x), ("y", y)))
+        width, height = (_number(n, v, 0, _MAX_PIXELS)
+                         for n, v in (("width", width), ("height", height)))
         self._later(self.native.set_geometry, x, y, width, height)
         return {}
 
@@ -640,7 +770,7 @@ class ControlBridge(QObject):
             raise ProtocolError("only when started with --embed")
 
     def cmd_set_visible(self, rid, visible):
-        self._later(self.widget.setVisible, bool(visible))
+        self._later(self.widget.setVisible, _flag("visible", visible))
         return {}
 
     def cmd_window(self, rid):
@@ -660,32 +790,49 @@ class ControlBridge(QObject):
         return {"version": __version__, "protocol": PROTOCOL, "pid": os.getpid()}
 
     def cmd_confirm_close(self, rid):
-        self._later(lambda: self.reply(rid, self.widget.confirm_close()))
+        self._later(lambda: self.reply(rid, self.widget.confirm_close()),
+                    on_skip=lambda: self.reply(rid, error=ProtocolError(
+                        "confirm_close: TurboSSH has shut down")))
         return _LATER
 
-    def cmd_shutdown(self, rid, wait=6.0):
-        self._later(self.finish, float(wait))
+    def cmd_shutdown(self, rid, wait=_QUIT_WAIT):
+        self._later(self.finish, float(_number("wait", wait, 0, _MAX_WAIT)))
         return {}
 
     # ---- the end ----
-    def finish(self, wait: float = 6.0) -> None:
-        """Close everything, say so, and end the process."""
+    def finish(self, wait: float = _QUIT_WAIT) -> None:
+        """Close everything, say so, and end the process — once, whoever asks
+        first: the host's shutdown, its hang-up (noticed by the reader and the
+        writer both), its window going away, or our own window being closed."""
+        if self._finished:
+            return
+        self._finished = True
         qtutil.close_jobs(self._jobs)
-        self.widget.shutdown(wait=wait)
-        QApplication.instance().quit()
+        end_process(self.widget, wait)
+
+    def _say_exited(self) -> None:
+        self.send_event("exited")
 
 
 class _HostedWidget(TurboSSHWidget):
-    """As a window of its own (``--control`` without ``--embed``), closing it asks
-    about open sessions first, like the desktop app."""
+    """TurboSSH's whole window when it is a process of its own for a host.
+
+    As a window of its own (``--control`` without ``--embed``), closing it asks
+    about open sessions first, like the desktop app. Either way, closing it ends
+    the process (``on_close``): embedded, a WM_CLOSE sent to it used to shut the
+    sessions down and leave the process running, empty, answering requests it
+    then dropped."""
     in_native_parent = False
+    on_close = None                      # ends the process (ControlBridge.finish)
 
     def closeEvent(self, event):
         if not self.in_native_parent and not self.is_shut_down \
                 and not self.confirm_close():
             event.ignore()
             return
-        super().closeEvent(event)
+        super().closeEvent(event)        # shuts the sessions down
+        if self.on_close is not None:
+            QTimer.singleShot(0, self.on_close)
 
 
 def _install_error_hook(bridge_ref: list) -> None:
@@ -715,9 +862,25 @@ def run_hosted(args) -> int:
         proto_in, proto_out = claim_stdio()
     qt_args = match_dpi_awareness(args.embed, args.qt_args) if args.embed else args.qt_args
     app = QApplication.instance() or QApplication([sys.argv[0]] + list(qt_args))
+    widget, bridge = build_hosted(args, app, proto_out)
+    if bridge is not None:
+        bridge.start(proto_in)
+    code = app.exec_()
+    if bridge is not None:
+        bridge.flush()
+    return code
+
+
+def build_hosted(args, app, out=None):
+    """Everything run_hosted sets up between the QApplication and its event loop:
+    ``(widget, bridge)``, the bridge (``None`` without *out*) having sent
+    ``ready``. Its reader is not started."""
     app.setApplicationName("TurboSSH")
-    # embedded, closing a dialog must not look like "the last window closed"
-    app.setQuitOnLastWindowClosed(not args.embed)
+    # Hosted, only an explicit end quits: the host's shutdown or hang-up, its
+    # window going away, or our own window closed. Qt's "last window closed" rule
+    # quit (closing every session) after set_visible(false) as soon as any of our
+    # dialogs closed — a question, Settings, confirm_close.
+    app.setQuitOnLastWindowClosed(False)
     try:
         icon = theme_mod.app_icon(args.theme if args.theme in theme_mod.THEME_NAMES
                                   else theme_mod.current_name())
@@ -742,26 +905,28 @@ def run_hosted(args) -> int:
         widget.show()
 
     bridge = None
-    if proto_out is not None:
-        bridge = ControlBridge(widget, proto_out, native)
+    if out is not None:
+        bridge = ControlBridge(widget, out, native)
         bridge_ref.append(bridge)
-        bridge.host_gone.connect(lambda: bridge.finish(6.0))
-        app.aboutToQuit.connect(lambda: bridge.send_event("exited"))
+        bridge.host_gone.connect(bridge.finish)
+        app.aboutToQuit.connect(bridge._say_exited)
+        widget.on_close = bridge.finish
+    else:
+        ended = []
+
+        def end(wait=_QUIT_WAIT):
+            if not ended:
+                ended.append(True)
+                end_process(widget, wait)
+        widget.on_close = end
     if native is not None:
         def parent_closed():
-            if bridge is not None:
+            if bridge is not None and not bridge.ended:
                 bridge.send_event("parent_closed")
-                bridge.finish(6.0)
-            else:
-                widget.shutdown(wait=6.0)
-                app.quit()
+            widget.on_close()
         native.gone.connect(parent_closed)
     if bridge is not None:
         bridge.send_event("ready", protocol=PROTOCOL, version=__version__, pid=os.getpid(),
-                     window=int(widget.winId()),
-                     embedded_in=args.embed or None)
-        bridge.start(proto_in)
-    code = app.exec_()
-    if bridge is not None:
-        bridge.flush()
-    return code
+                          window=int(widget.winId()),
+                          embedded_in=args.embed or None)
+    return widget, bridge

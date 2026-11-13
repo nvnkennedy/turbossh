@@ -41,19 +41,42 @@ def _relaunch_target() -> str:
     return sys.executable
 
 
+# Every check until it ends. The thread has no parent on purpose: one parented to
+# the window was destroyed with it, still running, when the app was closed during
+# a slow check — and Qt aborts the process for that. Held here instead (and parked
+# by the window when it closes), it finishes on its own after the window is gone.
+_RUNNING: set = set()
+
+
 def check_now(window):
     """Manually check for updates (ribbon button). Always reports the result —
     a newer version offers a one-click update, otherwise says you're current."""
-    th = _CheckThread(window)
+    current = getattr(window, "_update_thread", None)
+    try:
+        if current is not None and current.isRunning():
+            return                       # a click while it checks: one answer is enough
+    except RuntimeError:                 # its C++ side is gone: start afresh
+        pass
+    th = _CheckThread()
     th.result.connect(lambda latest: _on_result(window, latest, manual=True))
-    th.finished.connect(lambda: window.statusBar().clearMessage()
-                        if window.statusBar() else None)
+    th.finished.connect(lambda: _clear_status(window))
+    _RUNNING.add(th)
+    th.finished.connect(lambda t=th: _RUNNING.discard(t))
     window._update_thread = th
     try:
         window.statusBar().showMessage("Checking for updates…", 4000)
     except Exception:
         pass
     th.start()
+
+
+def _clear_status(window):
+    try:
+        bar = window.statusBar()
+        if bar is not None:
+            bar.clearMessage()
+    except RuntimeError:                 # the window was closed while it checked
+        pass
 
 
 def _on_result(window, latest: str, manual: bool = False):
