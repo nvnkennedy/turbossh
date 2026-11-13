@@ -284,10 +284,14 @@ def test_setup_and_install_commands_call_the_right_thing(run, monkeypatch):
     monkeypatch.setattr(cli, "prompt_password", lambda prompt: cli.Secret("adminpw"))
     code, out, _ = run("install-ssh-remote", "--host", "10.9.9.9", "--user", "adm",
                        "--domain", "CORP", "--ssh-port", "2200", "--winrm-port",
-                       "5986", target=False)
+                       "5986", "--password", target=False)
     assert code == 0 and "Running" in out
     assert (seen["host"], seen["user"], seen["password"]) == ("10.9.9.9", "adm", "adminpw")
     assert (seen["domain"], seen["ssh_port"], seen["winrm_port"]) == ("CORP", 2200, 5986)
+    # without --password, TURBOSSH_PASSWORD (set by the fixture) is used, unprompted
+    assert run("install-ssh-remote", "--host", "10.9.9.9", "--user", "adm",
+               target=False)[0] == 0
+    assert seen["password"] == "good"
 
 
 def test_diagnose(run, ssh_server):

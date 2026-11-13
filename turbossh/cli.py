@@ -57,7 +57,9 @@ def _setup_script_path() -> str:
 
 def sshd_result_file() -> str:
     """Where the setup script writes its result (ProgramData = readable by all
-    users, so the GUI can poll it even though setup runs elevated)."""
+    users, so the GUI can poll it even though setup runs elevated). The script
+    only writes it into a folder that Administrators own and only they can
+    change, so a user cannot redirect the elevated write with a planted link."""
     base = os.environ.get("ProgramData", r"C:\ProgramData")
     return os.path.join(base, "turbossh", "sshd-setup-result.txt")
 
@@ -529,6 +531,47 @@ def _build_config(args) -> SSHConfig:
     )
 
 
+def _command_line(words) -> str:
+    """The remote command from a REMAINDER argument. argparse keeps the "--" that
+    ends the options (`turbossh run --host h -- ls -la`), which would otherwise
+    be sent to the remote host as part of the command."""
+    words = list(words or [])
+    if words[:1] == ["--"]:
+        words = words[1:]
+    return " ".join(words).strip()
+
+
+def _tolerant_output() -> None:
+    """Make printing unable to fail on a character the output encoding lacks.
+
+    On Windows a redirected or piped stdout uses the ANSI code page (cp1252), so
+    the first "●" of `systemctl status`, or the U+FFFD a serial port yields for a
+    garbled byte, raised UnicodeEncodeError: `run` lost the command's output and
+    a monitor stopped. Such characters now become "?". The encoding itself is
+    kept, so a program reading our output decodes it exactly as before
+    (PYTHONUTF8=1 or PYTHONIOENCODING=utf-8 give the characters themselves), and
+    an error handler the user chose (anything but the default "strict") stays."""
+    for stream in (sys.stdout, sys.stderr):
+        if getattr(stream, "errors", None) != "strict":
+            continue                    # None (pythonw), or already tolerant
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass                        # a replaced stream without reconfigure()
+
+
+def _expected_failure(exc: BaseException) -> bool:
+    """Errors that are a failed operation, not a bug: they get an ERROR line,
+    not a traceback. paramiko's own exceptions (a banner timeout, a failed key
+    exchange) can escape raw; paramiko is imported lazily, so an exception can
+    only be one of them when paramiko is loaded."""
+    if isinstance(exc, (OSError, ValueError, re.error, EOFError,
+                        subprocess.SubprocessError)):
+        return True
+    ssh_exception = getattr(sys.modules.get("paramiko"), "SSHException", None)
+    return ssh_exception is not None and isinstance(exc, ssh_exception)
+
+
 def _output(args, obj) -> None:
     if args.json:
         if isinstance(obj, (CommandResult, TransferResult)):
@@ -541,6 +584,7 @@ def _output(args, obj) -> None:
 
 def main(argv=None) -> int:
     """CLI entry point. Never ends in a traceback for an expected failure."""
+    _tolerant_output()
     try:
         return _main(argv)
     except KeyboardInterrupt:
@@ -552,9 +596,14 @@ def main(argv=None) -> int:
     except SSHError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except (OSError, ValueError, re.error) as exc:
-        # a bad --match regex, an unwritable --save path, a local file error …
-        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+    except Exception as exc:
+        # a bad --match regex, an unwritable --save path, a local ffmpeg that
+        # hangs, standard input closed under a prompt, a raw paramiko error …
+        if not _expected_failure(exc):
+            raise
+        detail = str(exc) or ("standard input ended" if isinstance(exc, EOFError)
+                              else "no details")
+        print(f"ERROR: {type(exc).__name__}: {detail}", file=sys.stderr)
         return 1
 
 
@@ -649,6 +698,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_inst.add_argument("--domain", default=None)
     p_inst.add_argument("--ssh-port", type=int, default=22)
     p_inst.add_argument("--winrm-port", type=int, default=5985)
+    # the password comes from where every other command takes it (_resolve_password)
+    p_inst.add_argument("--password", action="store_true",
+                        help="prompt for the password (hidden input; also what "
+                             "happens when no other source is given)")
+    p_inst.add_argument("--password-stdin", action="store_true",
+                        help="read the password from standard input (for scripts; "
+                             "TURBOSSH_PASSWORD in the environment also works)")
+    p_inst.add_argument("--use-stored", action="store_true",
+                        help="read the password from the OS credential vault")
+    p_inst.add_argument("--service", default="turbossh",
+                        help="credential-vault namespace")
 
     # --- local port forward (ssh -L) through this connection / jump ---
     p_fwd = sub.add_parser("forward",
@@ -870,7 +930,18 @@ def _main(argv=None) -> int:
     # install-ssh-remote uses WinRM (not SSH) — handle before the SSH connection
     if args.cmd == "install-ssh-remote":
         from .winrm_bootstrap import enable_openssh_via_winrm_offline
-        pw = prompt_password(f"Password for {args.user}@{args.host}: ")
+        login_user = f"{args.domain}\\{args.user}" if args.domain else args.user
+        pw = _resolve_password(args, login_user, args.host)
+        if pw is None:
+            # WinRM needs a password. getpass reads the CONSOLE, not stdin, so a
+            # script with nobody at the keyboard would wait for ever: ask only
+            # when someone can answer.
+            if not (sys.stdin is not None and sys.stdin.isatty()):
+                raise _UsageError(
+                    "no password for the WinRM login: use --password-stdin, "
+                    "TURBOSSH_PASSWORD or --use-stored (there is no terminal to "
+                    "ask on).")
+            pw = prompt_password(f"Password for {login_user}@{args.host}: ")
         openssh_dir = os.path.join(os.path.dirname(_setup_script_path()), "openssh")
         try:
             res = enable_openssh_via_winrm_offline(
@@ -980,7 +1051,7 @@ def _main(argv=None) -> int:
     rc = 0
     with _connect(args) as ssh:
         if args.cmd == "run":
-            cmd = " ".join(args.command).strip()
+            cmd = _command_line(args.command)
             if not cmd:
                 print("No command given.", file=sys.stderr)
                 return 2
@@ -1003,7 +1074,7 @@ def _main(argv=None) -> int:
             _output(args, {"host": args.host, "remote_os": ssh.detect_os(),
                            "connected": ssh.is_connected})
         elif args.cmd == "stream":
-            cmd = " ".join(args.command).strip()
+            cmd = _command_line(args.command)
             if not cmd:
                 print("No command given.", file=sys.stderr)
                 return 2
@@ -1070,7 +1141,7 @@ def _main(argv=None) -> int:
                 except Exception:
                     pass
         elif args.cmd == "sudo":
-            cmd = " ".join(args.command).strip()
+            cmd = _command_line(args.command)
             if not cmd:
                 print("No command given.", file=sys.stderr)
                 return 2

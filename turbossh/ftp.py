@@ -7,12 +7,15 @@ push/pull/listing surface of SSHHandler and returns the same result objects.
 from __future__ import annotations
 
 import os
+import ssl
 import time
+import uuid
 import logging
 from ftplib import FTP, FTP_TLS, error_perm, all_errors
 from typing import Callable, Optional
 
 from . import _logging
+from ._jsonstore import _replace_with_retry
 from .config import FTPConfig
 from .credentials import Secret, mask
 from .results import TransferResult, OperationResult
@@ -25,12 +28,20 @@ class FTPHandler:
     ...                           password="p", use_tls=True)) as ftp:
     ...     ftp.push("local.txt", "remote.txt")
     ...     ftp.pull("remote.txt", "copy.txt")
+
+    With FTPS (``use_tls``) the server's certificate and host name are checked
+    against the system's trusted CAs, or against ``ca_file`` (a PEM bundle, e.g.
+    a lab's own CA). ``verify_tls=False`` turns the check off, for a self-signed
+    lab server only: without it anyone on the path can read the password.
     """
 
     def __init__(self, config: FTPConfig, *,
                  log_callback: Optional[Callable[[str], None]] = None,
-                 logger: Optional[logging.Logger] = None, safe: bool = False):
+                 logger: Optional[logging.Logger] = None, safe: bool = False,
+                 verify_tls: bool = True, ca_file: Optional[str] = None):
         self.config = config
+        self.verify_tls = verify_tls
+        self.ca_file = ca_file
         self._safe_default = safe
         self._log_callback = log_callback
         if logger is None:
@@ -62,11 +73,23 @@ class FTPHandler:
     def connect(self, *, safe=None):
         return self._guard("connect", self._connect, safe=safe)
 
+    def _tls_context(self) -> ssl.SSLContext:
+        # FTP_TLS() without a context uses one that checks neither the
+        # certificate nor the host name: any machine on the path could pose as
+        # the server and take the login
+        if not self.verify_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        cafile = os.path.expanduser(self.ca_file) if self.ca_file else None
+        return ssl.create_default_context(cafile=cafile)
+
     def _connect(self):
         cfg = self.config
         pw = cfg.password.reveal() if isinstance(cfg.password, Secret) else cfg.password
         try:
-            self._ftp = FTP_TLS() if cfg.use_tls else FTP()
+            self._ftp = FTP_TLS(context=self._tls_context()) if cfg.use_tls else FTP()
             self._ftp.encoding = cfg.encoding
             self._ftp.connect(cfg.host, cfg.port, timeout=cfg.timeout)
             self._ftp.login(cfg.username, pw or "")
@@ -75,7 +98,12 @@ class FTPHandler:
             self._ftp.set_pasv(cfg.passive)
             self._emit(logging.INFO, f"Connected to ftp://{cfg.username}@{cfg.host}.")
         except all_errors as exc:
-            raise FTPError(f"FTP connect/login failed for {cfg.host}: {exc}") from exc
+            hint = ""
+            if isinstance(exc, ssl.SSLCertVerificationError):
+                hint = (" (the server's TLS certificate could not be verified: pass "
+                        "ca_file= with the CA that signed it, or verify_tls=False "
+                        "for a self-signed lab server)")
+            raise FTPError(f"FTP connect/login failed for {cfg.host}: {exc}{hint}") from exc
         return self
 
     def disconnect(self):
@@ -167,21 +195,25 @@ class FTPHandler:
                 os.makedirs(parent, exist_ok=True)
             start = time.time()
             self._emit(logging.INFO, f"PULL {remote_path} -> {lp}")
-            existed = os.path.exists(lp)
+            # Into a temporary file next to the target, swapped in only once it
+            # is complete: writing the target itself destroyed the good copy
+            # already there when the transfer broke off part-way (a VPN drop).
+            tmp = os.path.join(parent, f".{os.path.basename(lp)}."
+                                       f"{uuid.uuid4().hex[:8]}.part")
             try:
-                with open(lp, "wb") as fh:
+                with open(tmp, "xb") as fh:
                     def _cb(data):
                         fh.write(data)
                         if callback:
                             callback(len(data))
                     self._require().retrbinary(f"RETR {remote_path}", _cb)
+                _replace_with_retry(tmp, lp)
             except BaseException as exc:
-                # don't leave a partial/empty local file behind on failure
-                if not existed and os.path.exists(lp):
-                    try:
-                        os.remove(lp)
-                    except OSError:
-                        pass
+                # nothing partial is left behind, and the old file is untouched
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
                 if isinstance(exc, all_errors):
                     raise FTPError(f"FTP download failed: {exc}") from exc
                 raise

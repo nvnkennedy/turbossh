@@ -19,6 +19,7 @@ without Kerberos setup.
 
 from __future__ import annotations
 
+import time
 from typing import Callable, Optional
 
 from .credentials import Secret, mask
@@ -44,6 +45,21 @@ def _load_winrm():
 
 class WinRMError(SSHError):
     """A WinRM bootstrap operation failed."""
+
+
+class WinRMTimeoutError(WinRMError):
+    """A remote command did not finish in time and was stopped."""
+
+
+# How long one remote step may run. pywinrm itself waits for ever: its
+# get_command_output() retries the WinRM operation timeout in a loop, so a
+# command that never ends (Add-WindowsCapability with Windows Update blocked, a
+# service stuck starting) blocked the caller for good — the GUI's install thread,
+# or SSHHandler's connect lock during an auto-bootstrap.
+COMMAND_TIMEOUT = 600.0
+# the small steps (probe the architecture, upload one chunk) are quick when
+# anything works at all
+_STEP_TIMEOUT = 120.0
 
 
 def _require_transport_deps(transport: str) -> None:
@@ -115,6 +131,7 @@ def enable_openssh_via_winrm(
     ssh_port: int = 22,
     set_powershell_default: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    command_timeout: float = COMMAND_TIMEOUT,
 ) -> dict:
     """
     Connect over WinRM and enable OpenSSH Server on *host*.
@@ -123,8 +140,12 @@ def enable_openssh_via_winrm(
     is False (only for a self-signed lab listener: without validation an
     attacker on the path can read the administrator credentials).
 
+    The remote script is stopped if it runs longer than ``command_timeout``
+    seconds (Add-WindowsCapability can wait for ever for a blocked Windows Update).
+
     :returns: dict with keys ``ok``, ``status``, ``stdout``, ``stderr``.
-    :raises WinRMError: if pywinrm is missing or the WinRM call fails.
+    :raises WinRMError: if pywinrm is missing or the WinRM call fails
+        (:class:`WinRMTimeoutError` when it ran out of time).
     """
     if _load_winrm() is None:
         raise WinRMError(
@@ -152,7 +173,16 @@ def enable_openssh_via_winrm(
         )
         extra = _SET_PS_DEFAULT if set_powershell_default else ""
         script = _ENABLE_SCRIPT.format(ssh_port=ssh_port, extra=extra)
-        result = session.run_ps(script)
+        result = _run_ps(session, script, command_timeout,
+                         f"Enabling OpenSSH Server on {host}")
+    except WinRMTimeoutError as exc:
+        _log(f"WinRM bootstrap FAILED: {exc}")
+        raise WinRMTimeoutError(
+            f"{exc} Add-WindowsCapability waits for Windows Update (or a "
+            f"capability source), which locked-down networks block; the offline "
+            f"install (turbossh install-ssh-remote) needs neither.") from None
+    except WinRMError:
+        raise
     except Exception as exc:  # pragma: no cover - needs a live host
         raise WinRMError(f"WinRM connection/exec to {host} failed: {exc}") from exc
 
@@ -195,22 +225,83 @@ class _SharedShell:
         self._protocol = session.protocol
         self._shell_id = self._protocol.open_shell()
 
-    def run_ps(self, script: str):
-        """Run a PowerShell script; returns ``(stdout, stderr, status_code)``."""
+    def run_ps(self, script: str, *, timeout: Optional[float] = None,
+               what: str = "The remote command"):
+        """Run a PowerShell script; returns ``(stdout, stderr, status_code)``.
+        With *timeout*, a script still running after that many seconds is
+        stopped and :class:`WinRMTimeoutError` raised (*what* names it)."""
         import base64
         encoded = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
         command_id = self._protocol.run_command(
             self._shell_id, f"powershell -encodedcommand {encoded}")
         try:
-            return self._protocol.get_command_output(self._shell_id, command_id)
+            if timeout is None:
+                return self._protocol.get_command_output(self._shell_id, command_id)
+            return _receive(self._protocol, self._shell_id, command_id,
+                            timeout, what)
         finally:
-            self._protocol.cleanup_command(self._shell_id, command_id)
+            # signals "terminate", which also stops a command we gave up on
+            try:
+                self._protocol.cleanup_command(self._shell_id, command_id)
+            except Exception:
+                pass
 
     def close(self) -> None:
         try:
             self._protocol.close_shell(self._shell_id)
         except Exception:
             pass
+
+
+def _receive(protocol, shell_id, command_id, timeout: float, what: str):
+    """A command's ``(stdout, stderr, status_code)``, given up on after
+    *timeout* seconds. One WinRM Receive waits at most the operation timeout
+    (20 s by default) for output, so the deadline is checked at least that often."""
+    receive = (getattr(protocol, "get_command_output_raw", None)       # pywinrm 0.5
+               or getattr(protocol, "_raw_get_command_output", None))  # 0.4
+    if receive is None:         # no single-Receive call to drive: wait as pywinrm does
+        return protocol.get_command_output(shell_id, command_id)
+    from winrm.exceptions import WinRMOperationTimeoutError
+    deadline = time.monotonic() + timeout
+    out, err = [], []
+    while True:
+        try:
+            stdout, stderr, code, done = receive(shell_id, command_id)
+        except WinRMOperationTimeoutError:
+            stdout, stderr, code, done = b"", b"", -1, False    # still running
+        out.append(stdout)
+        err.append(stderr)
+        if done:
+            return b"".join(out), b"".join(err), code
+        if time.monotonic() >= deadline:
+            raise WinRMTimeoutError(
+                f"{what} did not finish within {timeout:g} s, so it was stopped.")
+
+
+class _Result:
+    """A remote PowerShell call's outcome (the fields of pywinrm's Response)."""
+
+    def __init__(self, std_out: bytes, std_err: bytes, status_code: int):
+        self.std_out, self.std_err, self.status_code = std_out, std_err, status_code
+
+
+def _run_ps(session, script: str, timeout: float, what: str) -> _Result:
+    """``session.run_ps(script)`` with a deadline: the same open shell / run /
+    receive / clean up / close shell, but a script that runs longer than
+    *timeout* seconds is stopped (the shell is closed) and
+    :class:`WinRMTimeoutError` raised instead of waiting for ever."""
+    shell = _SharedShell(session)
+    try:
+        out, err, code = shell.run_ps(script, timeout=timeout, what=what)
+    finally:
+        shell.close()
+    clean = getattr(session, "_clean_error_msg", None)     # CLIXML -> plain text
+    if err and clean is not None:
+        try:
+            err = clean(err)
+        except Exception:
+            pass
+    return _Result(out, err, code)
 
 
 def _smb_copy(host, login, password, local_path, remote_winpath, log) -> bool:
@@ -267,10 +358,11 @@ _DECODE_B64 = (
 
 # PowerShell that installs OpenSSH Server from an already-present ZIP — fully
 # OFFLINE (no Add-WindowsCapability / Windows Update), then repairs host keys,
-# starts the service and opens the firewall. {zip} and {port} are substituted.
+# starts the service and opens the firewall. {zip} (a quoted PowerShell literal,
+# see cli._ps_quote) and {port} are substituted.
 _INSTALL_FROM_ZIP = r"""
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
-$zip = '{zip}'
+$zip = {zip}
 try {{
     $dest = Join-Path $env:ProgramFiles 'OpenSSH'
     # IDEMPOTENT: if sshd is already installed, do NOT re-copy the binaries — they
@@ -335,6 +427,7 @@ def enable_openssh_via_winrm_offline(
     ssh_port: int = 22,
     chunk: int = 2200,
     log: Optional[Callable[[str], None]] = None,
+    command_timeout: float = COMMAND_TIMEOUT,
 ) -> dict:
     """
     Install OpenSSH Server on a remote Windows host **fully offline, over WinRM**,
@@ -346,9 +439,15 @@ def enable_openssh_via_winrm_offline(
     -Win64 / -Win32); the matching one is chosen from the *remote* CPU arch.
     The connecting account must be a local admin on the target, and WinRM
     (5985/5986) must be reachable. Returns ``{ok, status, stdout, stderr}``.
+    The install script is stopped after ``command_timeout`` seconds, each
+    smaller step (a probe, one upload chunk) after at most two minutes;
+    :class:`WinRMTimeoutError` says which one ran out of time.
     """
     import base64
     import os
+    from .cli import _ps_quote
+
+    step = min(command_timeout, _STEP_TIMEOUT)
 
     if _load_winrm() is None:
         raise WinRMError("WinRM bootstrap needs pywinrm: pip install pywinrm")
@@ -371,8 +470,10 @@ def enable_openssh_via_winrm_offline(
             server_cert_validation="validate" if verify_ssl else "ignore")
 
         # pick the ZIP that matches the REMOTE machine's architecture
-        ra = session.run_ps(
-            "[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()")
+        ra = _run_ps(
+            session,
+            "[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()",
+            step, f"Asking {host} for its CPU architecture")
         arch = (ra.std_out or b"").decode("utf-8", "replace").strip()
         name = {"Arm64": "OpenSSH-ARM64.zip", "X64": "OpenSSH-Win64.zip",
                 "X86": "OpenSSH-Win32.zip"}.get(arch, "OpenSSH-Win64.zip")
@@ -382,8 +483,9 @@ def enable_openssh_via_winrm_offline(
         _log(f"WinRM -> {endpoint} as {login}; remote arch {arch or '?'} -> {name}")
 
         # Get the remote TEMP dir + prepare staging.
-        rt = session.run_ps(r"$d=Join-Path $env:TEMP 'turbossh_ossh';"
-                            r"New-Item -ItemType Directory -Force -Path $d|Out-Null;$d")
+        rt = _run_ps(session, r"$d=Join-Path $env:TEMP 'turbossh_ossh';"
+                              r"New-Item -ItemType Directory -Force -Path $d|Out-Null;$d",
+                     step, f"Preparing a staging folder on {host}")
         remote_temp = (rt.std_out or b"").decode("utf-8", "replace").strip().splitlines()
         remote_temp = remote_temp[-1] if remote_temp else r"C:\Windows\Temp\turbossh_ossh"
 
@@ -404,8 +506,9 @@ def enable_openssh_via_winrm_offline(
             chunks = [b64[i:i + chunk] for i in range(0, len(b64), chunk)]
             _log(f"Uploading over WinRM ({len(b64)//1024} KB base64, "
                  f"{len(chunks)} chunks — this is slow; SMB would be faster)…")
-            session.run_ps(r"Set-Content -LiteralPath (Join-Path $env:TEMP "
-                           r"'turbossh_ossh\openssh.b64') -Value '' -NoNewline; 'OK'")
+            _run_ps(session, r"Set-Content -LiteralPath (Join-Path $env:TEMP "
+                             r"'turbossh_ossh\openssh.b64') -Value '' -NoNewline; 'OK'",
+                    step, f"Starting the upload to {host}")
             try:
                 shell = _SharedShell(session)
             except Exception:
@@ -414,10 +517,11 @@ def enable_openssh_via_winrm_offline(
                 for i, c in enumerate(chunks):
                     ps = (r"Add-Content -LiteralPath (Join-Path $env:TEMP "
                           r"'turbossh_ossh\openssh.b64') -Value '" + c + r"' -NoNewline")
+                    what = f"Uploading chunk {i + 1}/{len(chunks)} to {host}"
                     if shell is not None:
-                        _, std_err, status = shell.run_ps(ps)
+                        _, std_err, status = shell.run_ps(ps, timeout=step, what=what)
                     else:
-                        r = session.run_ps(ps)
+                        r = _run_ps(session, ps, step, what)
                         std_err, status = r.std_err, r.status_code
                     if status != 0:
                         raise WinRMError(
@@ -428,14 +532,19 @@ def enable_openssh_via_winrm_offline(
             finally:
                 if shell is not None:
                     shell.close()
-            dr = session.run_ps(_DECODE_B64)
+            dr = _run_ps(session, _DECODE_B64, step,
+                         f"Reassembling the uploaded ZIP on {host}")
             if "OK" not in (dr.std_out or b"").decode("utf-8", "replace"):
                 raise WinRMError("failed to reassemble the uploaded ZIP remotely")
             remote_zip = remote_temp + r"\openssh.zip"
 
         _log("Transfer done — extracting + installing on the remote host…")
-        result = session.run_ps(
-            _INSTALL_FROM_ZIP.format(zip=remote_zip, port=ssh_port))
+        # the path comes from the remote %TEMP%, so it holds the account name:
+        # quoted, or O'Brien's ends the string and breaks the script — after
+        # the whole slow upload
+        result = _run_ps(
+            session, _INSTALL_FROM_ZIP.format(zip=_ps_quote(remote_zip), port=ssh_port),
+            command_timeout, f"Installing OpenSSH Server on {host}")
     except WinRMError:
         raise
     except Exception as exc:

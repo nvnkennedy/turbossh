@@ -87,6 +87,15 @@ output can be piped.
 Expected failures print `ERROR: …` on standard error; they do not end in a
 traceback.
 
+### Output encoding
+
+Output that is redirected to a file or piped is written in the system's code
+page (cp1252 on most Windows PCs), so a program reading it decodes it as usual.
+A character that code page cannot hold, such as the `●` of `systemctl status` or
+the `�` a serial port shows for a garbled byte, is written as `?`; it never stops
+the command. Set `PYTHONUTF8=1` (or `PYTHONIOENCODING=utf-8`) to get UTF-8 with
+every character instead.
+
 ### State folder
 
 Saved sessions, settings and the cached ffmpeg live in `~/.turbossh`. Set
@@ -132,7 +141,9 @@ turbossh run -s lab-qnx --timeout 20 --json pidin info
 ```
 
 Arguments are joined with spaces, as `ssh` does. To keep a command's own quoting
-or to use pipes and `&&`, pass it as one quoted argument. With `--json` the
+or to use pipes and `&&`, pass it as one quoted argument. A `--` before the
+command ends TurboSSH's options and is not sent (`turbossh run --host h -- ls -la`;
+the same goes for `sudo` and `stream`). With `--json` the
 result is `{command, exit_code, stdout, stderr, duration, host, started_at}`.
 A command still running after `--timeout` seconds is stopped and reported as an
 error.
@@ -392,10 +403,16 @@ turbossh setup-server --port 2222
 
 Install OpenSSH Server on *another* Windows machine over WinRM, uploading the
 bundled copy. The account must be a local administrator there, and WinRM must be
-reachable. The password is asked for with a hidden prompt.
+reachable. The password comes from the same places as for every other command
+(see [Credentials](#credentials)): `--use-stored`, `--password`,
+`--password-stdin` or `TURBOSSH_PASSWORD`. With none of them it is asked for with
+a hidden prompt, or, when there is no terminal to ask on (a script, CI), the
+command stops with exit code 2. A remote step that runs for more than ten
+minutes is stopped and reported as an error.
 
 ```bash
 turbossh install-ssh-remote --host 10.0.0.9 --user admin --domain CORP
+echo "$PW" | turbossh install-ssh-remote --host 10.0.0.9 --user admin --password-stdin
 ```
 
 | Option | Meaning |
@@ -405,6 +422,10 @@ turbossh install-ssh-remote --host 10.0.0.9 --user admin --domain CORP
 | `--domain DOMAIN` | Windows domain of that account |
 | `--ssh-port PORT` | the port sshd should listen on, default 22 |
 | `--winrm-port PORT` | WinRM port, default 5985 |
+| `--password` | prompt for the password |
+| `--password-stdin` | read the password from standard input |
+| `--use-stored` | read the password from the OS credential vault |
+| `--service NAME` | credential-vault namespace, default `turbossh` |
 
 ### `turbossh diagnose`
 

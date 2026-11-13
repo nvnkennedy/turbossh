@@ -48,6 +48,10 @@ class SerialHandler:
     ...     s.write_line("help")
     ...     res = s.stream(match="login:", stop_on_match=True,
     ...                    save_to="console.log", on_line=print)
+
+    A write that the port stops taking (flow control holding it off, a stalled
+    USB adapter) raises SerialError after ``write_timeout`` seconds without
+    progress; ``write_timeout=None`` waits for ever, as pyserial does by default.
     """
 
     def __init__(self, port: str, baudrate: int = 115200, *, bytesize: int = 8,
@@ -55,15 +59,19 @@ class SerialHandler:
                  rtscts: bool = False, xonxoff: bool = False,
                  log_callback: Optional[Callable[[str], None]] = None,
                  logger: Optional[logging.Logger] = None, safe: bool = False,
-                 quiet: bool = False):
+                 quiet: bool = False, write_timeout: Optional[float] = 5.0):
         if not _HAS_SERIAL:
             raise SerialError(
                 "pyserial is required for serial support. "
                 "Install it with: pip install pyserial")
         self.port = port
         self.baudrate = baudrate
+        # write_timeout: without one, pyserial's write() blocks until every byte
+        # is out, so a port held off by XOFF/RTS or a wedged adapter froze the
+        # caller (the GUI's UI thread, a test script) with no way out
         self._kw = dict(bytesize=bytesize, parity=parity, stopbits=stopbits,
-                        timeout=timeout, rtscts=rtscts, xonxoff=xonxoff)
+                        timeout=timeout, rtscts=rtscts, xonxoff=xonxoff,
+                        write_timeout=write_timeout)
         self._safe_default = safe
         self._log_callback = log_callback
         self._quiet = quiet
@@ -121,10 +129,30 @@ class SerialHandler:
 
     # --- write ---
     def _write(self, payload: bytes) -> int:
+        ser = self._require()
+        timeout = self._kw.get("write_timeout")
+        # The timeout applies to each write() call. Pieces that take about half
+        # of it at this baud rate (10 bits a byte) mean a slow but moving link
+        # never times out, a stalled one does, and the error can say how much
+        # got out — pyserial's timeout exception does not.
+        step = (max(1, int(self.baudrate / 10 * timeout / 2)) if timeout
+                else max(1, len(payload)))
+        sent = 0
         try:
-            return self._require().write(payload)
+            for i in range(0, len(payload), step):
+                piece = payload[i:i + step]
+                n = ser.write(piece)
+                sent += len(piece) if n is None else n
+                if n is not None and n < len(piece):
+                    break               # the write was cancelled (cancel_write)
+        except serial.SerialTimeoutException as exc:
+            raise SerialError(
+                f"Write to {self.port} timed out after {timeout:g} s: {sent} of "
+                f"{len(payload)} bytes were sent (the port is not taking data: "
+                f"flow control holding it off, or a stalled adapter)") from exc
         except (serial.SerialException, OSError) as exc:
             raise SerialError(f"Write to {self.port} failed: {exc}") from exc
+        return sent
 
     def write(self, data: str, *, safe=None):
         """Write raw text (no newline added)."""

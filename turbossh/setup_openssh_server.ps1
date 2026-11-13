@@ -85,6 +85,45 @@ function Resolve-BundledZip {
     return (Join-Path $PSScriptRoot ("openssh\" + $name))
 }
 
+function Send-EnvironmentChanged {
+    # Tell running programs (Explorer, hence new consoles) that the environment
+    # changed, as SetEnvironmentVariable does. Best effort.
+    try {
+        if (-not ('TurboSsh.EnvNotify' -as [type])) {
+            Add-Type -Namespace TurboSsh -Name EnvNotify -MemberDefinition @'
+[DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wParam,
+    string lParam, uint flags, uint timeout, out UIntPtr result);
+'@
+        }
+        $res = [UIntPtr]::Zero
+        # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG, 5 s
+        [void][TurboSsh.EnvNotify]::SendMessageTimeout([IntPtr]0xffff, 0x1A,
+            [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$res)
+    } catch {}
+}
+
+function Add-MachinePath([string]$Dir) {
+    # Read and write the registry value itself. [Environment]::GetEnvironmentVariable
+    # returns PATH with every %VAR% already expanded and SetEnvironmentVariable
+    # writes it back as REG_SZ: the system PATH lost its REG_EXPAND_SZ type and
+    # entries like %SystemRoot%\system32 or %JAVA_HOME%\bin were frozen for good.
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', $true)
+    if (-not $key) { throw 'cannot open the system environment registry key' }
+    try {
+        $raw = [string]$key.GetValue('Path', '',
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $have = @($raw -split ';' | Where-Object { $_ } |
+                  ForEach-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') })
+        if ($have -contains $Dir.TrimEnd('\')) { return }       # already there
+        $new = if ($raw.Trim()) { $raw.TrimEnd(';') + ';' + $Dir } else { $Dir }
+        $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    }
+    finally { $key.Close() }
+    Send-EnvironmentChanged
+}
+
 # --- 3. Install OpenSSH Server from the ZIP -------------------------------- #
 if ((Test-SshdPresent) -and -not $Force) {
     Write-Host "OpenSSH Server already present (use -Force to reinstall)." -ForegroundColor Green
@@ -137,10 +176,8 @@ else {
     }
 
     # add the install dir to the machine PATH so ssh/sshd are callable
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    if ($machinePath -notlike "*$dest*") {
-        [Environment]::SetEnvironmentVariable('Path', "$machinePath;$dest", 'Machine')
-    }
+    try { Add-MachinePath $dest }
+    catch { Write-Warning "Could not add $dest to the system PATH: $($_.Exception.Message)" }
 }
 
 # --- 4. Repair host keys, (re)start the service, open the firewall --------- #
@@ -235,17 +272,87 @@ $ok = ($svcStatus -eq 'Running' -and $listening)
 
 # Write a small result file the GUI polls (ProgramData is readable by all users,
 # so it works even when this script runs elevated as a different account).
-$resultDir = Join-Path $env:ProgramData 'turbossh'
+#
+# But any user may also CREATE folders in ProgramData: one could make 'turbossh'
+# a junction, or plant a link inside it, and have this elevated script overwrite
+# a file of their choosing. So the result only goes into a folder that is ours:
+# a plain folder (no reparse point), owned by Administrators or SYSTEM, whose
+# entries let nobody else change it. Anything else at that name is renamed aside
+# (renaming moves a link itself, never its target) and the folder is created
+# afresh with that ACL already in place. The file is then replaced, not written
+# through: deleting a planted link deletes the link.
+$script:Admins = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+$script:System = New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'
+$script:Users  = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'
+
+function Test-AdminOnlyFolder([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer) { return $false }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    try { $sd = $item.GetAccessControl() } catch { return $false }   # its owner locked us out
+    $owner = $sd.GetOwner([Security.Principal.SecurityIdentifier])
+    if (-not ($owner.Equals($script:Admins) -or $owner.Equals($script:System))) { return $false }
+    if (-not $sd.AreAccessRulesProtected) { return $false }
+    # write data / append / attributes, delete (child), change permissions, take
+    # ownership, and the generic all / write bits
+    $writeMask = 0x500D0156
+    foreach ($rule in $sd.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference
+        if ($rule.AccessControlType -eq 'Allow' -and ([int64]$rule.FileSystemRights -band $writeMask) -and
+            -not ($sid.Equals($script:Admins) -or $sid.Equals($script:System))) { return $false }
+    }
+    return $true
+}
+
+function Write-SetupResult([string[]]$Lines) {
+    $dir = Join-Path $env:ProgramData 'turbossh'
+    if (-not (Test-AdminOnlyFolder $dir)) {
+        if (Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue) {
+            # an older TurboSSH's folder (Users could add files), or something planted
+            $aside = $dir + '.old-' + (Get-Date -Format 'yyyyMMddHHmmss')
+            Rename-Item -LiteralPath $dir -NewName (Split-Path $aside -Leaf) -Force
+            Write-Host "  Moved the existing $dir aside to $aside." -ForegroundColor Yellow
+        }
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetOwner($script:Admins)
+        $acl.SetAccessRuleProtection($true, $false)
+        $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $none = [Security.AccessControl.PropagationFlags]::None
+        foreach ($entry in @(@($script:Admins, 'FullControl'), @($script:System, 'FullControl'),
+                             @($script:Users, 'ReadAndExecute'))) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                $entry[0], [Security.AccessControl.FileSystemRights]$entry[1], $inherit, $none, 'Allow')))
+        }
+        # created with the ACL in place: there is no moment anyone else can write to it
+        [void][IO.Directory]::CreateDirectory($dir, $acl)
+        # if something else claimed the name in between, CreateDirectory just
+        # returned it: check again rather than trust it
+        if (-not (Test-AdminOnlyFolder $dir)) { throw "$dir is not a folder only Administrators control" }
+    }
+    $file = Join-Path $dir 'sshd-setup-result.txt'
+    if (Test-Path -LiteralPath $file) { [IO.File]::Delete($file) }
+    # CreateNew: never opens (and writes through) something that is already there.
+    # No BOM: the GUI reads the file as plain UTF-8.
+    $stream = New-Object IO.FileStream($file, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try {
+        $writer = New-Object IO.StreamWriter($stream, (New-Object Text.UTF8Encoding($false)))
+        foreach ($line in $Lines) { $writer.WriteLine($line) }
+        $writer.Flush()
+    }
+    finally { $stream.Dispose() }
+}
+
 try {
-    New-Item -ItemType Directory -Path $resultDir -Force | Out-Null
-    @(
+    Write-SetupResult @(
         ("status="    + $(if ($ok) { 'OK' } else { 'FAIL' })),
         ("sshd="      + $svcStatus),
         ("port="      + $Port),
         ("listening=" + $listening),
         ("time="      + (Get-Date -Format s))
-    ) | Set-Content -Path (Join-Path $resultDir 'sshd-setup-result.txt') -Encoding UTF8
-} catch {}
+    )
+} catch {
+    Write-Warning "Could not write the result file for the GUI: $($_.Exception.Message)"
+}
 
 if ($ok) {
     Write-Host "`nDone. This machine now accepts SSH on port $Port." -ForegroundColor Green
