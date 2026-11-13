@@ -188,6 +188,20 @@ def _set_flag(table, sftp) -> None:
 # --------------------------------------------------------------------------- #
 # What is at the target
 # --------------------------------------------------------------------------- #
+S_IFLNK = _S_IFLNK
+
+
+def stat_or_none(sftp, path: str):
+    """``sftp.stat(path)`` (links followed), or None if nothing is there; a
+    timeout is raised, not taken for "nothing"."""
+    try:
+        return sftp.stat(path)
+    except socket.timeout:
+        raise
+    except IOError:
+        return None
+
+
 def resolve(sftp, path: str):
     """``(path, attr)``: *path* with a symbolic link resolved by the server
     (realpath — a lexical join got ``..`` wrong in symlinked folders), and the
@@ -207,7 +221,7 @@ def resolve(sftp, path: str):
         real_attr = sftp.lstat(real)
     except socket.timeout:
         raise
-    except IOError:
+    except (IOError, paramiko.SFTPError):    # no realpath, or a strange answer
         return path, attr
     if file_type(getattr(real_attr, "st_mode", None)) == _S_IFLNK:
         return path, attr

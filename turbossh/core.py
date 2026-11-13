@@ -1019,6 +1019,7 @@ class SSHHandler:
                 verify_ssl=cfg.winrm_verify_ssl,
                 transport=cfg.winrm_transport, ssh_port=cfg.port,
                 log=lambda m: self._emit(logging.INFO, m),
+                **self._winrm_timeout(),
             )
             for _ in range(10):
                 if self._port_open(cfg.host, cfg.port, 2.0):
@@ -1172,6 +1173,11 @@ class SSHHandler:
     # ------------------------------------------------------------------ #
     # WinRM bootstrap — enable sshd on a Windows host that has no SSH yet
     # ------------------------------------------------------------------ #
+    def _winrm_timeout(self) -> dict:
+        """``command_timeout`` for the WinRM install, when SSHConfig sets one."""
+        limit = getattr(self.config, "winrm_command_timeout", None)
+        return {} if limit is None else {"command_timeout": float(limit)}
+
     def bootstrap_sshd_via_winrm(self, *, set_powershell_default: bool = False,
                                  safe: Optional[bool] = None):
         """
@@ -1194,6 +1200,7 @@ class SSHHandler:
                 transport=cfg.winrm_transport, ssh_port=cfg.port,
                 set_powershell_default=set_powershell_default,
                 log=lambda m: self._emit(logging.INFO, m),
+                **self._winrm_timeout(),
             )
             # wait briefly for the listener to come up
             for _ in range(10):

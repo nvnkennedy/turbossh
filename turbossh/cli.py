@@ -765,6 +765,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rser.add_argument("--stop-on-match", action="store_true")
     p_rser.add_argument("--send", default=None,
                         help="write this line to the port before monitoring")
+    p_rser.add_argument("--force", action="store_true",
+                        help="first stop a stale TurboSSH reader holding the "
+                             "port (Windows; never another program)")
 
     # --- scan serial ports on the REMOTE host ---
     p_scan = sub.add_parser("scan-ports",
@@ -1189,22 +1192,18 @@ def _main(argv=None) -> int:
             print(f"Monitoring {args.device} @ {args.baud} on {args.host} "
                   f"(Ctrl+C to stop)...", file=sys.stderr)
             try:
+                # serial_stream stops its own remote reader when it ends (also
+                # on Ctrl+C). No serial_release here: that stops the port's
+                # tracked holder, which may be the GUI's live session on it.
                 res = ssh.serial_stream(args.device, baudrate=args.baud,
                                         on_line=print, match=args.match,
                                         stop_on_match=args.stop_on_match,
-                                        save_to=args.save)
+                                        save_to=args.save, force=args.force)
                 if args.match:
                     print(f"\n[{len(res['matches'])} matched lines]",
                           file=sys.stderr)
             except KeyboardInterrupt:
                 rc = 130
-            finally:
-                # Closing the channel doesn't kill the remote reader on Windows
-                # OpenSSH, which would leave the COM port locked — release it.
-                try:
-                    ssh.serial_release(args.device, safe=True)
-                except Exception:
-                    pass
         elif args.cmd == "forward":
             import time as _time
             fwd = ssh.forward_local(args.to_host, args.to_port,

@@ -389,15 +389,49 @@ def test_a_path_that_is_no_link_costs_no_realpath():
     assert [c for c, _p in server.calls] == ["lstat"]
 
 
-def test_links_are_still_followed_where_the_server_has_no_realpath():
+def test_a_link_the_server_cannot_resolve_is_kept_and_written_through():
+    """No realpath (or a dangling link, which realpath refuses): the link itself
+    comes back — writing to it goes through it on the server, which is always
+    where it points; a target joined on as text could be the wrong file."""
     server = tree(realpath=False)
-    assert sb.resolve_remote_link(server, "/b/c/x")[0] == "/b/x"
+    path, attr = sb.resolve_remote_link(server, "/b/c/x")
+    assert path == "/b/c/x" and stat.S_ISLNK(attr.st_mode)
     loop = LinkServer({"/l1": "l2", "/l2": "l1"}, set(), {"/"}, realpath=False)
-    with pytest.raises(IOError, match="too many levels"):
-        sb.resolve_remote_link(loop, "/l1")
+    path, attr = sb.resolve_remote_link(loop, "/l1")
+    assert path == "/l1" and stat.S_ISLNK(attr.st_mode)
 
 
-def test_a_dangling_link_resolves_to_where_its_target_would_be():
+def test_a_dangling_link_is_kept_as_the_link():
     server = LinkServer({"/a": "/b/c", "/b/c/new": "../new"}, set(), {"/", "/b", "/b/c"})
+
+    def no_target(path):
+        server.calls.append(("normalize", path))
+        raise IOError(errno.ENOENT, "No such file")   # what OpenSSH's realpath says
+    server.normalize = no_target
     path, attr = sb.resolve_remote_link(server, "/a/new")
-    assert (path, attr) == ("/b/new", None)
+    assert path == "/a/new" and stat.S_ISLNK(attr.st_mode)
+
+
+def test_an_editor_save_through_an_unresolved_link_compares_what_it_points_at():
+    """The editor loaded the file through the link (stat follows it): its save
+    must compare that, not the link's own lstat — or every save on a server
+    without realpath says "changed on the remote"."""
+    from turbossh.gui import remote_edit
+    server = tree(realpath=False)
+    target_attr = type("Attr", (), {"st_mode": stat.S_IFREG | 0o644,
+                                     "st_size": 5, "st_mtime": 100})()
+    server.stat = lambda path: target_attr
+    written = []
+
+    def put_data(sftp, data, remote, existing=None, mode=None):
+        written.append((remote, data))
+        return ""
+    import turbossh._transfer as transfer
+    original = transfer.put_data
+    transfer.put_data = put_data
+    try:
+        size, _stamp, how = remote_edit.write_remote_text(
+            server, "/b/c/x", b"hello", stamp=(5, 100))
+    finally:
+        transfer.put_data = original
+    assert size == 5 and written == [("/b/c/x", b"hello")]

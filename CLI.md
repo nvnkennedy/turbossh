@@ -309,7 +309,10 @@ turbossh serial-monitor --port COM5 --baud 115200 --match "login:" --save consol
 ### `turbossh serial-ssh`
 
 Monitor a serial port that is plugged into the *remote* machine, over SSH. The
-port is released on that machine when the command ends.
+command's own reader on that machine is stopped when it ends. A port that
+another program — or a TurboSSH session in the GUI — holds is not taken: the
+command says it cannot open it. `--force` first stops a stale TurboSSH reader of
+the port (one an earlier run left behind on Windows), never another program.
 
 ```bash
 turbossh serial-ssh --host rdp-box --user me --password --device COM4 --baud 115200
@@ -324,6 +327,7 @@ turbossh serial-ssh -s rdp-box --device COM4 --send "reset" --match "U-Boot" --s
 | `--save FILE` | also append every line to this local file |
 | `--stop-on-match` | stop as soon as a line matches |
 | `--send TEXT` | write this line to the port before monitoring |
+| `--force` | first stop a stale TurboSSH reader holding the port (Windows) |
 
 Plus the [connection options](#connection-options).
 

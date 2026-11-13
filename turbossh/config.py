@@ -79,6 +79,8 @@ class SSHConfig:
                                             # winrm_use_ssl is on; set False only
                                             # for a self-signed lab listener
     winrm_transport: str = "ntlm"           # ntlm works with domain creds, no Kerberos
+    winrm_command_timeout: Optional[float] = None  # s the remote install may run
+                                            # (None: the bootstrap's default, 45 min)
 
     # --- host key policy ---
     # "auto"   -> accept unknown host keys; reject a CHANGED key for hosts already
@@ -151,6 +153,14 @@ class FTPConfig:
     passive: bool = True
     timeout: float = 30.0
     encoding: str = "utf-8"
+    # FTPS certificate checks (with use_tls). verify_tls=False turns them off
+    # (a self-signed lab server); ca_file is a PEM bundle to trust instead of
+    # the system's CAs (a lab's own CA); check_hostname=False still checks the
+    # certificate but not that it names the host (a server reached by an IP
+    # address its certificate does not list).
+    verify_tls: bool = True
+    ca_file: Optional[str] = None
+    check_hostname: bool = True
 
     def __post_init__(self):
         self.password = coerce_secret(self.password)

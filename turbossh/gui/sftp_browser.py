@@ -529,6 +529,7 @@ class _TransferThread(QThread):
         self._cancel = threading.Event()
         self.restart = False             # stopped to run again on a new link
         self.notes = []                  # names changed, entries skipped
+        self.in_place = []               # uploads written in place, and why
         self._file, self._last = "", 0.0
         self._before = 0                 # bytes of the files already finished
         self._here = self._size = 0      # bytes done / size of the current file
@@ -670,7 +671,9 @@ class _TransferThread(QThread):
 
     def _put_file(self, sftp, local, remote, existing=_UNKNOWN) -> int:
         self._on_file(remote)
-        put_atomic(sftp, local, remote, self._on_bytes, existing)
+        how = put_atomic(sftp, local, remote, self._on_bytes, existing)
+        if how:
+            self.in_place.append(f"{remote} was written {how}")
         return os.path.getsize(local)
 
     def _put_dir(self, sftp, local_dir, remote_dir, seen):
@@ -1484,6 +1487,8 @@ class SftpBrowser(QWidget):
             return
         notes = ""
         if self._transfer is not None:
+            for note in getattr(self._transfer, "in_place", ()):
+                self.log.emit(f"[INFO] {note}")
             for note in self._transfer.notes:
                 self.log.emit(f"[WARN] {note}")
             if self._transfer.notes:
