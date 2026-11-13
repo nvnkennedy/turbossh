@@ -579,3 +579,39 @@ def test_setup_script_keeps_path_expandable_and_guards_the_result_file():
 @pytest.mark.skipif(not _powershell(), reason="needs PowerShell to parse the script")
 def test_setup_script_parses():
     assert _ps_parse_errors(SETUP_PS1) == 0
+
+
+# ------------------------------------------------------------------ follow-ups
+def test_a_second_ssh_server_setup_keeps_a_stage_still_in_use(tmp_path):
+    """Each launch swept every earlier stage, including one an elevated setup
+    started a minute ago was still running from."""
+    old = tmp_path / "turbossh-sshd-setup-old"
+    recent = tmp_path / "turbossh-sshd-setup-recent"
+    other = tmp_path / "unrelated"
+    for folder in (old, recent, other):
+        folder.mkdir()
+    past = time.time() - cli._STAGE_MAX_AGE - 60
+    os.utime(old, (past, past))
+    os.utime(other, (past, past))
+    cli._sweep_setup_stages(str(tmp_path))
+    assert not old.exists()
+    assert recent.exists() and other.exists()
+
+
+def test_a_saved_jump_session_falls_back_to_the_shared_jump_password(monkeypatch):
+    """Sessions now keep their own jump password only when it differs from the
+    shared one in Settings, so the CLI must fall back to the shared one."""
+    from turbossh.gui import settings
+    from turbossh.gui.sessions import SessionStore
+    monkeypatch.delenv("TURBOSSH_JUMP_PASSWORD", raising=False)
+    monkeypatch.setattr(settings, "jump_password", lambda: "shared-secret")
+    store = SessionStore()
+    store.save({"name": "cli-jump-box", "type": "ssh", "host": "10.0.0.5", "user": "u",
+                "use_jump": True, "jhost": "10.0.0.20", "juser": "j"}, "pw")
+    try:
+        args = cli.build_parser().parse_args(["run", "-s", "cli-jump-box", "uptime"])
+        cfg = cli._build_config(args)
+        assert cfg.jump_host is not None
+        assert cfg.jump_host.password.reveal() == "shared-secret"
+    finally:
+        store.delete("cli-jump-box")

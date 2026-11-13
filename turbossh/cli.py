@@ -38,6 +38,7 @@ from .results import CommandResult, TransferResult
 # which must not pay for paramiko before the window is on screen.
 
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+_STAGE_MAX_AGE = 3600       # s: an SSH-server setup stage younger than this may be in use
 
 
 class _UsageError(Exception):
@@ -62,6 +63,24 @@ def sshd_result_file() -> str:
     change, so a user cannot redirect the elevated write with a planted link."""
     base = os.environ.get("ProgramData", r"C:\ProgramData")
     return os.path.join(base, "turbossh", "sshd-setup-result.txt")
+
+
+def _sweep_setup_stages(tmp: str) -> None:
+    """Remove old SSH-server setup stages — only old ones: a setup launched a
+    minute ago may still be running elevated from its stage (a second click while
+    the first UAC prompt was hidden used to delete the folder under it)."""
+    import shutil
+    import time
+    for old in os.listdir(tmp):
+        if not old.startswith("turbossh-sshd-setup"):
+            continue
+        path = os.path.join(tmp, old)
+        try:
+            stale = time.time() - os.path.getmtime(path) > _STAGE_MAX_AGE
+        except OSError:
+            continue
+        if stale:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def launch_setup_server(install_pip: bool = False, port: int = 22) -> bool:
@@ -90,10 +109,7 @@ def launch_setup_server(install_pip: bool = False, port: int = 22) -> bool:
         # A fresh, unpredictable folder per run: the script in it is about to be
         # executed elevated, so it must not sit at a fixed, guessable path that
         # something else could have populated first. Older stages are swept.
-        tmp = tempfile.gettempdir()
-        for old in os.listdir(tmp):
-            if old.startswith("turbossh-sshd-setup"):
-                shutil.rmtree(os.path.join(tmp, old), ignore_errors=True)
+        _sweep_setup_stages(tempfile.gettempdir())
         stage = tempfile.mkdtemp(prefix="turbossh-sshd-setup-")
         dst_script = os.path.join(stage, "setup_openssh_server.ps1")
         shutil.copy2(src_script, dst_script)
@@ -509,7 +525,10 @@ def _build_config(args) -> SSHConfig:
         if password is None and not args.passwordless:
             stored = SessionStore.password(name)
             password = Secret(stored) if stored else None
-        jump_password = jump_password or SessionStore.jump_password(name) or None
+        # its own copy, else the shared one from Settings: sessions now keep a
+        # copy only when it differs from the shared jump password
+        from .gui.sessions import jump_password_for
+        jump_password = jump_password or jump_password_for(name, base) or None
     policy = args.host_key_policy or (
         ("ignore" if base.get("ignore_hostkey", True) else "auto") if name else "auto")
     legacy = bool(args.legacy or base.get("legacy"))
