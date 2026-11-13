@@ -628,6 +628,12 @@ class FakeLocalShell:
         self.gate.wait(10)
         self.written += data
 
+    def write_ready(self):
+        return True
+
+    def send_interrupt(self, signalled=False):
+        self.write(b"\x03")
+
     def signal_interrupt(self):
         return False
 

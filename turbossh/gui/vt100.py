@@ -64,6 +64,10 @@ _HIGHLIGHTS = [
 # it used to stop at the limit, and Save then missed everything after it.
 _CAPTURE_LIMIT = 256 * 1024 * 1024
 _CAPTURE_PARTS = 4
+# capture files untouched this long are a crashed session's: swept at the next
+# start. A live terminal touches its parts far more often than that.
+_CAPTURE_MAX_AGE = 86400
+_CAPTURE_TOUCH_MS = 3600 * 1000
 
 _MODIFIER_KEYS = (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta,
                   Qt.Key_AltGr, Qt.Key_CapsLock, Qt.Key_NumLock, Qt.Key_ScrollLock)
@@ -198,6 +202,7 @@ class Vt100Terminal(QWidget):
         self._cap_stale: list = []      # dropped parts Windows would not delete yet
         self._cap_trimmed = False       # True once the oldest output was dropped
         self._cap_bytes = 0             # bytes in the part being written
+        self._cap_timer = None          # keeps the parts' mtimes fresh
         self._open_capture()
 
         self.setFocusPolicy(Qt.StrongFocus)
@@ -348,20 +353,38 @@ class Vt100Terminal(QWidget):
         try:
             capdir = paths.state_path("captures")
             os.makedirs(capdir, exist_ok=True)
-            # best-effort sweep of stale captures (>1 day old) so they don't pile up
+            # best-effort sweep of stale captures (>1 day old) so they don't pile
+            # up. Not this process's: a part of a live session is not written
+            # any more once the next one starts, and a long session's older
+            # parts were deleted under it (Save then left them out unsaid). The
+            # parts of other running processes are kept fresh by their terminals.
             now = time.time()
+            ours = f"term-{os.getpid()}-"
             for f in os.listdir(capdir):
                 p = os.path.join(capdir, f)
                 try:
-                    if f.startswith("term-") and now - os.path.getmtime(p) > 86400:
+                    if (f.startswith("term-") and not f.startswith(ours)
+                            and now - os.path.getmtime(p) > _CAPTURE_MAX_AGE):
                         os.remove(p)
                 except Exception:
                     pass
             self._cap_base = os.path.join(capdir, f"term-{os.getpid()}-{id(self)}")
             self._cap_serial = 0
             self._next_capture_part()
+            self._cap_timer = QTimer(self)
+            self._cap_timer.timeout.connect(self._keep_capture_fresh)
+            self._cap_timer.start(_CAPTURE_TOUCH_MS)
         except Exception:
             self._cap_fh = None
+
+    def _keep_capture_fresh(self):
+        """Touch the parts kept, so another TurboSSH process's sweep (by age)
+        leaves them alone however long the session runs or sits quiet."""
+        for path in self._cap_parts:
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
 
     def _next_capture_part(self):
         """Start a new part of the capture; drop the oldest beyond the limit."""
@@ -1048,10 +1071,22 @@ class Vt100Terminal(QWidget):
 
     def _save_worker(self, sources, path, fallback, trimmed=False):
         """*sources*: the capture's parts in order (or one path, or None);
-        *fallback*: what to write without a capture — text, or rows."""
+        *fallback*: what to write without a capture — text, or rows; *trimmed*:
+        the oldest output was dropped already (the size limit)."""
         from ..results import strip_ansi
         if isinstance(sources, str):
             sources = [sources]
+        # Every part is opened first, so one that is gone — dropped since the
+        # snapshot, or deleted — is known before anything is written (and on
+        # Windows the others cannot be deleted while they are read). Output that
+        # is missing is said so in the file: it used to be left out unsaid.
+        parts = []
+        for source in sources or ():
+            try:
+                parts.append(open(source, "rb"))
+            except OSError:
+                parts.append(None)
+        first = next((i for i, src in enumerate(parts) if src is not None), len(parts))
         try:
             wrote = False
             with open(path, "w", encoding="utf-8", newline="\n") as out:
@@ -1063,25 +1098,28 @@ class Vt100Terminal(QWidget):
                         out.write(text if text.endswith("\n") else text + "\n")
                         wrote = wrote or bool(text.strip())
 
-                if trimmed:
+                if trimmed or first > 0:
                     out.write(f"[… earlier output is not included: a session keeps "
                               f"its last {_CAPTURE_LIMIT // (1024 * 1024)} MB …]\n")
                 # the parts are one stream: a line (or a UTF-8 character) cut
                 # where a new part began is joined up again
                 carry = b""
-                for source in sources or ():
-                    try:
-                        src = open(source, "rb")
-                    except OSError:              # dropped since the snapshot
-                        continue
-                    with src:
-                        for raw in src:          # line by line: constant memory
+                for index, src in enumerate(parts):
+                    if src is None:
+                        if index > first:        # a gap in what was written
                             if carry:
-                                raw, carry = carry + raw, b""
-                            if raw.endswith(b"\n"):
-                                emit(raw)
-                            else:
-                                carry = raw
+                                emit(carry)
+                                carry = b""
+                            out.write("[… some output is not included here: part of "
+                                      "the session's capture file was deleted …]\n")
+                        continue
+                    for raw in src:              # line by line: constant memory
+                        if carry:
+                            raw, carry = carry + raw, b""
+                        if raw.endswith(b"\n"):
+                            emit(raw)
+                        else:
+                            carry = raw
                 if carry:
                     emit(carry)
                 if not wrote:                    # no capture: what is on screen
@@ -1091,6 +1129,10 @@ class Vt100Terminal(QWidget):
             self._saved_gate.emit(path, "")
         except Exception as exc:
             self._saved_gate.emit(path, f"{type(exc).__name__}: {exc}")
+        finally:
+            for src in parts:
+                if src is not None:
+                    src.close()
 
     def _on_saved(self, path, error):
         if error:
@@ -1131,6 +1173,8 @@ class Vt100Terminal(QWidget):
         self._saved_gate.close()
         try:
             self._resize_timer.stop()
+            if self._cap_timer is not None:
+                self._cap_timer.stop()
             _pump().remove(self)
         except Exception:
             pass

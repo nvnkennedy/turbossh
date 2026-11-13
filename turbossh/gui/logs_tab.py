@@ -34,6 +34,9 @@ _SCAN_LINES = 20000         # stored lines re-filtered per step
 _CHUNK = 500                # lines added to the view per call
 _STEP_BUDGET = 0.015
 _TICK_MS = 50
+# how long a Save result stays in the status row before the live line count may
+# take it back (it was re-set every tick, so the result showed for < 50 ms)
+_NOTE_SECONDS = 6.0
 
 
 # Level colouring: the first rule that matches a line decides its colour. The
@@ -124,6 +127,7 @@ class _LogThread(QThread):
 class LogsTab(QWidget):
     title = "Logs"
     _save_done = pyqtSignal(str)            # status text, from the save worker
+    _find_done = pyqtSignal(int, int)       # search id, matches: from the find worker
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -164,8 +168,12 @@ class LogsTab(QWidget):
 
         self.statusrow = QLabel("○ stopped")
         self._count = 0
-        self._save_done.connect(self.statusrow.setText)
+        self._save_done.connect(self._show_note)
         self._save_gate = qtutil.SignalGate(self._save_done)
+        # while a note (a Save result) is up, the automatic status updates wait
+        self._note_timer = QTimer(self); self._note_timer.setSingleShot(True)
+        self._note_timer.timeout.connect(self._note_expired)
+        self._status_stale = False      # an update waited: show it when the note goes
 
         self.view = QPlainTextEdit(); self.view.setReadOnly(True)
         self.view.setFont(QFont("Consolas", 9))
@@ -177,8 +185,9 @@ class LogsTab(QWidget):
         find_row = QHBoxLayout()
         self.find = QLineEdit(); self.find.setPlaceholderText("find in the log (Ctrl+F)")
         self.find.returnPressed.connect(self.find_next)
-        self.find.textChanged.connect(lambda _t: self._find_status.setText(""))
+        self.find.textChanged.connect(lambda _t: self._reset_find())
         self.find_case = QCheckBox("Match case")
+        self.find_case.toggled.connect(lambda _on: self._reset_find())
         prev_btn = QPushButton("◀"); prev_btn.setProperty("role", "ghost")
         prev_btn.setToolTip("Previous match (Shift+F3)")
         prev_btn.clicked.connect(self.find_previous)
@@ -186,9 +195,23 @@ class LogsTab(QWidget):
         next_btn.setToolTip("Next match (F3)")
         next_btn.clicked.connect(self.find_next)
         self._find_status = QLabel("")
+        self._find_status.setToolTip(
+            f"Find searches the view, which holds the latest {_VIEW_LINES:,} lines; "
+            f"without a match there it looks in the older lines kept (up to "
+            f"{_KEEP_LINES:,}, what Save writes)")
+        # Find searches the view (the latest _VIEW_LINES lines); a miss there is
+        # looked for in the older lines kept, and this shows them
+        self._find_show = QPushButton("Filter for it"); self._find_show.setProperty("role", "ghost")
+        self._find_show.setToolTip("Show only the lines with it (replaces the filter)")
+        self._find_show.clicked.connect(self._filter_for_find)
+        self._find_show.hide()
+        self._find_seq = 0              # bumped per search: a late answer is dropped
+        self._find_done.connect(self._on_find_done)
+        self._find_gate = qtutil.SignalGate(self._find_done)
         find_row.addWidget(QLabel("Find")); find_row.addWidget(self.find, 1)
         find_row.addWidget(prev_btn); find_row.addWidget(next_btn)
         find_row.addWidget(self.find_case); find_row.addWidget(self._find_status)
+        find_row.addWidget(self._find_show)
 
         lay.addLayout(row); lay.addWidget(self.statusrow); lay.addWidget(self.view, 1)
         lay.addLayout(find_row)
@@ -256,7 +279,7 @@ class LogsTab(QWidget):
         What it had already buffered is still taken, a step per tick."""
         self.stop_event.set()
         self._retire_thread()
-        self._set_stopped_status()
+        self._show_status()
 
     def _on_stream_ended(self):
         # The command ended on its own (or failed). run() emits `stopped` as its
@@ -264,7 +287,7 @@ class LogsTab(QWidget):
         # only reference to it then destroyed a running QThread, and Qt aborted
         # the whole app — after every one-shot preset (journalctl, dmesg …).
         self._retire_thread()
-        self._set_stopped_status()
+        self._show_status(auto=True)
 
     def _retire_thread(self):
         thread, self._thread = self._thread, None
@@ -273,9 +296,6 @@ class LogsTab(QWidget):
             self._sources.append(thread)    # its buffered tail is still taken
             self._on_timer()
             self._kick()
-
-    def _set_stopped_status(self):
-        self.statusrow.setText(f"○ stopped — {self._count} lines{self._rx_note}")
 
     def _toggle_pause(self):
         self._paused = not self._paused
@@ -293,6 +313,7 @@ class LogsTab(QWidget):
     def _drain(self):
         """Take what the workers buffered (bounded per tick), oldest first."""
         budget = _PULL_LINES
+        shown = self._count
         sources = self._sources + ([self._thread] if self._thread is not None else [])
         for source in sources:
             lines = source.pull(budget)
@@ -303,8 +324,9 @@ class LogsTab(QWidget):
             budget -= len(lines)
             if budget <= 0:
                 break
-        if self._thread is not None:
-            self.statusrow.setText(f"● live — {self._count} lines{self._rx_note}")
+        # only when lines were shown: re-set every tick, it wiped a Save result
+        if self._thread is not None and self._count != shown:
+            self._show_status(auto=True)
 
     def _accept(self, lines):
         """Take *lines* as if they had just arrived."""
@@ -369,10 +391,29 @@ class LogsTab(QWidget):
         self._kick()
         self._show_status()
 
-    def _show_status(self):
+    def _show_status(self, auto: bool = False):
+        """Live / stopped and the line count. *auto*: an update nobody asked for
+        (lines came in, the stream ended, a re-filter finished) — it waits while
+        a note is up, and is shown when the note goes."""
+        if auto and self._note_timer.isActive():
+            self._status_stale = True
+            return
+        self._note_timer.stop()
+        self._status_stale = False
         live = self._thread is not None
         self.statusrow.setText(f"{'● live' if live else '○ stopped'} — "
                                f"{self._count} lines{self._rx_note}")
+
+    def _show_note(self, text: str):
+        """A Save result: it stays up _NOTE_SECONDS, and after that until the
+        status has something new to say — a failed save is not wiped unseen."""
+        self.statusrow.setText(text)
+        self._status_stale = False
+        self._note_timer.start(int(_NOTE_SECONDS * 1000))
+
+    def _note_expired(self):
+        if self._status_stale:
+            self._show_status()
 
     def _work(self):
         """One step of view work, within _STEP_BUDGET of GUI time: new lines
@@ -407,7 +448,7 @@ class LogsTab(QWidget):
         self._scan[1] = start
         if start == 0:
             self._scan = None
-            self._show_status()
+            self._show_status(auto=True)
 
     def _insert_older(self):
         room = _VIEW_LINES - self.view.document().blockCount()
@@ -453,16 +494,69 @@ class LogsTab(QWidget):
             flags |= QTextDocument.FindBackward
         if self.find_case.isChecked():
             flags |= QTextDocument.FindCaseSensitively
+        self._reset_find()
         if self.view.find(needle, flags):
-            self._find_status.setText("")
             return True
         # not found from here: wrap round once
         cursor = self.view.textCursor()
         cursor.movePosition(cursor.End if backward else cursor.Start)
         self.view.setTextCursor(cursor)
-        found = self.view.find(needle, flags)
-        self._find_status.setText("wrapped" if found else "not found")
-        return found
+        if self.view.find(needle, flags):
+            self._find_status.setText("wrapped")
+            return True
+        self._find_older(needle, self.find_case.isChecked())
+        return False
+
+    def _find_older(self, needle: str, case: bool):
+        """Not in the view, which holds only the latest _VIEW_LINES lines: look
+        in every stored line that passes the filter (what Save writes) — an
+        error 60k lines back was "not found" although Save had it. On a worker:
+        that is up to 200k lines."""
+        lines = self._lines
+        if len(lines) <= self.view.document().blockCount():
+            self._find_status.setText("not found")    # the view has every line
+            return
+        self._find_status.setText("searching older lines…")
+        seq, snapshot, rx, gate = self._find_seq, list(lines), self._rx, self._find_gate
+
+        def work():
+            want = needle if case else needle.lower()
+            hits = 0
+            for line in snapshot:
+                if (want in (line if case else line.lower())
+                        and (rx is None or type(line) is _Marker or rx.search(line))):
+                    hits += 1
+            gate.emit(seq, hits)
+
+        threading.Thread(target=work, name="logs-find", daemon=True).start()
+
+    def _on_find_done(self, seq: int, hits: int):
+        if seq != self._find_seq:
+            return                                    # searched for something else since
+        if hits:
+            self._find_status.setText(f"found in {hits:,} older line"
+                                      f"{'s' if hits > 1 else ''} (not shown)")
+            self._find_show.show()
+        else:
+            self._find_status.setText("not found")
+
+    def _filter_for_find(self):
+        """Show the lines with what was found: the find text becomes the filter."""
+        needle = self.find.text()
+        if not needle:
+            return
+        pattern = re.escape(needle)
+        if not self.find_case.isChecked():
+            pattern = "(?i)" + pattern
+        self.filter.setText(pattern)
+        self._filter_timer.stop()                     # (setText started it)
+        self._apply_filter()
+        self._reset_find()
+
+    def _reset_find(self):
+        self._find_seq += 1
+        self._find_status.setText("")
+        self._find_show.hide()
 
     def find_next(self) -> bool:
         return self._find(False)
@@ -511,6 +605,8 @@ class LogsTab(QWidget):
         to be deleted froze the window for seconds."""
         self.stop_event.set()
         self._save_gate.close()
+        self._find_gate.close()
+        self._note_timer.stop()
         thread, self._thread = self._thread, None
         qtutil.park_thread(thread)
         self._sources.clear()

@@ -80,6 +80,7 @@ class ReaderThread(QThread):
 
 
 _PASTE_START, _PASTE_END = b"\x1b[200~", b"\x1b[201~"
+_INTERRUPT = object()          # the key of an interrupt queued as a call
 
 
 class Writer:
@@ -141,14 +142,18 @@ class Writer:
 
     def interrupt(self, data=b"\x03") -> int:
         """Drop the input still queued (and the rest of what is being sent), then
-        send *data* (Ctrl-C; None: nothing) before anything else. Queued calls
-        are kept. Returns how many bytes were dropped."""
+        send *data* before anything else: Ctrl-C, or a callable that sends it
+        from the writer thread (a local pty: see LocalShell.send_interrupt);
+        None: nothing. Queued calls are kept, except an earlier interrupt still
+        waiting: this one replaces it. Returns how many bytes were dropped."""
         with self._cond:
             dropped = sum(len(item) for item in self._queue if type(item) is bytes)
-            self._queue = deque(item for item in self._queue if type(item) is tuple)
+            self._queue = deque(item for item in self._queue
+                                if type(item) is tuple and item[0] is not _INTERRUPT)
             self._epoch += 1
             if data and not self._closed:
-                self._queue.appendleft(bytes(data))
+                self._queue.appendleft((_INTERRUPT, data) if callable(data)
+                                       else bytes(data))
             self._cond.notify()
             return dropped
 
@@ -190,12 +195,18 @@ class Writer:
                 self._report(exc)
 
     def _send_all(self, data: bytes, epoch: int):
-        view = memoryview(data)
+        rest = self._push(memoryview(data), epoch)
+        if rest:                           # interrupted: the rest is dropped
+            self._end_paste(data, rest)
+
+    def _push(self, view: memoryview, epoch=None) -> memoryview:
+        """Hand *view* to ``write_fn`` a chunk at a time. Returns what is left
+        when it is interrupted (*epoch* changed; None: only close() stops it),
+        or an empty view once it is all out."""
         stalled = None
         while view:
-            if self._epoch != epoch:       # interrupted: the rest is dropped
-                self._end_paste(data, view)
-                return
+            if self._closed if epoch is None else self._epoch != epoch:
+                return view
             n = self._write(bytes(view[:self._chunk]))
             if n is None:
                 n = min(len(view), self._chunk)
@@ -212,17 +223,23 @@ class Writer:
                 raise TimeoutError(f"the other end took no input for "
                                    f"{self._stall:.0f} s")
             time.sleep(0.005)
+        return view
 
     def _end_paste(self, data: bytes, rest: memoryview):
         """A bracketed paste cut short still gets its end marker, or the program
-        would take everything typed afterwards as part of the paste."""
+        (vim, a shell) would take everything typed afterwards as part of the
+        paste. Ctrl-C on a paste usually comes just when the other end takes
+        nothing (a full SSH window), and a single write of the marker was then
+        lost: it is retried like any input — whatever is interrupted meanwhile —
+        until it is out, or nothing was taken for stall_timeout. Only then does
+        the Ctrl-C go."""
         if (self._closed or not data.startswith(_PASTE_START)
                 or not data.endswith(_PASTE_END)
                 or len(data) - len(rest) < len(_PASTE_START)):
             return
         tail = bytes(rest) if len(rest) <= len(_PASTE_END) else _PASTE_END
         try:
-            self._write(tail)
+            self._push(memoryview(tail))
         except Exception:
             pass
 

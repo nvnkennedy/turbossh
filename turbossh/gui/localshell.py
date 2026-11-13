@@ -160,13 +160,40 @@ class LocalShell:
         except (OSError, ValueError):
             pass
 
+    def write_ready(self) -> bool:
+        """POSIX: whether the pty takes a write now, without blocking. False
+        when it is full of input the program has not read (a paste while a
+        command runs). A shell's stdin pipe is not asked: True."""
+        if self._master is None:
+            return True
+        try:
+            import select
+            return bool(select.select([], [self._master], [], 0)[1])
+        except (OSError, ValueError):
+            return True                  # closed: a write fails at once anyway
+
+    def send_interrupt(self, signalled: bool = False) -> None:
+        """POSIX: Ctrl+C the way a terminal sends it — the byte, through the pty.
+        The line discipline then echoes ^C, throws away the input the program
+        has not read yet (lines typed or pasted while a command ran) and
+        signals the job; SIGINT alone left those lines to run once the command
+        had ended. Only when the pty cannot take the byte now — full of input
+        the program does not read — does SIGINT go to the job directly (unless
+        *signalled*: the caller did that already); the byte follows once there
+        is room. May block until then: the terminal tab calls it on its writer
+        thread."""
+        if self._master is None:
+            return
+        if not signalled and not self.write_ready():
+            self.signal_interrupt()
+        self.write(b"\x03")
+
     def signal_interrupt(self) -> bool:
-        """POSIX: deliver Ctrl+C the way the terminal would — SIGINT to the
-        foreground process group — without writing it into the pty, where it
-        would wait behind a paste the program has not read yet. Only when the
-        terminal would turn Ctrl+C into that signal at all (a full-screen
-        program switches that off and reads the key itself). False: send the
-        byte instead."""
+        """POSIX: SIGINT to the pty's foreground process group, as the line
+        discipline sends it for Ctrl+C — the fallback of :meth:`send_interrupt`
+        for a pty too full to take the byte. Only when the terminal would turn
+        Ctrl+C into that signal at all (a full-screen program switches that off
+        and reads the key itself). False: nothing was sent."""
         if self._master is None:
             return False
         try:
@@ -186,13 +213,12 @@ class LocalShell:
             return False
 
     def interrupt(self) -> None:
-        """Stop the running command. POSIX: Ctrl+C, as a signal or through the
-        pty. Windows: end the processes the shell started (a pipe cannot carry a
-        Ctrl+C, and Ctrl+Break is ignored by many programs); the shell stays at
-        its prompt."""
+        """Stop the running command. POSIX: Ctrl+C through the pty (see
+        :meth:`send_interrupt`). Windows: end the processes the shell started (a
+        pipe cannot carry a Ctrl+C, and Ctrl+Break is ignored by many programs);
+        the shell stays at its prompt."""
         if self._master is not None:
-            if not self.signal_interrupt():
-                self.write(b"\x03")
+            self.send_interrupt()
         elif self.alive:
             for pid in _descendants(self._proc.pid):
                 _terminate(pid)

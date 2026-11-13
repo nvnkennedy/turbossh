@@ -101,10 +101,15 @@ class LocalTerminalWidget(QWidget):
             self.writer.send(data)
 
     def _interrupt_pty(self):
-        # what is still queued is dropped and Ctrl-C goes first — as a signal
-        # when the terminal would make it one, so it is not stuck behind a paste
-        # the program has not read
-        self.writer.interrupt(None if self.shell.signal_interrupt() else b"\x03")
+        """Ctrl-C on a pty: what is still queued is dropped, and Ctrl-C goes
+        through the pty ahead of anything else, so the line discipline throws
+        away the lines typed while a command ran, as any terminal does (see
+        LocalShell.send_interrupt). When the pty is full — the writer is stuck
+        behind a paste the program does not read, and the byte would wait
+        there — the job is signalled at once as well (non-blocking calls)."""
+        shell = self.shell
+        signalled = not shell.write_ready() and shell.signal_interrupt()
+        self.writer.interrupt(lambda: shell.send_interrupt(signalled))
 
     def _stop_running(self):
         """Ctrl-C on a shell over pipes: drop the queued input, then end what the
