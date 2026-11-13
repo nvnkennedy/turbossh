@@ -877,3 +877,43 @@ def test_a_callback_can_call_turbossh():
     while not after_exit and time.monotonic() < deadline:
         time.sleep(0.02)
     assert after_exit and isinstance(after_exit[0], TurboSSHError)
+
+
+# ------------------------------------------------------------------ quitting with unsaved edits
+def test_quitting_asks_about_remote_editors_with_unsaved_changes(qapp, monkeypatch):
+    """An offline editor outlives its session tab but not the window: quitting
+    used to destroy unsaved edits without a word."""
+    import sys as _sys
+    import types
+    from PyQt5.QtWidgets import QMessageBox
+    from turbossh.gui import main_window
+    assert main_window.unsaved_editor_count() == 0 or "turbossh.gui.remote_edit" in _sys.modules
+    fake = types.SimpleNamespace(unsaved_editors=lambda: ["editor"])
+    monkeypatch.setitem(_sys.modules, "turbossh.gui.remote_edit", fake)
+    asked = []
+
+    def answer(*args, **_kwargs):
+        asked.append(args[2])
+        return QMessageBox.No
+    monkeypatch.setattr(QMessageBox, "question", answer)
+    assert main_window.unsaved_editor_count() == 1
+    assert main_window.confirm_unsaved_editors(None) is False
+    assert asked and "unsaved changes" in asked[0]
+    fake.unsaved_editors = lambda: []
+    assert main_window.confirm_unsaved_editors(None) is True
+
+
+def test_confirm_close_for_hosts_includes_unsaved_editors(qapp, monkeypatch):
+    import sys as _sys
+    import types
+    from PyQt5.QtWidgets import QMessageBox
+    from turbossh.gui import TurboSSHWidget
+    monkeypatch.setitem(_sys.modules, "turbossh.gui.remote_edit",
+                        types.SimpleNamespace(unsaved_editors=lambda: ["editor"]))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+    turbo = TurboSSHWidget()
+    try:
+        assert turbo.confirm_close() is False          # no session, but an edit
+    finally:
+        turbo.shutdown()
+        turbo.deleteLater()

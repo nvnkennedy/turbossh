@@ -186,7 +186,7 @@ events rather than wait for you; answers and the other events are never dropped.
 | `set_chrome` | any of `menu_bar`, `ribbon`, `sidebar`, `log_dock`, `status_bar` (true / false) | `{}` |
 | `action_names` | — | `["session", "local", …]` (see [Action names](#joining-the-hosts-menus-and-toolbars)) |
 | `trigger_action` | `name` | `{}` — as if the ribbon button was clicked |
-| `confirm_close` | — | `true` when nothing is open or the user agreed to close; answered when they have |
+| `confirm_close` | — | `true` when nothing is open (no session, no remote-file editor with unsaved changes) or the user agreed to close; answered when they have |
 | `shutdown` | optional `wait` (s, default 6, 0 to 60) | `{}` — closes every session (waiting up to `wait` for remote ports and cameras to be released, and no longer) and ends the process |
 
 Once TurboSSH has shut down (by `shutdown`, or any of the ways under
@@ -472,7 +472,7 @@ for menu in turbo.menus():
 | | |
 |---|---|
 | `shutdown(wait=0.0)` | Close every tab and connection and stop all background work. The application keeps running. Safe to call twice; afterwards every `open_*` method raises `RuntimeError`. `wait` is how many seconds to block while remote COM ports and cameras are released: pass some when the process is about to end. |
-| `confirm_close()` | Ask the user, as the desktop app does: "N open sessions will be disconnected". `True` when nothing is open or they agreed. |
+| `confirm_close()` | Ask the user, as the desktop app does: "N open sessions will be disconnected", and about remote-file editors with unsaved changes. `True` when nothing is open or they agreed. |
 | `is_shut_down` | `True` after `shutdown()`. |
 
 You do not have to call `shutdown()`. It happens by itself when:

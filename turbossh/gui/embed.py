@@ -420,14 +420,16 @@ class TurboSSHWidget(QWidget):
 
     def confirm_close(self) -> bool:
         """Ask before closing, as the desktop app does: ``True`` when nothing is
-        open or the user agreed. Call it from the host's own ``closeEvent``."""
-        if not self._sessions:
-            return True
-        return QMessageBox.question(
-            self, "Close TurboSSH",
-            f"{len(self._sessions)} open session(s) will be disconnected and closed."
-            f"\n\nContinue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        open or the user agreed. Call it from the host's own ``closeEvent``.
+        Remote-file editors with unsaved changes are asked about too."""
+        from .main_window import confirm_unsaved_editors
+        if self._sessions and QMessageBox.question(
+                self, "Close TurboSSH",
+                f"{len(self._sessions)} open session(s) will be disconnected and "
+                f"closed.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return False
+        return confirm_unsaved_editors(self)
 
     def shutdown(self, wait: float = 0.0) -> None:
         """Close every session and stop all background work; the application keeps

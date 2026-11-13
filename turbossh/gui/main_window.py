@@ -35,6 +35,29 @@ ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
 INHERIT_THEME = "inherit"       # WindowOptions.theme: keep the host's own styling
 
 
+def unsaved_editor_count() -> int:
+    """Remote-file editors whose changes are not saved anywhere. They outlive a
+    closed session tab (offline), but not the window that owns them."""
+    import sys
+    remote_edit = sys.modules.get(__package__ + ".remote_edit")
+    if remote_edit is None:                 # no editor was ever opened
+        return 0
+    return len(remote_edit.unsaved_editors())
+
+
+def confirm_unsaved_editors(parent) -> bool:
+    """True when no editor has unsaved changes, or the user agrees to lose them."""
+    count = unsaved_editor_count()
+    if not count:
+        return True
+    return QMessageBox.question(
+        parent, "Unsaved remote files",
+        f"{count} remote file editor(s) have unsaved changes, which will be lost."
+        f"\n\nSave them first (or use \"Save a copy…\" if their session has "
+        f"closed). Quit anyway?",
+        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+
 @dataclass(frozen=True)
 class WindowOptions:
     """How a :class:`MainWindow` is hosted. The defaults are the desktop app.
@@ -1387,6 +1410,9 @@ class MainWindow(QMainWindow):
             if resp != QMessageBox.Yes:
                 event.ignore()
                 return
+        if not confirm_unsaved_editors(self):
+            event.ignore()
+            return
         # close EVERY session (serial/ssh/camera each release their own port/
         # connection and stop their reader/worker threads in close_session).
         for w in sessions:
