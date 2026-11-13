@@ -302,7 +302,9 @@ def test_closing_the_browser_keeps_a_modified_editor_open_offline(remote, ssh_se
     assert changed in unsaved_editors()
     copy = tmp_path / "alpha copy.txt"
     changed.save_copy_to(str(copy))
-    assert wait_until(lambda: copy.exists())
+    # the copy is written on a worker and the editor marked saved when it reports
+    # back: wait for that, not for the file to appear (it can before the report)
+    assert wait_until(lambda: not changed.has_unsaved_changes())
     assert copy.read_bytes() == b"my edit\n"
     assert not changed.has_unsaved_changes() and changed not in unsaved_editors()
     assert (ssh_server.root / "alpha.txt").read_bytes() == b"alpha\n"
@@ -977,3 +979,68 @@ def test_ffmpeg_is_never_taken_from_the_current_folder(tmp_path, monkeypatch):
     assert ffmpeg_tools._which("ffmpeg") is None
     monkeypatch.setenv("PATH", str(here))
     assert ffmpeg_tools._which("ffmpeg") == str(exe)
+
+
+# ------------------------------------------------------------ follow-ups with the core fixes
+def test_replacing_the_remote_ffmpeg_force_releases_it():
+    """webcam_release() now stops only the streams the calling handler started;
+    replacing the exe on a fresh connection must stop any ffmpeg running it."""
+    from turbossh.gui import ffmpeg_tools
+    calls = []
+
+    class Ssh:
+        def __init__(self):
+            self.renamed = False
+
+        def rename(self, part, dest, safe=False):
+            if not self.renamed:
+                self.renamed = True
+                raise OSError("in use")
+
+        def webcam_release(self, **kwargs):
+            calls.append(kwargs)
+
+        def remove(self, path, safe=False):
+            pass
+
+    ffmpeg_tools._replace_remote(Ssh(), "C:/t/ffmpeg.part", "C:/t/ffmpeg.exe")
+    assert calls and calls[0].get("force") is True
+
+
+def test_camera_probes_use_command_lines_for_the_remote_shell(qapp):
+    """The probe's and the device listing's ffmpeg lines are cmd.exe syntax; they
+    go through the handler's _cmd_line so a PowerShell default shell works too."""
+    from turbossh.gui import camera_widget
+    wrapped, opened = [], []
+
+    class Chan:
+        def settimeout(self, _t):
+            pass
+
+        def exec_command(self, cmd):
+            opened.append(cmd)
+
+        def exit_status_ready(self):
+            return True
+
+        def recv_stderr_ready(self):
+            return False
+
+        def recv_ready(self):
+            return False
+
+        def close(self):
+            pass
+
+    class Handler:
+        transport = type("T", (), {"open_session": staticmethod(lambda timeout=None: Chan())})()
+
+        def _cmd_line(self, line):
+            wrapped.append(line)
+            return "WRAPPED " + line
+
+    probe = camera_widget._RemoteProbe(Handler(), "C:/t/ffmpeg.exe", 'Cam "1"')
+    probe.run()
+    assert wrapped and wrapped[0].startswith('"C:/t/ffmpeg.exe"')
+    assert opened == ["WRAPPED " + wrapped[0]]
+    assert 'video="Cam 1"' in wrapped[0]          # the quote was stripped from the name

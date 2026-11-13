@@ -615,3 +615,20 @@ def test_a_saved_jump_session_falls_back_to_the_shared_jump_password(monkeypatch
         assert cfg.jump_host.password.reveal() == "shared-secret"
     finally:
         store.delete("cli-jump-box")
+
+
+def test_powershell_quoting_doubles_every_quote_powershell_honours():
+    """PowerShell ends a single-quoted string at U+2018..U+201B as well as at ',
+    so doubling only ' let a curly apostrophe (pasted from Word) break out."""
+    from turbossh import update
+    for quote in (cli._ps_quote, update._ps_quote):
+        for ch in "'\u2018\u2019\u201a\u201b":
+            assert quote(f"a{ch}b") == f"'a{ch}{ch}b'"
+        assert quote("plain") == "'plain'"
+
+
+def test_winrm_timeout_error_is_exported():
+    import turbossh
+    from turbossh.winrm_bootstrap import WinRMError, WinRMTimeoutError
+    assert turbossh.WinRMTimeoutError is WinRMTimeoutError
+    assert issubclass(WinRMTimeoutError, WinRMError)

@@ -271,8 +271,9 @@ class _RemotePrep(QThread):
                 # No cameras -> capture the raw ffmpeg enumeration so the user can
                 # see WHY (privacy block, none attached, ffmpeg error, …) instead
                 # of a silent "no camera".
-                probe = h.run(f'"{remote}" -hide_banner -list_devices true '
-                              f'-f dshow -i dummy', safe=False, timeout=20)
+                # cmd.exe syntax, made to run under a PowerShell default shell too
+                probe = h.run(h._cmd_line(f'"{remote}" -hide_banner -list_devices true '
+                                          f'-f dshow -i dummy'), safe=False, timeout=20)
                 diag = ((getattr(probe, "stdout", "") or "") + "\n" +
                         (getattr(probe, "stderr", "") or "")).strip()
             self.done.emit(h, remote, cams, diag)
@@ -303,9 +304,12 @@ class _RemoteProbe(QThread):
             # the name goes inside "…" of a remote command line: a quote would end
             # it, and % (cmd) / $ ` (PowerShell) would be expanded there
             camera = _QUOTE_UNSAFE.sub("", self.camera)
-            cmd = (f'"{self.ffmpeg}" -hide_banner -loglevel verbose -f dshow '
-                   f'-rtbufsize 16M -i video="{camera}" -frames:v 1 -f null -')
-            chan = self.handler._client.get_transport().open_session()
+            # cmd.exe syntax, made to run under a PowerShell default shell too
+            # (and safe from cmd /c stripping the line's first and last quote)
+            cmd = self.handler._cmd_line(
+                f'"{self.ffmpeg}" -hide_banner -loglevel verbose -f dshow '
+                f'-rtbufsize 16M -i video="{camera}" -frames:v 1 -f null -')
+            chan = self.handler.transport.open_session(timeout=15)
             chan.settimeout(1.0)
             chan.exec_command(cmd)
             t0 = time.time()

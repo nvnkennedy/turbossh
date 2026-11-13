@@ -85,9 +85,13 @@ def owning_python(exe_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
+_PS_QUOTES = "'‘’‚‛"
+
+
 def _ps_quote(value) -> str:
-    """A PowerShell single-quoted literal (an embedded quote is doubled)."""
-    return "'" + str(value).replace("'", "''") + "'"
+    """A PowerShell single-quoted literal. Every quote PowerShell ends such a
+    string at is doubled: ' and the typographic U+2018..U+201B."""
+    return "'" + "".join(c * 2 if c in _PS_QUOTES else c for c in str(value)) + "'"
 
 
 def build_update_script(python: str, version: str, relaunch: str, wait_pid: int) -> str:

@@ -57,6 +57,7 @@ _LAZY_SUBMODULES = {
     "enable_openssh_via_winrm": "winrm_bootstrap",
     "enable_openssh_via_winrm_offline": "winrm_bootstrap",
     "winrm_available": "winrm_bootstrap", "WinRMError": "winrm_bootstrap",
+    "WinRMTimeoutError": "winrm_bootstrap",
     "SerialHandler": "serial_handler", "list_serial_ports": "serial_handler",
     "serial_available": "serial_handler", "SerialError": "serial_handler",
 }
@@ -79,7 +80,7 @@ __all__ = [
     "SSHHandler", "ShellSession", "SSHConfig", "FTPConfig", "FTPHandler",
     "SSHPool", "LocalForward", "RemoteForward", "generate_keypair",
     "enable_openssh_via_winrm", "enable_openssh_via_winrm_offline",
-    "winrm_available", "WinRMError",
+    "winrm_available", "WinRMError", "WinRMTimeoutError",
     "SerialHandler", "list_serial_ports", "serial_available", "SerialError",
     "Secret", "CredentialStore", "prompt_password", "mask",
     "CommandResult", "TransferResult", "ShellResult", "OperationResult",

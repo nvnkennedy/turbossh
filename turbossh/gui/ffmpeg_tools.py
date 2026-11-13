@@ -341,7 +341,10 @@ def _replace_remote(ssh, part: str, dest: str) -> None:
     except Exception:
         pass
     try:
-        ssh.webcam_release(safe=True)
+        # force: a plain release now stops only the streams this handler started
+        # (none, on the fresh connection used here), and the exe to replace may
+        # be running for another tab or an orphan
+        ssh.webcam_release(safe=True, force=True)
     except Exception:
         pass
     try:

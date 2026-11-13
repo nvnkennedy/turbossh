@@ -45,10 +45,15 @@ class _UsageError(Exception):
     """A problem with how the command was invoked (exit code 2)."""
 
 
+_PS_QUOTES = "\u0027\u2018\u2019\u201a\u201b"
+
+
 def _ps_quote(value) -> str:
     """A PowerShell single-quoted literal (an embedded quote is doubled), so a
-    path like C:\\Users\\O'Brien cannot break out of the string."""
-    return "'" + str(value).replace("'", "''") + "'"
+    path like C:\\Users\\O'Brien cannot break out of the string. PowerShell also
+    ends such a string at the typographic quotes U+2018..U+201B, so those are
+    doubled too (doubling only ' let a curly apostrophe break out)."""
+    return "'" + "".join(c * 2 if c in _PS_QUOTES else c for c in str(value)) + "'"
 
 
 def _setup_script_path() -> str:
