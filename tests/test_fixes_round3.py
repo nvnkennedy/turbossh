@@ -518,3 +518,26 @@ def test_a_call_after_close_hung_up_raises_turbossh_error():
         assert not gui._pending
     finally:
         proc._w.close()
+
+
+# ---------------------------------------------------------------- editor + unresolved link
+def test_an_editor_save_through_an_unresolved_link_keeps_the_link(ssh_server, ssh):
+    """On a server whose realpath does not resolve links, the save compared the
+    target's stamp (right) but then told the writer "a regular file", and the
+    link was replaced by a file with the new text; the real file kept the old."""
+    from turbossh.gui import remote_edit
+    root = ssh_server.root
+    (root / "real").mkdir()
+    (root / "real" / "app.conf").write_bytes(b"old\n")
+    try:
+        os.symlink(str(root / "real" / "app.conf"), str(root / "app.conf"))
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links cannot be made here")
+    ssh_server.server.resolve_links = False
+    sftp = ssh.sftp()
+    loaded = remote_edit.read_remote_text(sftp, "/app.conf")
+    remote_edit.write_remote_text(sftp, "/app.conf", b"new\n",
+                                  stamp=remote_edit._stamp(sftp.stat("/app.conf")),
+                                  mode=loaded.mode)
+    assert os.path.islink(str(root / "app.conf"))
+    assert (root / "real" / "app.conf").read_bytes() == b"new\n"

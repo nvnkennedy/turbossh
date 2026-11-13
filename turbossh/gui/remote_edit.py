@@ -122,14 +122,17 @@ def write_remote_text(sftp, path, data: bytes, *, stamp=None, mode=None):
     name = posixpath.basename(path)
     target, attr = resolve_remote_link(sftp, path)       # edit the file, not the link
     if stamp is not None:
+        seen = attr
         if attr is not None and _attr_type(attr) == _transfer.S_IFLNK:
-            # a link the server did not resolve (it is written through): the
-            # file was loaded through it, so compare what it points at
-            attr = _transfer.stat_or_none(sftp, target)
-        if attr is None:
+            # a link the server did not resolve: the file was loaded through
+            # it, so its stamp is compared with what it points at. (Only here:
+            # the write below must still be told it is a link, and goes
+            # through it — told "a regular file", it replaced the link.)
+            seen = _transfer.stat_or_none(sftp, target)
+        if seen is None:
             raise ChangedOnRemote(f"{name} was deleted on the remote after you "
                                   f"opened it.")
-        if _stamp(attr) != tuple(stamp):
+        if _stamp(seen) != tuple(stamp):
             raise ChangedOnRemote(f"{name} was changed on the remote after you "
                                   f"opened it (by someone or something else).")
     how = _transfer.put_data(sftp, data, target, existing=attr, mode=mode)
