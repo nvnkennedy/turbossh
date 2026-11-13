@@ -68,6 +68,9 @@ _CAPTURE_PARTS = 4
 # start. A live terminal touches its parts far more often than that.
 _CAPTURE_MAX_AGE = 86400
 _CAPTURE_TOUCH_MS = 3600 * 1000
+# the capture names ("term-<pid>-<id>") of this process's terminals that are
+# open: the sweep leaves their parts alone, and removes what closed ones left
+_LIVE_CAPTURES: set = set()
 
 _MODIFIER_KEYS = (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta,
                   Qt.Key_AltGr, Qt.Key_CapsLock, Qt.Key_NumLock, Qt.Key_ScrollLock)
@@ -353,22 +356,29 @@ class Vt100Terminal(QWidget):
         try:
             capdir = paths.state_path("captures")
             os.makedirs(capdir, exist_ok=True)
-            # best-effort sweep of stale captures (>1 day old) so they don't pile
-            # up. Not this process's: a part of a live session is not written
-            # any more once the next one starts, and a long session's older
-            # parts were deleted under it (Save then left them out unsaid). The
-            # parts of other running processes are kept fresh by their terminals.
+            # best-effort sweep of stale captures so they don't pile up. Never
+            # a live terminal's of this process: a part of a live session is not
+            # written any more once the next one starts, and a long session's
+            # older parts were deleted under it (Save then left them out
+            # unsaid). What a closed terminal of this process left (a Save was
+            # reading it, and Windows does not delete an open file) goes now;
+            # another process's after a day (its terminals keep theirs fresh).
             now = time.time()
             ours = f"term-{os.getpid()}-"
+            live = tuple(name + "." for name in _LIVE_CAPTURES)
             for f in os.listdir(capdir):
                 p = os.path.join(capdir, f)
                 try:
-                    if (f.startswith("term-") and not f.startswith(ours)
-                            and now - os.path.getmtime(p) > _CAPTURE_MAX_AGE):
+                    if not f.startswith("term-") or (live and f.startswith(live)):
+                        continue
+                    if (f.startswith(ours)
+                            or now - os.path.getmtime(p) > _CAPTURE_MAX_AGE):
                         os.remove(p)
                 except Exception:
                     pass
-            self._cap_base = os.path.join(capdir, f"term-{os.getpid()}-{id(self)}")
+            name = f"term-{os.getpid()}-{id(self)}"
+            self._cap_base = os.path.join(capdir, name)
+            _LIVE_CAPTURES.add(name)
             self._cap_serial = 0
             self._next_capture_part()
             self._cap_timer = QTimer(self)
@@ -1133,6 +1143,15 @@ class Vt100Terminal(QWidget):
             for src in parts:
                 if src is not None:
                     src.close()
+            # a part dropped (or the terminal closed) while this save read it
+            # could not be removed on Windows: now it can. Parts never come back
+            # into _cap_parts, so one that is not there now is stale for good.
+            for source in sources or ():
+                if source not in self._cap_parts:
+                    try:
+                        os.remove(source)
+                    except OSError:
+                        pass
 
     def _on_saved(self, path, error):
         if error:
@@ -1190,6 +1209,9 @@ class Vt100Terminal(QWidget):
         self._cap_stale.extend(self._cap_parts)
         self._cap_parts = []
         self._remove_stale_parts()
+        base = getattr(self, "_cap_base", None)
+        if base:
+            _LIVE_CAPTURES.discard(os.path.basename(base))
 
     # the names the main window's menus call
     _copy = copy_selection

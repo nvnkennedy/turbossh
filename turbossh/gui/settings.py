@@ -146,7 +146,7 @@ def _merged(saved: dict, view: dict) -> dict:
     return merged
 
 
-def save(data: dict) -> None:
+def save(data: dict, force=()) -> None:
     """Set the settings in *data* (a partial dict: what the caller sets).
 
     Written on top of the file as it is NOW, so what another TurboSSH process
@@ -159,11 +159,14 @@ def save(data: dict) -> None:
 
     Afterwards this process also sees what the others saved, except its
     ``LIVE`` settings: a theme or Camera switch saved by another process does not
-    switch this window (it used to, on any save at all)."""
+    switch this window (it used to, on any save at all).
+
+    Keys in *force* are written like ``LIVE`` ones: whenever the file holds
+    another value (see :func:`set_shared_jump`)."""
     global _cache, save_problem, load_problem
     view = _view()
     wanted = {key: copy.deepcopy(value) for key, value in data.items()
-              if key in LIVE or key not in view or view[key] != value}
+              if key in LIVE or key in force or key not in view or view[key] != value}
     view.update(copy.deepcopy(wanted))   # the running app has it at once
     _unsaved.update(wanted)
     on_disk, problem = _read_for_save()
@@ -215,6 +218,34 @@ def _peek():
     except (ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+_JUMP_KEYS = ("jump_host", "jump_user", "jump_domain")
+
+
+def set_shared_jump(host: str, user: str, domain: str, password: str):
+    """Save the shared jump host, user and domain AND its password, together:
+    the password (OS vault) belongs to that host and user (settings.json), and
+    saving one without the other paired a host with another host's password.
+    The three are written whatever this process had cached (another process
+    may have saved another jump host since). If settings.json cannot be written
+    now, nothing is changed — not the vault, and not later either — and the
+    reason is returned (None: saved)."""
+    view = _view()
+    before = {key: copy.deepcopy(view.get(key)) for key in _JUMP_KEYS}
+    save({"jump_host": host, "jump_user": user, "jump_domain": domain},
+         force=_JUMP_KEYS)
+    if save_problem is not None:
+        problem = save_problem
+        for key in _JUMP_KEYS:           # not written later without its password
+            _unsaved.pop(key, None)
+            if before[key] is None:
+                view.pop(key, None)
+            else:
+                view[key] = before[key]
+        return problem
+    set_jump_password(password)
+    return None
 
 
 def shared_jump() -> dict:

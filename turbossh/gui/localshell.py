@@ -109,6 +109,7 @@ class LocalShell:
         self.echoes_input = _WINDOWS and self.label == "PowerShell"
         self._proc = None
         self._master = None
+        self._slave_name = None          # the pty's terminal side, for tcflush
 
     @property
     def alive(self) -> bool:
@@ -126,6 +127,10 @@ class LocalShell:
             return
         import pty
         master, slave = pty.openpty()
+        try:
+            self._slave_name = os.ttyname(slave)
+        except OSError:
+            self._slave_name = None
         shell = os.environ.get("SHELL") or "/bin/sh"
         env = dict(os.environ, TERM="xterm-256color")
         try:
@@ -207,10 +212,34 @@ class LocalShell:
             # signalling that would interrupt TurboSSH itself
             if group <= 0 or group == os.getpgrp():
                 return False
+            if not attrs[3] & getattr(termios, "NOFLSH", 0):
+                self._flush_unread_input(termios)
             os.killpg(group, signal.SIGINT)
             return True
         except Exception:
             return False
+
+    def _flush_unread_input(self, termios) -> None:
+        """Throw away the input the program has not read yet, as the line
+        discipline does when it turns Ctrl+C into SIGINT. This path runs when
+        the pty is full of a paste: once the job dies, the shell would read
+        what is left of it as commands. The terminal side is flushed (the
+        master's TCIFLUSH would flush the program's output instead); opened
+        non-blocking and without becoming our controlling terminal."""
+        name = self._slave_name
+        if not name:
+            return
+        try:
+            fd = os.open(name, os.O_RDWR | getattr(os, "O_NOCTTY", 0)
+                         | getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            return
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except Exception:
+            pass
+        finally:
+            os.close(fd)
 
     def interrupt(self) -> None:
         """Stop the running command. POSIX: Ctrl+C through the pty (see

@@ -203,7 +203,7 @@ class SessionStore:
         """The session's OWN jump password (see :func:`jump_password_for`)."""
         return SessionStore.password(f"{name}::jump")
 
-    def shared_jump_changing(self, old: dict, new: dict) -> None:
+    def shared_jump_changing(self, old: dict, new: dict) -> list:
         """The jump host in Settings changes from *old* to *new* (each
         ``{"host", "user", "password"}``): keep every session that used the old
         one on the password of ITS jump host.
@@ -219,16 +219,25 @@ class SessionStore:
           be sent the new host's password (and its own still works there).
 
         A session with another jump host is not touched: its own password is its
-        own, even when it happens to equal the shared one."""
+        own, even when it happens to equal the shared one. Returns the names of
+        those that keep the OLD password while it changes: perhaps the same
+        jump host by another name (a full DNS name, an IP address), so the
+        caller can say so."""
         old_pw = old.get("password") or ""
         if not old_pw:
-            return                       # nothing was shared, nothing to keep
+            return []                    # nothing was shared, nothing to keep
         same = _same_jump(old.get("host"), old.get("user"), new.get("host"), new.get("user"))
         if same and (new.get("password") or "") == old_pw:
-            return
+            return []
+        elsewhere = []
         for session in list(self.sessions):
             name = session.get("name")
-            if not name or not uses_shared_jump(session, old):
+            if not name:
+                continue
+            if not uses_shared_jump(session, old):
+                if (same and session.get("use_jump")
+                        and (self.jump_password(name) or "") == old_pw):
+                    elsewhere.append(name)
                 continue
             own = self.jump_password(name) or ""
             if same:
@@ -236,14 +245,16 @@ class SessionStore:
                     self._set_secret(f"{name}::jump", None)
             elif not own and session.get("use_jump"):
                 self._set_secret(f"{name}::jump", old_pw)
+        return elsewhere
 
 
 def _same_jump(host_a, user_a, host_b, user_b) -> bool:
-    """The same jump account: host names compare case-insensitively (DNS), user
-    names exactly. An empty host is nobody's."""
+    """The same jump account: host names compare case-insensitively (DNS), and
+    so do user names (the jump host is usually a Windows machine, where "JDoe"
+    is "jdoe"). An empty host is nobody's."""
     host_a, host_b = (host_a or "").strip(), (host_b or "").strip()
     return bool(host_a) and host_a.lower() == host_b.lower() \
-        and (user_a or "").strip() == (user_b or "").strip()
+        and (user_a or "").strip().lower() == (user_b or "").strip().lower()
 
 
 def uses_shared_jump(session: dict, shared: Optional[dict] = None) -> bool:

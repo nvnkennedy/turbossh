@@ -284,7 +284,7 @@ class TurboSSHProcess:
             with self._write_lock:
                 self.process.stdin.write(line.encode("utf-8"))
                 self.process.stdin.flush()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:    # ValueError: stdin closed (close())
             with self._lock:
                 self._pending.pop(rid, None)
             raise TurboSSHError(f"TurboSSH is not listening: {exc}") from exc

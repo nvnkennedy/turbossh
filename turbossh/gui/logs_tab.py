@@ -244,6 +244,7 @@ class LogsTab(QWidget):
             self.statusrow.setText("○ not connected")
             return
         self._stop()
+        self._reset_find()
         self._count = 0
         self.stop_event = threading.Event()
         raw = self.cmd.currentText().strip()
@@ -324,8 +325,10 @@ class LogsTab(QWidget):
             budget -= len(lines)
             if budget <= 0:
                 break
-        # only when lines were shown: re-set every tick, it wiped a Save result
-        if self._thread is not None and self._count != shown:
+        # only when lines were shown: re-set every tick, it wiped a Save result.
+        # Also once the worker has stopped: what it had left (a one-shot
+        # command's backlog) is drained after that and must be counted too.
+        if self._count != shown:
             self._show_status(auto=True)
 
     def _accept(self, lines):
@@ -365,6 +368,7 @@ class LogsTab(QWidget):
 
     def _apply_filter(self):
         pattern = self.filter.text().strip()
+        self._reset_find()                   # a search still running is for the old view
         self._rx, self._rx_note = None, ""
         if pattern:
             try:
@@ -545,7 +549,9 @@ class LogsTab(QWidget):
         needle = self.find.text()
         if not needle:
             return
-        pattern = re.escape(needle)
+        # grouped: the filter text is stripped, and an escaped trailing space
+        # ("error\ ") would end the pattern with a lone backslash
+        pattern = "(?:" + re.escape(needle) + ")"
         if not self.find_case.isChecked():
             pattern = "(?i)" + pattern
         self.filter.setText(pattern)
@@ -565,6 +571,7 @@ class LogsTab(QWidget):
         return self._find(True)
 
     def _clear(self):
+        self._reset_find()
         self._lines.clear()
         self._pending.clear()
         self._older.clear()

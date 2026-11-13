@@ -238,10 +238,16 @@ def test_how_long_a_cancelled_transfer_may_stay_quiet(qapp):
     # a slow link (1 Mbit/s) needs ~16 s to settle 2 MB in flight: it gets them
     t.pace = 128 * 1024
     assert not t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace - 0.5)
-    assert t.stalled(heard + sb._SFTP_TIMEOUT)
-    # however slow, never longer than a request waits for an answer anyway
+    assert t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace)
+    # slower than 2 MB in 22 s (~95 KB/s): still waited for past the SFTP
+    # timeout, which is silence between replies — a live link is not silent
+    t.pace = 40 * 1024
+    assert not t.stalled(heard + sb._SFTP_TIMEOUT + 5)
+    assert t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace)
+    # however slow, not for ever
     t.pace = 100
-    assert t.stalled(heard + sb._SFTP_TIMEOUT)
+    assert not t.stalled(heard + sb._CANCEL_WAIT_MAX - 1)
+    assert t.stalled(heard + sb._CANCEL_WAIT_MAX)
     t.deleteLater()
 
 

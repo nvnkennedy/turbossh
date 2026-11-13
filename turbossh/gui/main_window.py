@@ -901,7 +901,8 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence(seq), self, activated=slot, context=context)
 
     # ---- sessions ----
-    _STORE_RETRY_MS = 1500      # how often a sessions.json in use is read again
+    _STORE_RETRY_MS = 1500      # how soon a sessions.json in use is read again
+    _STORE_RETRY_MAX_MS = 60000  # … and at most this far apart, as it stays in use
 
     def reload_saved_sessions(self) -> bool:
         """Re-read sessions.json if it changed since it was read, or could not be
@@ -913,8 +914,11 @@ class MainWindow(QMainWindow):
         was_unread = self.store.unread
         changed = self.store.reload_if_changed()
         if self.store.unread:
-            if not self._store_retry.isActive():
-                self._store_retry.start(self._STORE_RETRY_MS)
+            # each try can cost the GUI thread half a second (the read rides out
+            # short locks), so the tries thin out while it stays unreadable
+            wait = (self._store_retry.interval() * 2 if self._store_retry.isActive()
+                    else self._STORE_RETRY_MS)
+            self._store_retry.start(min(wait, self._STORE_RETRY_MAX_MS))
             return False
         self._store_retry.stop()
         if changed:
@@ -1354,6 +1358,15 @@ class MainWindow(QMainWindow):
             cfg = dlg.result_settings()
             camera = cfg.pop("camera_enabled", None)
             settings_mod.save(cfg)              # what the dialog showed: written if changed
+            problem = getattr(dlg, "jump_problem", None)
+            if problem:
+                self.log_panel.append(f"[WARN] The jump host was not changed: {problem}")
+            kept = getattr(dlg, "jump_notes", None)
+            if kept:
+                self.log_panel.append(
+                    "[WARN] These sessions keep the old jump password with a jump "
+                    "host written differently from the one in Settings — edit them "
+                    "if it is the same machine: " + ", ".join(kept))
             name = theme.current_name()
             self.apply_theme(name)              # full immediate update everywhere
             if camera is not None and camera != self.camera_enabled():

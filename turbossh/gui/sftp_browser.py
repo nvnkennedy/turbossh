@@ -67,6 +67,8 @@ _STALL_AFTER = 8.0       # s without a block moved before a cancelled transfer
                          # in flight, and closing it then left its temp file
 _IN_FLIGHT = 2 * 1024 * 1024     # bytes a cancel may still wait for: the SSH
                                  # channel window — seconds on a slow VPN
+_CANCEL_WAIT_MAX = 300.0  # s a cancelled transfer that moves nothing is waited
+                          # for at most, however slow its link was
 _STAT_WINDOW = 64        # link stats in flight at once
 _FILL_CHUNK = 2000       # listing rows added per turn of the event loop
 _MAX_LINK_HOPS = 8       # symlinked folders followed inside one download
@@ -551,11 +553,13 @@ class _TransferThread(QThread):
         """Has nothing moved for longer than a live link would need? After a
         cancel the transfer still waits for what it had in flight — up to
         _IN_FLIGHT bytes at the pace it was going — and only a dead link takes
-        longer. Never longer than _SFTP_TIMEOUT, when a request fails anyway."""
+        longer. Not cut at _SFTP_TIMEOUT: that is silence between replies, and
+        a live slow link answers all along (cutting it at 30 s left the
+        temporary file on the server); a dead one fails there by itself."""
         now = time.monotonic() if now is None else now
         pace = self.pace
         wait = _STALL_AFTER + (_IN_FLIGHT / pace if pace > 0 else 0.0)
-        return now - self.heard >= min(wait, _SFTP_TIMEOUT)
+        return now - self.heard >= min(wait, _CANCEL_WAIT_MAX)
 
     def abort(self):
         """Close the client under this (stalled) transfer: the request it is

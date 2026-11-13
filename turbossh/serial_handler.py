@@ -71,7 +71,10 @@ class SerialHandler:
     takes. By default it is 5 s on a port without flow control, where only a
     stalled adapter stops the data, and none (wait as long as it takes) with
     ``rtscts``, ``xonxoff`` or ``dsrdtr``, where a busy device (a flash erase)
-    may hold the port off for longer. ``write_timeout=None`` always waits.
+    may hold the port off for longer. ``write_timeout=None`` always waits —
+    also the choice for a USB virtual COM port (CDC-ACM: many ECU and gadget
+    consoles), which holds writes back without flow control while the device
+    is busy or has not opened its side yet.
     (Windows reports how much of an interrupted write went out; elsewhere a
     write also fails when the rate drops more than eightfold all at once.)
     """

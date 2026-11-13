@@ -276,8 +276,20 @@ class FTPHandler:
             # already there when the transfer broke off part-way (a VPN drop).
             tmp = os.path.join(parent, f".{os.path.basename(dest)}."
                                        f"{uuid.uuid4().hex[:8]}.part")
+            in_place = False
             try:
-                with open(tmp, "xb") as fh:
+                fh = open(tmp, "xb")
+            except PermissionError:
+                # a file we may write, in a folder we may not create files in:
+                # written in place, as 2.0 did (a broken transfer then leaves it
+                # partial — there is no room beside it for a copy)
+                if not os.path.isfile(dest):
+                    raise
+                fh, in_place = open(dest, "wb"), True
+                self._emit(logging.WARNING, f"{lp} is written in place: its folder "
+                                            f"does not allow new files")
+            try:
+                with fh:
                     def _cb(data):
                         fh.write(data)
                         if callback:
@@ -285,15 +297,17 @@ class FTPHandler:
                     self._require().retrbinary(f"RETR {remote_path}", _cb)
             except BaseException as exc:
                 # nothing partial is left behind, and the old file is untouched
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+                if not in_place:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
                 if isinstance(exc, all_errors):
                     raise FTPError(f"FTP download failed: {exc}") from exc
                 raise
             # the download is complete: from here on it is never thrown away
-            _put_in_place(tmp, dest)
+            if not in_place:
+                _put_in_place(tmp, dest)
             return TransferResult(remote_path, lp, "pull", "ftp",
                                   os.path.getsize(dest), time.time() - start)
         return self._guard("pull", _do, safe=safe)

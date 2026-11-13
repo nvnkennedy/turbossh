@@ -618,13 +618,24 @@ class CameraPanel(QWidget):
                 self.r_user.setText(m["user"])
             if m.get("domain"):
                 self.r_domain.setText(m["domain"])
-        if host and host == (settings_mod.get("jump_host") or "").strip():
+        # the jump password filled in for an earlier pick is that host's: it
+        # must not go to the machine picked now (a lockout on the wrong host)
+        filled, self._jump_pw_filled = getattr(self, "_jump_pw_filled", None), None
+        if filled and self.r_pass.text() == filled:
+            self.r_pass.clear()
+        from .sessions import uses_shared_jump
+        shared = settings_mod.shared_jump()
+        if host and (shared.get("host") or "").strip().lower() == host.strip().lower():
             if not self.r_user.text():
-                self.r_user.setText(settings_mod.get("jump_user") or "")
+                self.r_user.setText(shared.get("user") or "")
             if not self.r_domain.text():
-                self.r_domain.setText(settings_mod.get("jump_domain") or "")
-            if not self.r_pass.text():
-                self.r_pass.setText(settings_mod.jump_password())
+                self.r_domain.setText(shared.get("domain") or "")
+            # only for the jump host's own account (the Settings host AND user)
+            if (not self.r_pass.text() and shared.get("password")
+                    and uses_shared_jump({"jhost": host, "juser": self.r_user.text()},
+                                         shared)):
+                self.r_pass.setText(shared["password"])
+                self._jump_pw_filled = shared["password"]
 
     def _res(self):
         return _RES.get(self.res.currentText(), (1280, 720))
@@ -654,7 +665,10 @@ class CameraPanel(QWidget):
     def _refresh(self):
         if self._closing:
             return
-        self._stop_stream()
+        # the old connection goes in the same ordered job as the camera release:
+        # a scan opens a new one, and a separate disconnect raced the release
+        # (on a slow old link it ran first, and the remote ffmpeg kept the camera)
+        self._stop_stream(drop_handler=True)
         self.camera.clear()
         self.refresh_btn.setEnabled(False)
         self.start_btn.setEnabled(False)

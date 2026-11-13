@@ -257,19 +257,31 @@ class SettingsDialog(QDialog):
             self._update_manage_label()
 
     def result_settings(self) -> dict:
+        """The settings to save. The shared jump host is saved here already, and
+        only if it was changed in this dialog: its host, user, domain and
+        password together (see settings.set_shared_jump). Pressing OK with the
+        jump page untouched wrote this dialog's password next to whatever jump
+        host another process had saved meanwhile. ``jump_problem`` says why a
+        changed jump host could not be saved (None: it was, or was unchanged)."""
+        self.jump_problem, self.jump_notes = None, []
         new = {"host": self.jhost.text().strip(), "user": self.juser.text().strip(),
-               "password": self.jpass.text()}
-        old = settings_mod.shared_jump()         # another process may have saved one
-        if (old["host"], old["user"], old["password"]) != \
-                (new["host"], new["user"], new["password"]):
-            # Sessions through the old jump host keep ITS password: a stale copy
-            # of a changed one is dropped (2.0.0 stored one per session, and it
-            # locked the account), and one that took the shared password keeps
-            # it when Settings moves to another jump host. Sessions through any
-            # other jump host are left alone.
-            from .sessions import SessionStore
-            SessionStore().shared_jump_changing(old, new)
-        settings_mod.set_jump_password(new["password"])     # password -> OS vault
+               "domain": self.jdomain.text().strip(), "password": self.jpass.text()}
+        fields = ("host", "user", "domain", "password")
+        if tuple(new[f] for f in fields) != tuple(self._jump_before[f] for f in fields):
+            old = settings_mod.shared_jump()     # another process may have saved one
+            problem = settings_mod.set_shared_jump(
+                new["host"], new["user"], new["domain"], new["password"])
+            if problem is not None:
+                self.jump_problem = problem
+            elif (old["host"], old["user"], old["password"]) != \
+                    (new["host"], new["user"], new["password"]):
+                # Sessions through the old jump host keep ITS password: a stale
+                # copy of a changed one is dropped (2.0.0 stored one per session,
+                # and it locked the account), and one that took the shared
+                # password keeps it when Settings moves to another jump host.
+                # Sessions through any other jump host are left alone.
+                from .sessions import SessionStore
+                self.jump_notes = SessionStore().shared_jump_changing(old, new) or []
         result = {
             "machines": self._machines,
             "term_font": self.font.currentFont().family(),
@@ -277,9 +289,6 @@ class SettingsDialog(QDialog):
             "term_scrollback": self.scrollback.value(),
             "highlight_keywords": self.highlight.isChecked(),
             "default_baud": self.baud.value(),
-            "jump_host": self.jhost.text().strip(),
-            "jump_user": self.juser.text().strip(),
-            "jump_domain": self.jdomain.text().strip(),
             "ffmpeg_path": self.ffmpeg_path.text().strip(),
         }
         if not self._theme_locked:

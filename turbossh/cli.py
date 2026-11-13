@@ -495,6 +495,30 @@ def _resolve_password(args, login_user: str, host: str | None) -> Secret | None:
     return None
 
 
+def _stdin_is_console() -> bool:
+    """Whether standard input is a terminal someone types at. On Windows
+    isatty() is also True for NUL, a character device — what a script that
+    runs us with stdin=DEVNULL hands over — so the console API decides there."""
+    stream = sys.stdin
+    try:
+        if stream is None or not stream.isatty():
+            return False
+    except (AttributeError, ValueError, OSError):
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = wintypes.DWORD()
+        return bool(ctypes.windll.kernel32.GetConsoleMode(
+            wintypes.HANDLE(handle), ctypes.byref(mode)))
+    except Exception:
+        return True
+
+
 def _winrm_password(args, login_user: str) -> Secret:
     """The password for install-ssh-remote's WinRM login, saying on standard
     error where it came from.
@@ -503,7 +527,7 @@ def _winrm_password(args, login_user: str) -> Secret:
     TURBOSSH_PASSWORD is used only when there is nobody to ask: it is usually
     set for the SSH targets, and a wrong password sent to a domain account
     counts toward locking it, so at a terminal the password is asked for."""
-    interactive = sys.stdin is not None and sys.stdin.isatty()
+    interactive = _stdin_is_console()
     from_env = os.environ.get("TURBOSSH_PASSWORD") is not None
     if args.use_stored:
         source = "the OS credential vault (--use-stored)"
