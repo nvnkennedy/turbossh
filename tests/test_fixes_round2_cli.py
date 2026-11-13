@@ -522,24 +522,33 @@ def test_install_ssh_remote_at_a_terminal_asks_rather_than_use_the_env(
 # ------------------------------------------------------------------ 9. jump password
 def test_a_command_line_jump_host_uses_the_sessions_jump_password(monkeypatch):
     """`run -s X --jump-host bastion` for a session saved without a jump host
-    but with a jump password: 2.0.0 sent it, the first fix round sent none."""
+    but with a jump password: 2.0.0 sent it, the first fix round sent none.
+    Without one of its own, the shared password in Settings goes only to the
+    jump host and user in Settings, never to another bastion."""
     from turbossh.gui import settings
     from turbossh.gui.sessions import SessionStore
     monkeypatch.delenv("TURBOSSH_JUMP_PASSWORD", raising=False)
-    monkeypatch.setattr(settings, "jump_password", lambda: "shared-secret")
+    monkeypatch.setattr(settings, "shared_jump", lambda: {
+        "host": "bastion", "user": "", "domain": "", "password": "shared-secret"})
     store = SessionStore()
     store.save({"name": "cli-nojump-box", "type": "ssh", "host": "10.0.0.5",
-                "user": "u"}, "pw", jump_password="own-jump")
+                "user": "u"}, "pw")
+    SessionStore._set_secret("cli-nojump-box::jump", "own-jump")   # as 2.0.0 kept it
     try:
         def jump_password(*extra):
             args = cli.build_parser().parse_args(
                 ["run", "-s", "cli-nojump-box", *extra, "uptime"])
             cfg = cli._build_config(args)
-            return cfg.jump_host and cfg.jump_host.password.reveal()
+            if cfg.jump_host is None:
+                return None
+            return cfg.jump_host.password and cfg.jump_host.password.reveal()
         assert jump_password("--jump-host", "bastion") == "own-jump"
         assert jump_password() is None                       # no jump host at all
         SessionStore._set_secret("cli-nojump-box::jump", None)
         assert jump_password("--jump-host", "bastion") == "shared-secret"
+        assert jump_password("--jump-host", "BASTION") == "shared-secret"
+        assert not jump_password("--jump-host", "other-bastion")
+        assert not jump_password("--jump-host", "bastion", "--jump-user", "x")
         monkeypatch.setenv("TURBOSSH_JUMP_PASSWORD", "from-env")
         assert jump_password("--jump-host", "bastion") == "from-env"
     finally:

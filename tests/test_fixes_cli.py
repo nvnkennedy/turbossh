@@ -613,22 +613,29 @@ def test_a_second_ssh_server_setup_keeps_a_stage_still_in_use(tmp_path):
 
 
 def test_a_saved_jump_session_falls_back_to_the_shared_jump_password(monkeypatch):
-    """Sessions now keep their own jump password only when it differs from the
-    shared one in Settings, so the CLI must fall back to the shared one."""
+    """Sessions through the jump host in Settings keep no copy of its password,
+    so the CLI must fall back to the shared one for them; a session through any
+    other jump host is never sent it."""
     from turbossh.gui import settings
     from turbossh.gui.sessions import SessionStore
     monkeypatch.delenv("TURBOSSH_JUMP_PASSWORD", raising=False)
-    monkeypatch.setattr(settings, "jump_password", lambda: "shared-secret")
+    monkeypatch.setattr(settings, "shared_jump", lambda: {
+        "host": "10.0.0.20", "user": "j", "domain": "", "password": "shared-secret"})
     store = SessionStore()
     store.save({"name": "cli-jump-box", "type": "ssh", "host": "10.0.0.5", "user": "u",
                 "use_jump": True, "jhost": "10.0.0.20", "juser": "j"}, "pw")
+    store.save({"name": "cli-other-jump", "type": "ssh", "host": "10.0.0.5", "user": "u",
+                "use_jump": True, "jhost": "10.0.0.30", "juser": "j"}, "pw")
     try:
         args = cli.build_parser().parse_args(["run", "-s", "cli-jump-box", "uptime"])
         cfg = cli._build_config(args)
         assert cfg.jump_host is not None
         assert cfg.jump_host.password.reveal() == "shared-secret"
+        args = cli.build_parser().parse_args(["run", "-s", "cli-other-jump", "uptime"])
+        assert cli._build_config(args).jump_host.password is None
     finally:
         store.delete("cli-jump-box")
+        store.delete("cli-other-jump")
 
 
 def test_powershell_quoting_doubles_every_quote_powershell_honours():

@@ -571,17 +571,19 @@ def _build_config(args) -> SSHConfig:
         if password is None and not args.passwordless:
             stored = SessionStore.password(name)
             password = Secret(stored) if stored else None
-        # its own copy, else the shared one from Settings: sessions now keep a
-        # copy only when it differs from the shared jump password
-        from .gui.sessions import jump_password_for
-        jump_password = jump_password or jump_password_for(name, base) or None
-        if jump_password is None and args.jump_host:
-            # a jump host named here, for a session saved without one: the
-            # session's own jump password if it has one (as 2.0.0 used), else
-            # the shared one from Settings
-            from .gui import settings
-            jump_password = (SessionStore.jump_password(name)
-                             or settings.jump_password() or None)
+        # its own jump password (2.0.0 used it, also for a jump host named
+        # here), else the shared one from Settings — but only when the jump
+        # host and user it goes through ARE the ones in Settings
+        from .gui.sessions import effective_jump_password
+        via = dict(base)
+        if args.jump_host:
+            via.update(use_jump=True, jhost=args.jump_host,
+                       juser=args.jump_user or base.get("juser") or "")
+        elif args.jump_user and base.get("use_jump"):
+            via["juser"] = args.jump_user
+        if jump_password is None and via.get("use_jump"):
+            jump_password = effective_jump_password(
+                via, SessionStore.jump_password(name) or "") or None
     policy = args.host_key_policy or (
         ("ignore" if base.get("ignore_hostkey", True) else "auto") if name else "auto")
     legacy = bool(args.legacy or base.get("legacy"))
