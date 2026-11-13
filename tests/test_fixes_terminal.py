@@ -283,7 +283,9 @@ class FakeChannel:
         self.resizes.append((width, height))
 
     def exit_status_ready(self):
-        return self.status is not None
+        # as paramiko: a closed channel counts as having an exit status (-1) —
+        # including one closed because the whole connection died
+        return self.closed or self.status is not None
 
     @property
     def exit_status(self):
@@ -474,6 +476,7 @@ def test_a_link_that_dies_reconnects_and_backs_off_when_it_dies_at_once(ssh_tab)
     assert ssh_tab._quick_drops == 0
     # the new connection dies the moment it opens: wait before trying again
     chan, _ = ssh_tab.connect_fake()
+    chan.transport.active = False
     chan.closed = True
     assert wait_until(lambda: ssh_tab._reconnecting)
     assert ssh_tab._quick_drops == 1 and ssh_tab.connects == [1]
@@ -509,6 +512,26 @@ def test_last_output_and_clean_exit_end_to_end(qapp, ssh_server):
         qtutil.wait_for_teardowns(10)
         widget.deleteLater()
 
+
+
+def test_a_dropped_link_reconnects_end_to_end(qapp, ssh_server):
+    """Against the loopback server: the connection dies under the shell (VPN drop,
+    reboot). paramiko then reports an exit status (-1) on the closed channel,
+    which 2.1.0's first cut took for a deliberate exit, so nothing reconnected."""
+    from turbossh.gui import qtutil
+    from turbossh.gui.session_widgets import SshSessionWidget
+    widget = SshSessionWidget({"name": "loop", "host": "127.0.0.1", "port": ssh_server.port,
+                               "user": "u", "ignore_hostkey": True}, "good", "")
+    try:
+        assert wait_until(lambda: widget.status.text().startswith("Connected"))
+        ssh_server.transports[0].close()                  # the link goes away
+        assert wait_until(lambda: "reconnected" in "\n".join(widget.term.screen.display))
+        assert "remote shell ended" not in "\n".join(widget.term.screen.display)
+        assert len(ssh_server.transports) >= 2
+    finally:
+        widget.close_session()
+        qtutil.wait_for_teardowns(10)
+        widget.deleteLater()
 
 # ====================================================================== serial tab
 class FakeSerial:

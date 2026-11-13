@@ -363,27 +363,39 @@ class SshSessionWidget(QWidget):
         self._start_reconnect(delay=delay)
 
     def _exit_status(self):
-        """The shell's exit status if the server sent one (the shell ended on its
-        own), else None (the link died: no status; a shell killed by a reboot
-        sends a signal, not a status, so that reconnects too)."""
+        """The shell's exit status (-1 if none came) when the remote shell ended
+        on its own, or None when the link died and it should reconnect.
+
+        Decided on the TRANSPORT, not the channel: when the connection dies,
+        paramiko closes every channel and sets its exit status event too (with
+        status -1), so "the channel has an exit status" was true for a VPN drop
+        or a reboot as well, and nothing reconnected. With the transport still
+        up, the shell itself ended (exit, logout, an account whose shell quits)."""
         chan = getattr(self.shell, "channel", None)
+        if chan is None:
+            return None
         try:
-            if chan is not None and chan.exit_status_ready():
-                return chan.exit_status
+            transport = chan.get_transport()
+            alive = transport is not None and transport.is_active()
         except Exception:
-            pass
-        return None
+            alive = False
+        if not alive:
+            return None
+        try:
+            return chan.exit_status if chan.exit_status_ready() else -1
+        except Exception:
+            return -1
 
     def _on_shell_ended(self, status):
         host = self.session.get("host")
         self._quick_drops = 0
         self.status.setText(f"Session ended — {host}")
-        self.term.notice(f"\r\n\x1b[33m[the remote shell ended (exit status {status})]"
+        how = f" (exit status {status})" if status not in (None, -1) else ""
+        self.term.notice(f"\r\n\x1b[33m[the remote shell ended{how}]"
                          f"\x1b[0m  press \x1b[1mCtrl+R\x1b[0m to reconnect\r\n"
                          .encode("utf-8"))
         self.term.reconnect_armed = True
-        self.log.emit(f"[INFO] {self.session.get('name')}: the remote shell ended "
-                      f"(exit status {status})")
+        self.log.emit(f"[INFO] {self.session.get('name')}: the remote shell ended{how}")
         self.connected.emit(False, f"Session ended on {host}")
 
     def _start_reconnect(self, window: float = 30.0, delay: float = 0.0):
