@@ -10,12 +10,9 @@ opened read-only instead of being quietly rewritten."""
 
 from __future__ import annotations
 
-import errno
 import os
 import posixpath
 import re
-import socket
-import stat
 import weakref
 from collections import namedtuple
 
@@ -24,9 +21,10 @@ from PyQt5.QtGui import QFont, QKeySequence
 from PyQt5.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                              QPlainTextEdit, QPushButton, QShortcut, QVBoxLayout)
 
+from .. import _transfer
 from .qtutil import close_jobs, run_job
 from .sftp_browser import (_attr_type, _part_name, kind_problem, local_name,
-                           replace_remote, resolve_remote_link, sip)
+                           resolve_remote_link, sip)
 
 MAX_EDIT_BYTES = 2 * 1024 * 1024     # larger files: download them instead
 
@@ -115,10 +113,12 @@ def write_remote_text(sftp, path, data: bytes, *, stamp=None, mode=None):
 
     *stamp* is the (size, mtime) the file had when it was loaded: if it is not
     that any more, :class:`ChangedOnRemote` is raised and nothing is written.
-    The data goes to a temporary file next to it, which then replaces it (with
-    *mode*, so a rewrite never drops +x) — the file is never truncated first.
-    Only where the folder is not writable (but the file is) is it written in
-    place, the one way left; *how* then says so."""
+    Saving follows TurboSSH's one transfer policy (turbossh._transfer, the same
+    as uploads): a temporary file next to it replaces it with its mode, owner
+    and group — the file is never truncated first. It is written in place where
+    replacing would change what the file is (hard links) or cannot be done (a
+    folder that is not writable, an owner that cannot be kept, no room for a
+    second copy); *how* then says so. *mode* is used if the file is gone."""
     name = posixpath.basename(path)
     target, attr = resolve_remote_link(sftp, path)       # edit the file, not the link
     if stamp is not None:
@@ -128,38 +128,7 @@ def write_remote_text(sftp, path, data: bytes, *, stamp=None, mode=None):
         if _stamp(attr) != tuple(stamp):
             raise ChangedOnRemote(f"{name} was changed on the remote after you "
                                   f"opened it (by someone or something else).")
-    tmp = posixpath.join(posixpath.dirname(target), _part_name(posixpath.basename(target)))
-    how = ""
-    try:
-        fh = sftp.open(tmp, "wb")
-    except IOError as exc:
-        if isinstance(exc, socket.timeout) or exc.errno not in (errno.EACCES, errno.EPERM):
-            raise
-        with sftp.open(target, "wb") as fh:
-            fh.write(data)
-        how = "in place (the folder is not writable)"
-    else:
-        try:
-            with fh:
-                fh.write(data)
-            written = sftp.stat(tmp).st_size
-            if written != len(data):
-                raise IOError(f"only {written} of {len(data)} bytes were written")
-            if mode:
-                try:
-                    sftp.chmod(tmp, stat.S_IMODE(int(mode)))
-                except socket.timeout:
-                    raise
-                except IOError:
-                    pass
-            replace_remote(sftp, tmp, target, existed=attr is not None)
-        except BaseException as exc:
-            if not isinstance(exc, socket.timeout):
-                try:
-                    sftp.remove(tmp)
-                except Exception:
-                    pass
-            raise
+    how = _transfer.put_data(sftp, data, target, existing=attr, mode=mode)
     return len(data), _stamp(sftp.stat(target)), how
 
 

@@ -112,7 +112,8 @@ class _EngineLog:
 def _close_handler(handler):
     """Close a handler nobody is waiting for any more, off the GUI thread."""
     if handler is not None:
-        closer = getattr(handler, "disconnect", None) or getattr(handler, "close", None)
+        closer = ((lambda: handler.disconnect(sticky=True)) if isinstance(handler, SSHHandler)
+                  else getattr(handler, "disconnect", None) or getattr(handler, "close", None))
         if closer is not None:
             qtutil.run_teardown(closer, "close-orphan")
 
@@ -902,7 +903,8 @@ class SerialSessionWidget(QWidget):
                 except Exception:
                     pass
             if handler is not None:
-                closer = getattr(handler, "disconnect", None) or handler.close
+                closer = ((lambda: handler.disconnect(sticky=True)) if isinstance(
+                    handler, SSHHandler) else getattr(handler, "disconnect", None) or handler.close)
                 try:
                     closer()
                 except Exception:

@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QAbstractItemView, QHeaderView, QShortcut, QMenu,
                              QStyle, QApplication, QSizePolicy)
 
+from .. import _transfer
 from ..results import TransferResult
 from . import transfer_log as tl
 from .qtutil import run_job, close_jobs, owner_window, park_thread, run_teardown
@@ -69,7 +70,7 @@ _IN_FLIGHT = 2 * 1024 * 1024     # bytes a cancel may still wait for: the SSH
 _STAT_WINDOW = 64        # link stats in flight at once
 _FILL_CHUNK = 2000       # listing rows added per turn of the event loop
 _MAX_LINK_HOPS = 8       # symlinked folders followed inside one download
-_PART = ".turbossh-part"     # suffix of a file still being written
+_PART = _transfer.TEMP_SUFFIX    # suffix of a file still being written
 _WINDOWS = os.name == "nt"   # this PC's file names follow Windows' rules
 
 
@@ -331,130 +332,50 @@ def _rename(sftp, src, dst):
 
 
 def _part_name(name) -> str:
-    """A temporary name next to *name* for a file still being written: unique,
-    and recognisably ours if a dropped link leaves it behind."""
-    return f".{name[:150]}.{uuid.uuid4().hex[:8]}{_PART}"
+    """The temporary name next to *name* for a file still being written:
+    ``.<name>.tsp``, the same for every attempt, so a retry replaces what an
+    interrupted one left instead of adding another (see turbossh._transfer)."""
+    return _transfer.temp_name(name)
 
 
 def resolve_remote_link(sftp, path):
-    """``(path, attr)``: *path* with symlinks followed — replacing a linked file
-    must replace what it points at, not turn the link into a file — and the
-    lstat of what is there (None if nothing is).
-
-    A link is resolved by the server (realpath): a relative target is relative
-    to where the link really is, and taken as text, "../x" in a symlinked
-    folder pointed somewhere else — an upload made a new file there, and an
-    editor save said the file had been deleted. Only a server that cannot
-    resolve it gets the link's target joined on as text."""
-    for _hop in range(_MAX_LINK_HOPS):
-        try:
-            attr = sftp.lstat(path)
-        except socket.timeout:
-            raise
-        except IOError:
-            return path, None
-        if _attr_type(attr) != stat.S_IFLNK:
-            return path, attr
-        try:
-            real = sftp.normalize(path)
-        except socket.timeout:
-            raise
-        except (IOError, paramiko.SFTPError):    # no realpath, or a strange answer
-            real = ""
-        if real and real != path:        # checked on the next hop: it may be a
-            path = real                  # link still (a server that only tidies)
-            continue
-        target = sftp.readlink(path)
-        if not target:
-            return path, attr
-        path = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
-    raise IOError(f"{path}: too many levels of symbolic links")
+    """``(path, attr)``: *path* with a symlink resolved by the server (realpath:
+    a lexical join of the link's text got ``..`` wrong in symlinked folders) —
+    replacing a linked file must replace what it points at, not turn the link
+    into a file — and the lstat of what is there (None if nothing is)."""
+    return _transfer.resolve(sftp, path)
 
 
 def replace_remote(sftp, tmp, dst, existed=True) -> None:
-    """Move the finished *tmp* over *dst*. posix-rename does that in one step.
-    A server without it (the plain SFTP rename never replaces) gets the old file
-    moved aside first and put back if the new one cannot take its place — the
-    content of *dst* is never lost on the way."""
-    try:
-        sftp.posix_rename(tmp, dst)
-        return
-    except socket.timeout:
-        raise
-    except IOError:
-        if not existed:
-            sftp.rename(tmp, dst)
-            return
-    folder, name = posixpath.split(dst)
-    old = posixpath.join(folder, _part_name(name)[:-len(_PART)] + ".turbossh-old")
-    sftp.rename(dst, old)
-    try:
-        sftp.rename(tmp, dst)
-    except BaseException:
-        try:
-            sftp.rename(old, dst)
-        except Exception:
-            pass
-        raise
-    try:
-        sftp.remove(old)
-    except IOError:
-        pass                             # a stray copy of the old file; nothing lost
+    """Move the finished *tmp* over *dst* (see turbossh._transfer.rename_over:
+    the content of *dst* is never lost on the way)."""
+    _transfer.rename_over(sftp, tmp, dst, existed)
 
 
-_UNKNOWN = object()
+_UNKNOWN = _transfer.UNKNOWN
 
 
-def put_atomic(sftp, local, remote, callback=None, existing=_UNKNOWN) -> None:
-    """Upload *local* to *remote* without ever writing into *remote* itself: to
-    a temporary name in the same folder, then renamed over it (with the old
-    file's permissions). A cancel or a dropped link leaves the old file as it
-    was — it used to be truncated, or deleted outright by Cancel. *existing* is
-    the lstat of what is at *remote* (None: nothing) when the caller knows."""
-    if existing is _UNKNOWN or (existing is not None
-                                and _attr_type(existing) == stat.S_IFLNK):
-        remote, existing = resolve_remote_link(sftp, remote)
-    if existing is not None and _attr_is_dir(existing):
-        raise IOError(f"{remote} is a folder")
-    tmp = posixpath.join(posixpath.dirname(remote), _part_name(posixpath.basename(remote)))
-    try:
-        sftp.put(local, tmp, callback=callback, confirm=True)
-        if existing is not None and getattr(existing, "st_mode", None):
-            try:
-                sftp.chmod(tmp, stat.S_IMODE(int(existing.st_mode)))
-            except socket.timeout:
-                raise
-            except IOError:
-                pass                     # the server's default; still a good file
-        replace_remote(sftp, tmp, remote, existed=existing is not None)
-    except BaseException as exc:
-        # a timed-out client is out of step with the server: it is dropped, so
-        # nothing more is sent on it (the stray temporary file is harmless)
-        if not isinstance(exc, socket.timeout):
-            try:
-                sftp.remove(tmp)
-            except Exception:
-                pass
-        raise
+def put_atomic(sftp, local, remote, callback=None, existing=_UNKNOWN) -> str:
+    """Upload *local* to *remote* by TurboSSH's one transfer policy (the same as
+    SSHHandler.push, see turbossh._transfer): to a temporary name in the same
+    folder, renamed over the old file with its mode, owner and group — a cancel
+    or a dropped link leaves the old file as it was — or written in place where
+    replacing would change what the file is (hard links, a device) or cannot be
+    done (a folder that is not writable, an owner that cannot be kept, no room
+    for a second copy). *existing* is the listing entry of what is at *remote*
+    (None: nothing) when the caller knows. Returns ``""``, or ``"in place
+    (why)"``."""
+    return _transfer.put_file(sftp, local, remote, callback=callback,
+                              existing=existing)
 
 
 def get_atomic(sftp, remote, local, callback=None) -> int:
-    """Download *remote* to *local* through a temporary file in the same folder,
-    renamed into place once complete — a cancel or a dropped link leaves an
-    existing *local* untouched. Returns the size."""
-    if os.path.islink(local):
-        local = os.path.realpath(local)  # replace what the link points at
-    tmp = os.path.join(os.path.dirname(local) or ".", _part_name(os.path.basename(local)))
-    try:
-        sftp.get(remote, tmp, callback=callback)
-        size = os.path.getsize(tmp)
-        os.replace(tmp, local)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+    """Download *remote* to *local* through ``.<name>.tsp`` in the same folder,
+    moved into place once complete (keeping the old file's mode) — a cancel or a
+    dropped link leaves an existing *local* untouched. At most 64 reads are in
+    flight: unlimited prefetch of a large file over a slow link outlasted the
+    SFTP timeout. Returns the size."""
+    size, _how = _transfer.get_file(sftp, remote, local, callback)
     return size
 
 

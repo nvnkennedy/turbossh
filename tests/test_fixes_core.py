@@ -101,10 +101,16 @@ def test_posix_bridge_puts_the_pty_in_raw_mode_and_records_its_pids(monkeypatch)
     # buffering, and Ctrl-C is a byte for the device instead of a SIGINT
     assert "stty raw -echo -isig" in cmd
     assert cmd.index("stty raw -echo -isig") < cmd.index("cat /dev/ttyUSB0 &")
+    # ...keeping 2.0's newline translations (LF -> CRLF out, Enter CR -> LF in)
+    assert (cmd.index("stty raw -echo -isig") < cmd.index("stty icrnl opost onlcr")
+            < cmd.index("cat /dev/ttyUSB0 &"))
     # QNX's stty has no -F: the device is configured through stdin instead
     assert "stty -F /dev/ttyUSB0 9600 raw -echo 2>/dev/null || " \
            "stty 9600 raw -echo < /dev/ttyUSB0" in cmd
-    assert "/tmp/turbossh_ser_devttyUSB0.pid" in cmd
+    # the PID file lives in a folder of the user's own, not at a fixed /tmp name
+    assert '__d="${TMPDIR:-/tmp}/turbossh-$(id -u)"' in cmd
+    assert '__pf="$__d/turbossh_ser_devttyUSB0.pid"' in cmd
+    assert "/tmp/turbossh_ser_" not in cmd
     assert "echo \"$__r $__w\" > \"$__pf\"" in cmd
     assert "fuser" not in cmd                       # only a forced open uses it
     handler.serial_bridge("/dev/ttyUSB0", force=True)
@@ -115,7 +121,7 @@ def test_posix_release_stops_only_the_tracked_bridge(ssh, ssh_server):
     ssh.serial_release("/dev/ttyUSB0")
     cmd = ssh_server.server.execs[-1]
     assert "fuser" not in cmd, "every process holding the device was killed"
-    assert "/tmp/turbossh_ser_devttyUSB0.pid" in cmd
+    assert '__pf="$__d/turbossh_ser_devttyUSB0.pid"' in cmd
     ssh.serial_release("/dev/ttyUSB0", force=True)
     assert "fuser -k /dev/ttyUSB0" in ssh_server.server.execs[-1]
 
@@ -171,7 +177,7 @@ def test_posix_bridge_and_release_end_to_end(monkeypatch, tmp_path):
 # ----------------------------------------------------------- serial: Windows
 def test_windows_stream_records_its_pid_only_once_open_and_stops_its_reader(ssh,
                                                                            ssh_server):
-    res = ssh.serial_stream("COM5", timeout=10)
+    res = ssh.serial_stream("COM5", timeout=10, force=True)
     assert res["lines"] == 1
     stream_cmd, stop_cmd = ssh_server.server.execs[-2:]
     src = decode_ps(stream_cmd)
@@ -341,7 +347,8 @@ def test_ps_quoting_round_trips_through_real_powershell():
 
 # ------------------------------------------------------------- transfers
 def _leftovers(folder):
-    return [p for p in os.listdir(folder) if ".part-" in p]
+    return [p for p in os.listdir(folder)
+            if p.endswith((core._transfer.TEMP_SUFFIX, core._transfer.ASIDE_SUFFIX))]
 
 
 def test_an_aborted_pull_keeps_the_existing_local_file(ssh, ssh_server, tmp_path):
@@ -501,10 +508,10 @@ def test_a_reconnect_closes_the_dead_connection(make_config):
         handler.disconnect()
 
 
-def test_disconnect_is_sticky_until_the_next_connect(make_config, ssh_server):
+def test_a_sticky_disconnect_holds_until_the_next_connect(make_config, ssh_server):
     handler = SSHHandler(make_config(auto_reconnect=True), quiet=True)
     handler.connect()
-    handler.disconnect()
+    handler.disconnect(sticky=True)
     before = len(ssh_server.transports)
     with pytest.raises(SSHNotConnectedError):
         handler.run("echo")

@@ -136,7 +136,8 @@ def _close_quietly(fileobj):
 def _close_orphan(first, *_rest):
     """Result of a worker nobody waits for any more: if it is a connected
     handler or an open channel, close it (off the GUI thread)."""
-    closer = getattr(first, "disconnect", None) or getattr(first, "close", None)
+    closer = ((lambda: first.disconnect(sticky=True)) if isinstance(first, SSHHandler)
+              else getattr(first, "disconnect", None) or getattr(first, "close", None))
     if closer is not None:
         qtutil.run_teardown(closer, "camera-orphan")
 
@@ -693,7 +694,7 @@ class CameraPanel(QWidget):
         previous, self._handler = self._handler, handler
         if previous is not None and previous is not handler:
             # every scan makes a new connection; the old one used to be left open
-            qtutil.run_teardown(previous.disconnect, "camera-old-handler")
+            qtutil.run_teardown(lambda: previous.disconnect(sticky=True), "camera-old-handler")
         self._remote_ffmpeg = remote_ffmpeg
         self._fill(cams, diag)
 
@@ -1188,7 +1189,7 @@ class CameraPanel(QWidget):
                         pass
                 if handler is not None and drop_handler:
                     try:
-                        handler.disconnect()
+                        handler.disconnect(sticky=True)
                     except Exception:
                         pass
             qtutil.run_teardown(teardown, "camera-teardown")
