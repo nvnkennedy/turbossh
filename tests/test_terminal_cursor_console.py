@@ -342,6 +342,7 @@ def test_ctrl_c_reaches_the_shells_program_when_turbossh_was_started_ignoring_it
     assert report.read_text() == "stopped"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows consoles (ctypes.wintypes)")
 def test_ctrl_c_is_let_through_only_where_nobody_else_can_send_it():
     """No console, or a hidden one nobody else is attached to (the embed
     client starts TurboSSH so): cleared. A console shared with a terminal:
