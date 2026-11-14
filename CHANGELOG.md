@@ -149,7 +149,10 @@ themselves were reviewed again, so that what worked in 2.0.0 keeps working.
 - `connect()` and `disconnect()` no longer hang on a stalled link while another
   thread uploads: the transport is closed first.
 - A cancelled download stops its read-ahead (Paramiko 3.3 and later). It used to
-  keep sending reads on the closed file.
+  keep sending reads on the closed file. And a download no longer fetches the
+  file twice when Paramiko's read-ahead thread starts a moment late. Paramiko
+  then took the read-ahead for finished: the file came one block per round trip
+  while the read-ahead fetched all of it again into memory.
 - Set up SSH server polls for its result once, not once per click.
 
 ### Fixed — crashes

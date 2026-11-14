@@ -894,24 +894,60 @@ def _can_stop_prefetch() -> bool:
 _CAN_STOP_PREFETCH = _can_stop_prefetch()
 
 
+_HOLD = -1                       # a request number no reply ever has (see _ReadAhead)
+
+
 class _ReadAhead:
     """The (offset, length) reads of a download's read-ahead, handed out until
     :meth:`stop` — Paramiko's own list made its thread go on sending reads for
-    the whole file after a cancelled download had closed it."""
+    the whole file after a cancelled download had closed it.
 
-    def __init__(self, start: int, size: int, step: int):
+    *fr* given, it also keeps Paramiko from taking the read-ahead for finished
+    while it is not: Paramiko calls it done the moment no read is in flight,
+    and its thread, a few ms late after the first request, then left the file
+    to one-at-a-time reads while the read-ahead fetched the whole file again
+    into memory (CI saw 1,088 reads for 1,024 blocks). A placeholder in its
+    table of reads in flight (one no reply ever matches) is kept there until
+    the reads are all handed out, or stopped."""
+
+    def __init__(self, start: int, size: int, step: int, fr=None):
         self.start, self.size, self.step = start, size, step
         self.stopped = False
+        self._fr = fr
+        self._held = False
+        lock = getattr(fr, "_prefetch_lock", None)
+        table = getattr(fr, "_prefetch_extents", None)
+        if lock is not None and isinstance(table, dict):
+            with lock:
+                table[_HOLD] = (size, 0)
+            self._held = True
 
     def __iter__(self):
         n = self.start
-        while n < self.size and not self.stopped:
-            length = min(self.step, self.size - n)
-            yield n, length
-            n += length
+        try:
+            while n < self.size and not self.stopped:
+                length = min(self.step, self.size - n)
+                yield n, length
+                n += length
+        finally:
+            self._release()
 
     def stop(self) -> None:
         self.stopped = True
+        self._release()
+
+    def _release(self) -> None:
+        """Take the placeholder out; done, as Paramiko would have said, if no
+        real read is in flight either."""
+        if not self._held:
+            return
+        fr = self._fr
+        with fr._prefetch_lock:
+            if self._held:
+                self._held = False
+                fr._prefetch_extents.pop(_HOLD, None)
+                if not fr._prefetch_extents:
+                    fr._prefetch_done = True
 
 
 def _get_stoppable(sftp, remote: str, local: str, callback) -> None:
@@ -923,7 +959,8 @@ def _get_stoppable(sftp, remote: str, local: str, callback) -> None:
             ahead = None
             if file_size:                # (no read-ahead for nothing: it would wait)
                 ahead = _ReadAhead(0, file_size,
-                                   getattr(fr, "MAX_REQUEST_SIZE", _CHUNK))
+                                   getattr(fr, "MAX_REQUEST_SIZE", _CHUNK), fr)
+                # (the placeholder takes one of the PREFETCH slots)
                 fr._start_prefetch(ahead, PREFETCH)
             try:
                 size = 0

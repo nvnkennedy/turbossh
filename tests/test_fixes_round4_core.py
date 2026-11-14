@@ -913,19 +913,25 @@ def test_a_refused_chmod_writes_the_file_in_place(ssh, ssh_server, tmp_path,
 
 
 # ===================================================================== L7
-@pytest.mark.skipif(not getattr(_transfer, "_CAN_STOP_PREFETCH", True),
-                    reason="this Paramiko's read-ahead cannot be stopped")
 def _read_ahead_threads():
     return [t for t in threading.enumerate()
             if getattr(getattr(t, "_target", None), "__name__", "") == "_prefetch_thread"]
 
 
+@pytest.mark.skipif(not getattr(_transfer, "_CAN_STOP_PREFETCH", True),
+                    reason="this Paramiko's read-ahead cannot be stopped")
 def test_a_cancelled_download_sends_no_more_reads(ssh, ssh_server, sftp_client,
                                                   tmp_path, monkeypatch):
     """Paramiko's read-ahead thread went on after a cancelled download had
     closed the file: it sent more reads on the closed handle, and then — its
     replies being errors that never free a slot — waited for room for ever,
-    one spinning thread per cancelled download."""
+    one spinning thread per cancelled download.
+
+    How far the read-ahead got before the cancel depends on the machine: it
+    caps the reads in flight, not how far it runs ahead of what was read, so
+    on a fast loopback it may have asked for the whole file by then. What is
+    checked: its thread ends, and after the cancel no more than the reads
+    already in flight go out."""
     before = set(_read_ahead_threads())
     size = 32 * 1024 * 1024
     (ssh_server.root / "big.bin").write_bytes(b"\0" * size)
@@ -940,8 +946,11 @@ def test_a_cancelled_download_sends_no_more_reads(ssh, ssh_server, sftp_client,
     class Cancelled(Exception):
         pass
 
+    at_cancel = {}
+
     def cancel(done, total):
         if done > 2 * 1024 * 1024:
+            at_cancel.setdefault("reads", reads["n"])
             raise Cancelled()
     with pytest.raises(Cancelled):
         _transfer.get_file(sftp_client, "/big.bin", str(tmp_path / "big.bin"), cancel)
@@ -952,7 +961,12 @@ def test_a_cancelled_download_sends_no_more_reads(ssh, ssh_server, sftp_client,
     while set(_read_ahead_threads()) - before and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not set(_read_ahead_threads()) - before, "the read-ahead thread lives on"
-    assert reads["n"] < 300, f"{reads['n']} reads of {size // 32768}"
+    settled = reads["n"]
+    time.sleep(0.5)
+    assert reads["n"] == settled, "reads still go out after the read-ahead ended"
+    # the ones in flight at the cancel (PREFETCH), and the one its thread held
+    assert reads["n"] - at_cancel["reads"] <= _transfer.PREFETCH + 2, (
+        reads["n"], at_cancel["reads"])
     assert leftovers(tmp_path) == []
     # and the client still works for the next download
     (ssh_server.root / "small.bin").write_bytes(b"S" * 100_000)

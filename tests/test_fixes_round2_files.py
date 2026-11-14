@@ -232,22 +232,25 @@ def test_a_transfer_that_went_quiet_before_the_cancel_is_freed_at_once(
 def test_how_long_a_cancelled_transfer_may_stay_quiet(qapp):
     t = sb._TransferThread(None, sb._Job("download", "/r", "C:/l", False, 0))
     heard = t.heard
+    # (just past each limit: (heard + x) - heard is not always exactly x in
+    # floating point — with some clock values it came out a hair under)
+    eps = 0.01
     # nothing measured yet: the floor
     assert not t.stalled(heard + sb._STALL_AFTER - 0.1)
-    assert t.stalled(heard + sb._STALL_AFTER)
+    assert t.stalled(heard + sb._STALL_AFTER + eps)
     # a slow link (1 Mbit/s) needs ~16 s to settle 2 MB in flight: it gets them
     t.pace = 128 * 1024
     assert not t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace - 0.5)
-    assert t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace)
+    assert t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace + eps)
     # slower than 2 MB in 22 s (~95 KB/s): still waited for past the SFTP
     # timeout, which is silence between replies — a live link is not silent
     t.pace = 40 * 1024
     assert not t.stalled(heard + sb._SFTP_TIMEOUT + 5)
-    assert t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace)
+    assert t.stalled(heard + sb._STALL_AFTER + 2 * 1024 * 1024 / t.pace + eps)
     # however slow, not for ever
     t.pace = 100
     assert not t.stalled(heard + sb._CANCEL_WAIT_MAX - 1)
-    assert t.stalled(heard + sb._CANCEL_WAIT_MAX)
+    assert t.stalled(heard + sb._CANCEL_WAIT_MAX + eps)
     t.deleteLater()
 
 

@@ -196,3 +196,42 @@ def test_a_probe_on_a_dead_link_ends_with_the_transport(make_config, ssh_server,
         time.sleep(0.05)
     block.set()
     assert probes() == before, "the probe outlived the link"
+
+
+# ---------------------------------------------------------------- Paramiko's read-ahead race
+@pytest.mark.skipif(not getattr(_transfer, "_CAN_STOP_PREFETCH", False),
+                    reason="this Paramiko's read-ahead is not driven by TurboSSH")
+@pytest.mark.parametrize("lag", [0.0, 0.002, 0.01, 0.03])
+def test_a_late_read_ahead_thread_does_not_fetch_the_file_twice(ssh, ssh_server, tmp_path,
+                                                                monkeypatch, lag):
+    """Paramiko takes its read-ahead for finished the moment no read is in
+    flight. Its thread a few ms late after the first request (CI, Python 3.13),
+    the download went on with one-at-a-time reads while the read-ahead fetched
+    the whole file again into memory: 1,088 reads for 1,024 blocks."""
+    size = 8 * 1024 * 1024 + 123
+    data = os.urandom(size)
+    (ssh_server.root / "big.bin").write_bytes(data)
+    reads = {"n": 0}
+    original = paramiko.SFTPHandle.read
+
+    def counting(self, offset, length):
+        reads["n"] += 1
+        return original(self, offset, length)
+    monkeypatch.setattr(paramiko.SFTPHandle, "read", counting)
+    real_iter = _transfer._ReadAhead.__iter__
+
+    def lagging(self):
+        for i, chunk in enumerate(real_iter(self)):
+            yield chunk
+            if i == 0 and lag:
+                time.sleep(lag)          # the first reply comes before the 2nd read
+    monkeypatch.setattr(_transfer._ReadAhead, "__iter__", lagging)
+    client = ssh.open_sftp()
+    try:
+        _transfer.get_file(client, "/big.bin", str(tmp_path / "big.bin"))
+    finally:
+        client.close()
+    assert (tmp_path / "big.bin").read_bytes() == data
+    blocks = -(-size // 32768)
+    # (+ the read or two at the end that find the end of the file)
+    assert reads["n"] <= blocks + 4, f"{reads['n']} reads for {blocks} blocks"
