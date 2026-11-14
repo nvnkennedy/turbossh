@@ -2,6 +2,49 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.1.1 — 2026-11-15
+
+The terminal: the cursor is drawn where it is, any font keeps to the grid,
+and the local terminal on Windows is a real console with Tab completion.
+
+### Changed — please read when upgrading
+- **The local terminal on Windows is a real console.** PowerShell and Command
+  Prompt run in a Windows pseudo console (ConPTY, Windows 10 1809 and later), as
+  in Windows Terminal:
+  - Tab completes commands and paths;
+  - the shell edits its own line and keeps its own history (PSReadLine in
+    PowerShell, with its colours);
+  - Ctrl+C reaches the running program, also when the updater restarted
+    TurboSSH (it starts it ignoring Ctrl+C, and the shell inherited that).
+
+  As in any Windows console, what is typed while Ctrl+C is handled is thrown
+  away, including the rest of a paste. **Clear** still moves the screen into
+  the scrollback, and clears the console's screen too. It never types into a
+  command that asks something (`set /p`, `Read-Host`, `pause`). At
+  PowerShell's prompt it is PSReadLine's Clear Screen (Ctrl+L). Elsewhere in
+  PowerShell (a custom prompt, a command running or asking something) it
+  cannot clear safely. It then leaves the screen as it is, and the status line
+  says to press Ctrl+L at the prompt. Older Windows gets the 2.0.0 behaviour:
+  pipes, TurboSSH's own line editing, no Tab completion. Set
+  `TURBOSSH_NO_CONPTY=1` to get it on newer Windows too.
+
+### Fixed — the terminal
+- The cursor is drawn where it is. A move along its row repainted nothing, so
+  the cursor stayed drawn where it had been. Such moves are Left / Right, a
+  shell putting the cursor back after completing a word, a carriage return, and
+  showing the cursor again after a redraw.
+- The cursor blinks while the terminal has the keyboard, at the system's caret
+  rate. It stays solid while you type or output arrives.
+- A proportional terminal font no longer pulls the text off the grid. Text came
+  out narrower than the cells, so the cursor stood far to the right of what was
+  typed. For such a font the terminal uses a monospaced one (Cascadia Mono,
+  Consolas, …).
+- Settings offers only monospaced fonts. Pressing OK no longer replaces a
+  terminal font that is not installed with some other font, which was often a
+  proportional one.
+- Bright colours (SGR 90–97 and 100–107, used by PSReadLine and many `ls`
+  colour schemes) are shown bright, not in the default colour.
+
 ## 2.1.0 — 2026-11-14
 
 A reliability release. The whole project was reviewed for what can make the
@@ -100,25 +143,6 @@ themselves were reviewed again, so that what worked in 2.0.0 keeps working.
   process (desktop app, embedded GUI) keeps its own theme and Camera choice.
   Saving writes only what that process changed, so it no longer undoes another
   process's changes.
-- **The local terminal on Windows is a real console.** PowerShell and Command
-  Prompt run in a Windows pseudo console (ConPTY, Windows 10 1809 and later), as
-  in Windows Terminal:
-  - Tab completes commands and paths;
-  - the shell edits its own line and keeps its own history (PSReadLine in
-    PowerShell, with its colours);
-  - Ctrl+C reaches the running program, also when the updater restarted
-    TurboSSH (it starts it ignoring Ctrl+C, and the shell inherited that).
-
-  As in any Windows console, what is typed while Ctrl+C is handled is thrown
-  away, including the rest of a paste. **Clear** still moves the screen into
-  the scrollback, and clears the console's screen too. It never types into a
-  command that asks something (`set /p`, `Read-Host`, `pause`). At
-  PowerShell's prompt it is PSReadLine's Clear Screen (Ctrl+L). Elsewhere in
-  PowerShell (a custom prompt, a command running or asking something) it
-  cannot clear safely. It then leaves the screen as it is, and the status line
-  says to press Ctrl+L at the prompt. Older Windows gets the 2.0.0 behaviour:
-  pipes, TurboSSH's own line editing, no Tab completion. Set
-  `TURBOSSH_NO_CONPTY=1` to get it on newer Windows too.
 
 ### Added
 - `SSHHandler.disconnect(sticky=True)`: nothing reconnects the handler until
@@ -137,23 +161,6 @@ themselves were reviewed again, so that what worked in 2.0.0 keeps working.
 - The file browser carries on over a reconnected session, keeping its queue,
   history and editors. The interrupted transfer starts again unless you
   cancelled it.
-
-### Fixed — the terminal
-- The cursor is drawn where it is. A move along its row repainted nothing, so
-  the cursor stayed drawn where it had been. Such moves are Left / Right, a
-  shell putting the cursor back after completing a word, a carriage return, and
-  showing the cursor again after a redraw.
-- The cursor blinks while the terminal has the keyboard, at the system's caret
-  rate. It stays solid while you type or output arrives.
-- A proportional terminal font no longer pulls the text off the grid. Text came
-  out narrower than the cells, so the cursor stood far to the right of what was
-  typed. For such a font the terminal uses a monospaced one (Cascadia Mono,
-  Consolas, …).
-- Settings offers only monospaced fonts. Pressing OK no longer replaces a
-  terminal font that is not installed with some other font, which was often a
-  proportional one.
-- Bright colours (SGR 90–97 and 100–107, used by PSReadLine and many `ls`
-  colour schemes) are shown bright, not in the default colour.
 
 ### Fixed — the window stopped responding
 - Typing, pasting and terminal resizes go out on a writer thread per session
