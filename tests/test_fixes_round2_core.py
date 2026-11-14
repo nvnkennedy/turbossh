@@ -357,14 +357,27 @@ def test_failed_pushes_leave_no_pile_of_temporary_files(
     for _ in range(3):
         with pytest.raises(SSHTransferError):
             ssh.push(str(src), "/ffmpeg.exe", callback=drop)
+    # each retry removed what the previous one of this process left (it is
+    # known to be nobody's), so there is one at most — however young
     left = leftovers(ssh_server.root)
-    assert left == [".ffmpeg.exe.0.tsp", ".ffmpeg.exe.1.tsp", ".ffmpeg.exe.2.tsp"]
+    assert left == [".ffmpeg.exe.0.tsp"]
     assert (ssh_server.root / "ffmpeg.exe").read_bytes() == b"OLD"
-    for name in left:
-        _age(ssh_server.root / name)       # abandoned by now
-    ssh.push(str(src), "/ffmpeg.exe")
+    ssh.push(str(src), "/ffmpeg.exe")        # right away: no ageing needed
     assert leftovers(ssh_server.root) == []
     assert (ssh_server.root / "ffmpeg.exe").read_bytes() == src.read_bytes()
+
+
+def test_another_runs_young_temporary_file_is_left_alone(ssh, ssh_server, tmp_path):
+    """One this process did not leave, younger than STALE_AFTER: another
+    transfer may still be writing it — kept, and this one takes the next name."""
+    (ssh_server.root / "fw.bin").write_bytes(b"GOOD")
+    busy = ssh_server.root / _transfer.temp_name("fw.bin")
+    busy.write_bytes(b"another transfer, still going")
+    src = tmp_path / "fw.bin"
+    src.write_bytes(b"NEW")
+    ssh.push(str(src), "/fw.bin")
+    assert (ssh_server.root / "fw.bin").read_bytes() == b"NEW"
+    assert busy.read_bytes() == b"another transfer, still going"
 
 
 def test_a_name_too_long_for_the_temporary_suffix_still_uploads(ssh, ssh_server,

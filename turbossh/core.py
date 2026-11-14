@@ -758,14 +758,21 @@ class SSHHandler:
         server's SSH_MSG_UNIMPLEMENTED reply, and that live link looked dead.
         Any packet that arrives meanwhile counts as well, so an answer queued
         behind bulk data on a slow link is not needed. The probe runs on a
-        helper thread; on a dead link it ends when the transport is closed."""
+        helper thread; on a dead link it ends when the transport is closed.
+
+        The helper waits for its answer without a deadline of its own (only the
+        caller's wait is bounded): given up on, a confirmation arriving late was
+        ignored by Paramiko and never closed, and the server kept that session
+        slot (OpenSSH allows 10 per connection) until the connection ended."""
         if transport is None or not transport.is_active():
             return False
         answered = threading.Event()
 
         def probe():
             try:
-                chan = transport.open_session(timeout=timeout)
+                # None: Paramiko's channel_timeout (an hour) — in practice
+                # until the answer comes or the transport closes
+                chan = transport.open_session(timeout=None)
             except paramiko.ChannelException:      # OPEN_FAILURE: an answer
                 answered.set()
                 return
@@ -1981,11 +1988,12 @@ class SSHHandler:
         than a command line can carry is written in several steps, in order.
         """
         raw = data + ("\n" if newline else "")
+        payload = raw.encode("utf-8")
         if self._is_windows_port(device, mode):
             # The bytes travel base64-encoded (no payload can break the quoting)
             # and are written as UTF-8 (SerialPort's default encoding is ASCII,
             # which turned every non-ASCII character into '?').
-            cmds = self._serial_write_cmds(device, raw.encode("utf-8"), baudrate)
+            cmds = self._serial_write_cmds(device, payload, baudrate)
         else:
             dev = shlex.quote(device)
             # `> dev` on a missing device would create a plain file there instead
@@ -1997,8 +2005,19 @@ class SSHHandler:
 
         def _do():
             res = None
-            for cmd in cmds:
-                res = self.run(cmd, timeout=60, check=True, safe=False)
+            for index, cmd in enumerate(cmds):
+                try:
+                    res = self.run(cmd, timeout=60, check=True, safe=False)
+                except SSHCommandError as exc:
+                    if index:
+                        # the earlier parts are on the wire already: say so (the
+                        # device has a partial line the next command joins)
+                        sent = min(len(payload), index * self._SERIAL_WRITE_CHUNK)
+                        exc.partial = sent
+                        exc.args = (f"{exc.args[0] if exc.args else exc}\n{sent} of "
+                                    f"{len(payload)} bytes had been written to "
+                                    f"{device} before this part failed.",)
+                    raise
             return res
         return self._guard("serial_write", _do, safe=safe)
 

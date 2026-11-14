@@ -335,6 +335,48 @@ def _lstat_or_none(sftp, path: str):
         return None
 
 
+# Temporary files this process left on a server after a broken transfer (the
+# link dropped, a request timed out: removing it failed or was not tried). The
+# next transfer to that target removes one at once, whatever its age — it is
+# known to be nobody's. Without this, a retry right after a VPN drop skipped
+# the partial copy (too young to be taken for abandoned), succeeded under the
+# next name, and a file pushed only once (ffmpeg, a firmware image) left the
+# partial copy there for good.
+_LEFT_BEHIND: set = set()        # (server, path)
+_LEFT_LOCK = threading.Lock()
+
+
+def _server(sftp):
+    """Who *sftp* talks to, as far as it can be told: the address and the host
+    key (the address alone is the jump host's for every target behind it).
+    None when it cannot be told; then nothing is recorded for it."""
+    try:
+        transport = sftp.get_channel().get_transport()
+        key = transport.get_remote_server_key()
+        return (tuple(transport.getpeername()), key.get_name(), key.asbytes())
+    except Exception:
+        return None
+
+
+def _left_behind(sftp, path: str) -> None:
+    server = _server(sftp)
+    if server is not None:
+        with _LEFT_LOCK:
+            _LEFT_BEHIND.add((server, path))
+
+
+def _ours_from_before(sftp, path: str) -> bool:
+    """Was *path* left by a broken transfer of this process (and forgotten now)?"""
+    server = _server(sftp)
+    if server is None:
+        return False
+    with _LEFT_LOCK:
+        if (server, path) in _LEFT_BEHIND:
+            _LEFT_BEHIND.discard((server, path))
+            return True
+    return False
+
+
 def _remove_abandoned(sftp, fh, taken) -> None:
     """Remove the temporary files in *taken* (``(path, lstat)`` pairs: names
     another run holds) that have not changed for :data:`STALE_AFTER` seconds —
@@ -355,13 +397,15 @@ def _remove_abandoned(sftp, fh, taken) -> None:
 
 def _cleanup(sftp, path: str, exc: BaseException) -> None:
     """Remove a temporary file after a failure — not after a timeout (the client
-    is out of step with the server then, and is dropped by its owner)."""
+    is out of step with the server then, and is dropped by its owner). What is
+    not removed is remembered, for the next transfer to remove."""
     if isinstance(exc, socket.timeout):
+        _left_behind(sftp, path)
         return
     try:
         sftp.remove(path)
     except Exception:
-        pass
+        _left_behind(sftp, path)
 
 
 def _close_quietly(fh) -> None:
@@ -393,6 +437,19 @@ def _open_temp(sftp, path: str, suffix: str = TEMP_SUFFIX):
             attr = _lstat_or_none(sftp, tmp)
             if attr is None:                 # not taken: refused for another reason
                 raise
+            if _ours_from_before(sftp, tmp):
+                # left by a broken transfer of ours: nobody's, gone now (a
+                # server session the drop orphaned may still hold it open,
+                # where Windows refuses — then the name stays taken)
+                _remove_stale(sftp, tmp)
+                try:
+                    fh = sftp.open(tmp, "wbx")
+                except socket.timeout:
+                    raise
+                except IOError:
+                    taken.append((tmp, attr))
+                    continue
+                return fh, tmp, slot
             taken.append((tmp, attr))
             continue
         if taken:
@@ -586,8 +643,11 @@ def _early_mode(perm: int) -> int:
     """The mode a temporary copy gets BEFORE its data is written: the final
     one, but writable by its owner (a read-only mode could keep the copy from
     being written or removed again on some servers). Nobody else gets
-    anything the final mode does not give them."""
-    return perm | 0o200
+    anything the final mode does not give them — and no setuid / setgid /
+    sticky bit yet: a half-written setuid-root copy, executable by everyone,
+    while a root upload runs (writes by root do not clear it). _late_mode sets
+    them once the data is in."""
+    return (perm & 0o777) | 0o200
 
 
 def _late_mode(sftp, path: str, perm: int, early: int) -> None:
