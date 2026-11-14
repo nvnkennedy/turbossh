@@ -53,6 +53,11 @@ def main(argv=None) -> int:
             cmd += ["--add-data", f"{src}{sep}{dest}"]
         for mod in ("winrm", "keyring.backends", "requests_ntlm", "spnego"):
             cmd += ["--hidden-import", mod]
+        # pywinrm ships its own tests (winrm.tests), which import pytest — and
+        # pytest pulls in numpy where it is installed: 12 MB of test tooling the
+        # app never runs. Collecting winrm's submodules must not take them along.
+        for mod in ("winrm.tests", "pytest", "_pytest", "numpy"):
+            cmd += ["--exclude-module", mod]
         cmd += ["--collect-submodules", "paramiko",
                 "--collect-submodules", "serial",
                 "--collect-submodules", "pyte",
