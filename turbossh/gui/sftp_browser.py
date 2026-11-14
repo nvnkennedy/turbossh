@@ -334,9 +334,9 @@ def _rename(sftp, src, dst):
 
 
 def _part_name(name) -> str:
-    """The temporary name next to *name* for a file still being written:
-    ``.<name>.tsp``, the same for every attempt, so a retry replaces what an
-    interrupted one left instead of adding another (see turbossh._transfer)."""
+    """A temporary name next to *name* for a file still being written:
+    ``.<name>.0.tsp`` (transfers pick the first free ``.<name>.<n>.tsp``
+    themselves, see turbossh._transfer)."""
     return _transfer.temp_name(name)
 
 
@@ -372,7 +372,7 @@ def put_atomic(sftp, local, remote, callback=None, existing=_UNKNOWN) -> str:
 
 
 def get_atomic(sftp, remote, local, callback=None) -> int:
-    """Download *remote* to *local* through ``.<name>.tsp`` in the same folder,
+    """Download *remote* to *local* through ``.<name>.<n>.tsp`` in the same folder,
     moved into place once complete (keeping the old file's mode) — a cancel or a
     dropped link leaves an existing *local* untouched. At most 64 reads are in
     flight: unlimited prefetch of a large file over a slow link outlasted the

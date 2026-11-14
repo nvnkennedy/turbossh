@@ -263,9 +263,11 @@ def test_browser_upload_into_a_read_only_folder_writes_the_file_in_place(
 # ------------------------------------------------- no room for a second copy
 def test_no_room_for_a_second_copy_writes_the_file_in_place(ssh, ssh_server, tmp_path,
                                                              monkeypatch):
-    """ENOSPC is a plain "Failure" in SFTP v3. 2.0 truncated and rewrote."""
+    """ENOSPC is a plain "Failure" in SFTP v3. 2.0 truncated and rewrote. (Only
+    where the new data fits in the old file's room — round 4; a bigger one is
+    refused and the old file kept, see test_fixes_round4_core.)"""
     target = ssh_server.root / "big.img"
-    target.write_bytes(b"O" * 1000)
+    target.write_bytes(b"O" * 300_000)
     real_target = ssh_server.server.sftp_root + "/big.img"
     original = paramiko.SFTPHandle.write
 
@@ -310,23 +312,31 @@ def test_browser_upload_through_a_link_in_a_linked_folder(ssh, ssh_server, sftp,
 
 
 # ------------------------------------------------- temporary names
-def test_a_stale_temporary_file_is_replaced_not_added_to(ssh, ssh_server, tmp_path):
+def _age(path, seconds=3600):
+    when = time.time() - seconds
+    os.utime(str(path), (when, when))
+
+
+def test_a_stale_temporary_file_is_removed_not_added_to(ssh, ssh_server, tmp_path):
     (ssh_server.root / "fw.bin").write_bytes(b"GOOD")
     stale = ssh_server.root / _transfer.temp_name("fw.bin")
     stale.write_bytes(b"left by a run whose link dropped")
+    _age(stale)                    # round 4: only an abandoned one is removed
     src = tmp_path / "fw.bin"
     src.write_bytes(b"NEW FIRMWARE")
     ssh.push(str(src), "/fw.bin")
     assert (ssh_server.root / "fw.bin").read_bytes() == b"NEW FIRMWARE"
     assert leftovers(ssh_server.root) == []
-    assert _transfer.temp_name("fw.bin") == ".fw.bin.tsp"
+    assert _transfer.temp_name("fw.bin") == ".fw.bin.0.tsp"
 
 
-def test_a_failed_push_leaves_at_most_one_temporary_file_per_target(
+def test_failed_pushes_leave_no_pile_of_temporary_files(
         ssh, ssh_server, tmp_path, monkeypatch):
-    """A link that drops leaves the temporary file (nothing can remove it): the
-    next attempts reuse that one name instead of adding one each (the camera's
-    160 MB ffmpeg upload left one per failure)."""
+    """A link that drops leaves the temporary file (nothing can remove it). Each
+    attempt has a name of its own (round 4: a shared one let two transfers
+    clobber each other); a later push removes the ones that are abandoned, so
+    they do not pile up (the camera's 160 MB ffmpeg upload left one per
+    failure)."""
     (ssh_server.root / "ffmpeg.exe").write_bytes(b"OLD")
     src = tmp_path / "ffmpeg.exe"
     src.write_bytes(os.urandom(300_000))
@@ -347,8 +357,11 @@ def test_a_failed_push_leaves_at_most_one_temporary_file_per_target(
     for _ in range(3):
         with pytest.raises(SSHTransferError):
             ssh.push(str(src), "/ffmpeg.exe", callback=drop)
-    assert leftovers(ssh_server.root) == [".ffmpeg.exe.tsp"]
+    left = leftovers(ssh_server.root)
+    assert left == [".ffmpeg.exe.0.tsp", ".ffmpeg.exe.1.tsp", ".ffmpeg.exe.2.tsp"]
     assert (ssh_server.root / "ffmpeg.exe").read_bytes() == b"OLD"
+    for name in left:
+        _age(ssh_server.root / name)       # abandoned by now
     ssh.push(str(src), "/ffmpeg.exe")
     assert leftovers(ssh_server.root) == []
     assert (ssh_server.root / "ffmpeg.exe").read_bytes() == src.read_bytes()
@@ -438,11 +451,17 @@ def test_browser_download_bounds_prefetch(ssh, ssh_server, sftp, tmp_path, monke
     original_get = paramiko.SFTPClient.get
 
     def spy(self, remote, local, **kw):
-        seen.append(kw)
+        seen.append(kw.get("max_concurrent_prefetch_requests"))
         return original_get(self, remote, local, **kw)
     monkeypatch.setattr(paramiko.SFTPClient, "get", spy)
+    start = getattr(paramiko.SFTPFile, "_start_prefetch", None)
+    if start is not None:                   # where the read-ahead can be stopped
+        def spy_start(self, chunks, max_concurrent_requests=None):
+            seen.append(max_concurrent_requests)
+            return start(self, chunks, max_concurrent_requests)
+        monkeypatch.setattr(paramiko.SFTPFile, "_start_prefetch", spy_start)
     assert sb.get_atomic(sftp, "/big.log", str(tmp_path / "big.log")) == 100_000
-    assert seen[-1].get("max_concurrent_prefetch_requests") == 64
+    assert seen[-1] == 64
 
 
 def test_browser_download_over_a_held_file_writes_it_in_place(ssh, ssh_server, sftp,
@@ -507,16 +526,17 @@ def test_connect_replaces_a_link_that_stopped_answering(make_config, ssh_server,
     """After a DUT reboot the old TCP link still looks open until something is
     sent; connect() must notice and open a fresh one (2.0 always did)."""
     monkeypatch.setattr(SSHHandler, "_LIVENESS_TIMEOUT", 1.0, raising=False)
-    handler = SSHHandler(make_config(), quiet=True)
+    handler = SSHHandler(make_config(connect_timeout=1), quiet=True)
     handler.connect()
     release, asked = threading.Event(), []
+    answer = ssh_server.server.check_channel_request
 
-    def silent(kind, msg):                # the first connection goes quiet
+    def silent(kind, chanid):             # the first connection goes quiet
         asked.append(kind)
         if len(asked) == 1:
             release.wait(30)
-        return False
-    ssh_server.server.check_global_request = silent
+        return answer(kind, chanid)
+    ssh_server.server.check_channel_request = silent
     try:
         old = handler.client
         assert handler.is_connected                # it still looks connected
@@ -580,11 +600,14 @@ def test_a_stream_does_not_kill_a_live_bridge_on_its_port(ssh, ssh_server):
 
 def test_force_kill_never_matches_its_own_ancestors_or_wrappers(monkeypatch):
     handler, sent = _offline_handler(monkeypatch)
+    ran = []
+    monkeypatch.setattr(handler, "_run", lambda cmd, **kw: ran.append(cmd))
     handler.serial_bridge("COM5", force=True)
-    src = decode_ps(sent[-1])
-    assert "$global:tsAnc" in src and "ParentProcessId" in src
+    src = decode_ps(ran[-1])                     # the forced stop, run first
+    assert "$A=@($PID)" in src and "ParentProcessId" in src
+    assert "$A -notcontains $w.ProcessId" in src
     assert "-EncodedCommand\\s+" + core._serial_ps_tag_b64() in src
-    assert "Where-Object{TsOurs $_}" in src
+    assert "$P|?{TsOurs $_}" in src
 
 
 @pytest.mark.skipif(os.name != "nt" or not shutil.which("powershell"),
@@ -592,21 +615,25 @@ def test_force_kill_never_matches_its_own_ancestors_or_wrappers(monkeypatch):
 def test_a_forced_bridge_does_not_kill_the_shell_that_started_it(monkeypatch, tmp_path):
     """Under a PowerShell default shell, sshd's wrapper ("powershell -c
     "powershell ... -EncodedCommand <tagged>"") carries the bridge's tag: the
-    forced open killed it — its own parent."""
+    forced open killed it — its own parent. A forced open is two commands now
+    (the forced stop, then the bridge); neither may kill its wrapper."""
     handler, sent = _offline_handler(monkeypatch)
+    ran = []
+    monkeypatch.setattr(handler, "_run", lambda cmd, **kw: ran.append(cmd))
     handler.serial_bridge("COM9387", force=True)      # a port no machine has
-    marker = tmp_path / "wrapper-finished"
-    inner = sent[-1]
-    wrapper = subprocess.Popen(
-        ["powershell", "-NoProfile", "-Command",
-         f"{inner}; Set-Content -LiteralPath '{marker}' -Value done"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        wrapper.wait(120)
-    finally:
-        if wrapper.poll() is None:
-            wrapper.kill()
-    assert marker.exists(), "the forced open killed the shell that started it"
+    for n, inner in enumerate((ran[-1], sent[-1])):
+        marker = tmp_path / f"wrapper-finished-{n}"
+        wrapper = subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command",
+             f"{inner}; Set-Content -LiteralPath '{marker}' -Value done"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            wrapper.wait(120)
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+        assert marker.exists(), "the forced open killed the shell that started it"
 
 
 def test_serial_in_use_counts_a_drivers_in_use_error_as_busy(ssh, ssh_server):
@@ -616,8 +643,8 @@ def test_serial_in_use_counts_a_drivers_in_use_error_as_busy(ssh, ssh_server):
     except Exception:
         pass
     src = decode_ps(ssh_server.server.execs[-1])
-    assert "[System.IO.IOException]" in src and "HResult" in src
-    assert "[System.UnauthorizedAccessException]" in src
+    assert "[IO.IOException]" in src and "HResult" in src
+    assert "[UnauthorizedAccessException]" in src
 
 
 @pytest.mark.skipif(os.name != "nt" or not shutil.which("powershell"),
@@ -759,18 +786,20 @@ def script(ssh_server):
 
 def test_camera_names_and_paths_cannot_break_the_powershell_command_line(
         ssh, ssh_server, script):
-    """Behind --%, PowerShell still ends the line at a | and expands %VAR%."""
+    """Behind --%, PowerShell still ends the line at a | and expands %VAR%.
+    (The ffmpeg path keeps its %VAR%: expanding it is what the user meant.)"""
     script(lambda cmd: (_PSHOME, b"", 0) if cmd == "echo $PSHOME" else
            (b"", b"", 1))
     ssh.list_cameras(ffmpeg="C:\\a|b\\%TEMP%\\ffmpeg.exe")
     sent = ssh_server.server.execs[-1]
     assert sent.startswith("cmd /s /c --% ")
-    assert "|" not in sent and "%" not in sent.replace("--%", "")
+    assert "|" not in sent and '"C:\\ab\\%TEMP%\\ffmpeg.exe"' in sent
     with pytest.raises(SSHConnectionError) as caught:
         ssh.webcam_channel("Cam|A %USERNAME%", ffmpeg="ffmpeg")
     for cmd in ssh_server.server.execs:
-        if "dshow" in cmd:
+        if "video=" in cmd:
             assert "|" not in cmd and "%" not in cmd.replace("--%", "")
+            assert 'video="CamA USERNAME"' in cmd
     # K: the error says how to clear a stale ffmpeg of an earlier session
     assert "force=True" in str(caught.value)
 
@@ -781,6 +810,7 @@ def test_webcam_release_with_nothing_of_its_own_says_how_to_clean_up(ssh, ssh_se
     ssh._log_callback = said.append
     n = len(ssh_server.server.execs)
     with caplog.at_level(logging.WARNING):
-        assert ssh.webcam_release().ok
+        res = ssh.webcam_release()
+    assert not res.ok and "force=True" in res.stderr       # not "released" (round 4)
     assert len(ssh_server.server.execs) == n
     assert any("force=True" in m and "nothing" in m for m in said), said

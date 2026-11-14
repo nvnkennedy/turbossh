@@ -13,18 +13,28 @@ Uploads (:func:`put_file`, :func:`put_data`):
 * Written in place, as 2.0 did, wherever replacing would change what the file
   is or cannot be done: more than one hard link, not a regular file
   (``/dev/null``, a FIFO, a block device), a folder we may not create files in,
-  an owner the new copy may not be given, or no room for a second copy (the
-  server's "Failure" while the temporary copy is written). The caller is told
-  why (the return value).
+  an owner or mode the new copy may not be given, a file that cannot be
+  replaced (in use, a mount point such as a bind-mounted /etc/resolv.conf), or
+  no room for a second copy (the server's "Failure" while the temporary copy
+  is written) when the new data fits where the old file is. The caller is told
+  why (the return value). A new file that would not fit fails, and the old
+  file is kept.
+
+The temporary copy gets the old file's mode before any data is written to it
+(a 0600 secret was world-readable while it uploaded).
 
 A symbolic link is resolved by the server (realpath), so the file it points at
-is the one replaced — the link stays a link. Temporary names are short and the
-same for every attempt at one target (``.<name>.tsp``): a retry replaces what
-an interrupted run left instead of adding one more next to it.
+is the one replaced — the link stays a link. Temporary names are short:
+``.<name>.<n>.tsp``, the first n (0, 1, …) not taken, created exclusively, so
+every attempt has a name of its own — two transfers to one target never write
+or remove each other's temporary file. A temporary file left by an
+interrupted run is skipped while it may still be in use, and removed by a
+later transfer to that target once it has not changed for :data:`STALE_AFTER`
+seconds, so they do not pile up.
 
-Downloads (:func:`get_file`) go to ``.<name>.tsp`` next to the target and are
-moved over it once complete; a target another program holds open without
-delete sharing (Windows) is written in place instead.
+Downloads (:func:`get_file`) go to ``.<name>.<n>.tsp`` next to the target the
+same way and are moved over it once complete; a target another program holds
+open without delete sharing (Windows) is written in place instead.
 """
 
 from __future__ import annotations
@@ -54,8 +64,11 @@ PREFETCH = 64                    # read requests in flight per download (as Open
                                  # at once, which on a slow link outlasts the SFTP
                                  # timeout and swamps small embedded servers
 UNKNOWN = object()               # "what is at the target has not been looked at"
+STALE_AFTER = 10 * 60            # s a temporary file another run left must have been
+                                 # unchanged before it is taken for abandoned
 
 _CHUNK = 32768
+_SLOTS = 8                       # temporary names .<name>.0.tsp … .7.tsp, then a random one
 _NAME_MAX = 255                  # bytes in one file name on most file systems
 _WIN_PATH_MAX = 259              # characters in a path without long-path support
 _LISTING_TTL = 5.0               # s a folder's link counts are reused for
@@ -103,50 +116,61 @@ def _hash8(name: str) -> str:
     return hashlib.sha1(name.encode("utf-8", "surrogatepass")).hexdigest()[:8]
 
 
-def temp_name(name: str, suffix: str = TEMP_SUFFIX) -> str:
-    """``.<name><suffix>`` — the same for every attempt at one target, so a retry
-    replaces what an interrupted run left. A name too long to take the extra
+def temp_name(name: str, suffix: str = TEMP_SUFFIX, slot=0) -> str:
+    """``.<name>.<slot><suffix>``: the temporary name number *slot* of a target
+    (see :func:`_open_temp`; the number always comes last, so no other
+    target's names can look the same). A name too long to take the extra
     characters is cut, and a hash of the whole name keeps it apart from its
     neighbours'."""
     name = str(name)
-    full = "." + name + suffix
+    tail = f".{slot}{suffix}"
+    full = "." + name + tail
     if _encoded_len(full) <= _NAME_MAX:
         return full
-    tail = "~" + _hash8(name) + suffix
+    tail = "~" + _hash8(name) + tail
     keep = name[:_NAME_MAX]
     while keep and _encoded_len("." + keep + tail) > _NAME_MAX:
         keep = keep[:-1]
     return "." + keep + tail
 
 
-def _short_name(name: str, suffix: str) -> str:
-    return ".~" + _hash8(str(name)) + suffix
+def _short_name(name: str, suffix: str, slot=0) -> str:
+    return ".~" + _hash8(str(name)) + f".{slot}" + suffix
 
 
-def remote_temp(path: str, suffix: str = TEMP_SUFFIX) -> str:
-    """The temporary name next to the remote *path*. A Windows server without
-    long-path support refuses paths over 259 characters: where the usual name
-    would cross that, a short hashed one is used."""
+def remote_temp(path: str, suffix: str = TEMP_SUFFIX, slot=0) -> str:
+    """The temporary name number *slot* next to the remote *path*. A Windows
+    server without long-path support refuses paths over 259 characters: where
+    the usual name would cross that, a short hashed one is used."""
     folder, name = posixpath.split(path)
-    tmp = posixpath.join(folder, temp_name(name, suffix))
+    tmp = posixpath.join(folder, temp_name(name, suffix, slot))
     if len(tmp) > _WIN_PATH_MAX >= len(path):
-        short = posixpath.join(folder, _short_name(name, suffix))
+        short = posixpath.join(folder, _short_name(name, suffix, slot))
         if len(short) < len(tmp):
             tmp = short
     return tmp
 
 
-def local_temp(path: str) -> str:
-    """The temporary name next to the local *path* (kept within MAX_PATH on
-    Windows, where a few extra characters broke downloads into deep folders)."""
+def local_temp(path: str, slot=0) -> str:
+    """The temporary name number *slot* next to the local *path* (kept within
+    MAX_PATH on Windows, where a few extra characters broke downloads into deep
+    folders)."""
     folder, name = os.path.split(path)
-    tmp = os.path.join(folder, temp_name(name))
+    tmp = os.path.join(folder, temp_name(name, TEMP_SUFFIX, slot))
     if (os.name == "nt" and not tmp.startswith("\\\\?\\")
             and len(os.path.abspath(tmp)) > _WIN_PATH_MAX):
-        short = os.path.join(folder, _short_name(name, TEMP_SUFFIX))
+        short = os.path.join(folder, _short_name(name, TEMP_SUFFIX, slot))
         if len(short) < len(tmp):
             tmp = short
     return tmp
+
+
+def _slots():
+    """The temporary-name numbers to try, in order: a few small ones (so names
+    stay short and what an interrupted run left is found again), then — every
+    one taken by transfers still going on — a random one."""
+    yield from range(_SLOTS)
+    yield os.urandom(3).hex()
 
 
 # --------------------------------------------------------------------------- #
@@ -281,8 +305,10 @@ def _links_of(sftp, path: str) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 # Uploads
 # --------------------------------------------------------------------------- #
-class _InPlace(Exception):
-    """Replacing the file cannot be done here; it is written in place (why)."""
+class _InPlace(IOError):
+    """Replacing the file cannot be done here; it is written in place (why).
+    An IOError, so a caller of :func:`rename_over` that does not write in place
+    sees it as the failure it is."""
 
     def __init__(self, why: str):
         super().__init__(why)
@@ -298,6 +324,33 @@ def _remove_stale(sftp, path: str) -> None:
         raise
     except (IOError, OSError):
         pass
+
+
+def _lstat_or_none(sftp, path: str):
+    try:
+        return sftp.lstat(path)
+    except socket.timeout:
+        raise
+    except (IOError, AttributeError):
+        return None
+
+
+def _remove_abandoned(sftp, fh, taken) -> None:
+    """Remove the temporary files in *taken* (``(path, lstat)`` pairs: names
+    another run holds) that have not changed for :data:`STALE_AFTER` seconds —
+    measured by the server's clock, which our own new file *fh* tells (an
+    embedded target's clock may be years off ours). A transfer still going on
+    keeps its file's time current and is never touched."""
+    try:
+        now = getattr(fh.stat(), "st_mtime", None)
+    except socket.timeout:
+        raise
+    except (IOError, AttributeError):
+        return
+    for path, attr in taken:
+        when = getattr(attr, "st_mtime", None)
+        if now is not None and when is not None and now - when > STALE_AFTER:
+            _remove_stale(sftp, path)
 
 
 def _cleanup(sftp, path: str, exc: BaseException) -> None:
@@ -318,19 +371,40 @@ def _close_quietly(fh) -> None:
         pass
 
 
-def _open_temp(sftp, tmp: str):
-    """Create *tmp* exclusively — never through a link planted under that name,
-    never into someone else's file. A leftover of an interrupted run (same name)
-    is removed and the create tried once more. Raises the server's IOError."""
-    try:
-        return sftp.open(tmp, "wbx")
-    except socket.timeout:
-        raise
-    except IOError as exc:
-        if exc.errno in (errno.EACCES, errno.EPERM):
+def _open_temp(sftp, path: str, suffix: str = TEMP_SUFFIX):
+    """Create a temporary file of this attempt's own next to *path*: the first
+    of ``.<name>.0.tsp``, ``.<name>.1.tsp``, … that is not taken, created
+    exclusively — never through a link planted under that name, never into
+    another transfer's file (two uploads to one target used to share one name:
+    one removed the other's file, or renamed it half-written over the target).
+    A name that is taken is skipped, whoever holds it (a transfer going on, or
+    a server session a VPN drop orphaned); the ones that are clearly abandoned
+    are removed afterwards (see :func:`_remove_abandoned`). Returns ``(handle,
+    temporary path, slot)``; raises the server's IOError when the file cannot
+    be created for another reason than a taken name."""
+    taken = []
+    for slot in _slots():
+        tmp = remote_temp(path, suffix, slot)
+        try:
+            fh = sftp.open(tmp, "wbx")
+        except socket.timeout:
             raise
-    _remove_stale(sftp, tmp)
-    return sftp.open(tmp, "wbx")
+        except IOError:
+            attr = _lstat_or_none(sftp, tmp)
+            if attr is None:                 # not taken: refused for another reason
+                raise
+            taken.append((tmp, attr))
+            continue
+        if taken:
+            try:
+                _remove_abandoned(sftp, fh, taken)
+            except BaseException as exc:
+                if not isinstance(exc, socket.timeout):   # else: out of step
+                    _close_quietly(fh)
+                    _remove_stale(sftp, tmp)
+                raise
+        return fh, tmp, slot
+    raise IOError(errno.EEXIST, f"no temporary name next to {path} is free")
 
 
 def _collect_replies(fh) -> bool:
@@ -432,11 +506,22 @@ def _rename_unsupported(exc) -> bool:
                                                     or "not supported" in text)
 
 
-def rename_over(sftp, tmp: str, dst: str, existed: bool = True) -> None:
+_CANNOT_REPLACE = "it cannot be replaced (in use, or a mount point)"
+
+
+def rename_over(sftp, tmp: str, dst: str, existed: bool = True, *,
+                aside: Optional[str] = None) -> None:
     """Move the finished *tmp* to *dst*. posix-rename replaces in one step. A
     server without it (whose plain rename never replaces) gets the old file
-    moved aside first and put back if the new one cannot take its place — the
-    content of *dst* is never lost on the way."""
+    moved aside (to *aside*, default ``.<name>.0.turbossh-old``) first and put
+    back if the new one cannot take its place — the content of *dst* is never
+    lost on the way.
+
+    An existing *dst* that cannot be replaced — the server refuses the rename
+    for another reason than not knowing posix-rename: a bind-mounted
+    /etc/resolv.conf (EBUSY), a Windows file held open without delete sharing
+    — is left untouched and :class:`_InPlace` raised (an IOError), so the
+    caller writes it in place, as 2.0 did."""
     if not _flag(_NO_POSIX_RENAME, sftp):
         try:
             sftp.posix_rename(tmp, dst)
@@ -444,26 +529,33 @@ def rename_over(sftp, tmp: str, dst: str, existed: bool = True) -> None:
         except socket.timeout:
             raise
         except IOError as exc:
-            if _rename_unsupported(exc):         # asked once per client
-                _set_flag(_NO_POSIX_RENAME, sftp)
+            if _rename_unsupported(exc):
+                _set_flag(_NO_POSIX_RENAME, sftp)    # asked once per client
+            elif existed:
+                raise _InPlace(f"{_CANNOT_REPLACE}: {exc}") from None
     if not existed:
         sftp.rename(tmp, dst)
         return
-    aside = remote_temp(dst, ASIDE_SUFFIX)
+    aside = aside or remote_temp(dst, ASIDE_SUFFIX)
     try:
         sftp.rename(dst, aside)
     except socket.timeout:
         raise
     except IOError:
-        _remove_stale(sftp, aside)       # an older one an interrupted replace left
+        _remove_stale(sftp, aside)       # a stray copy an earlier replace left
         try:
             sftp.rename(dst, aside)
         except socket.timeout:
             raise
-        except IOError:
-            # nothing there to move aside after all (or it cannot be moved, and
-            # this fails as well, saying why)
-            sftp.rename(tmp, dst)
+        except IOError as exc:
+            # nothing there to move aside after all (removed meanwhile): the
+            # new file takes the free name; or it cannot be moved — untouched
+            try:
+                sftp.rename(tmp, dst)
+            except socket.timeout:
+                raise
+            except IOError:
+                raise _InPlace(f"{_CANNOT_REPLACE}: {exc}") from None
             return
     try:
         sftp.rename(tmp, dst)
@@ -479,25 +571,67 @@ def rename_over(sftp, tmp: str, dst: str, existed: bool = True) -> None:
         pass                             # a stray copy of the old file; nothing lost
 
 
+def _chmod(sftp, path: str, perm: int) -> bool:
+    """chmod; False if the server refused it (a timeout is raised)."""
+    try:
+        sftp.chmod(path, perm)
+        return True
+    except socket.timeout:
+        raise
+    except IOError:
+        return False
+
+
+def _early_mode(perm: int) -> int:
+    """The mode a temporary copy gets BEFORE its data is written: the final
+    one, but writable by its owner (a read-only mode could keep the copy from
+    being written or removed again on some servers). Nobody else gets
+    anything the final mode does not give them."""
+    return perm | 0o200
+
+
+def _late_mode(sftp, path: str, perm: int, early: int) -> None:
+    """After the data: the exact final mode, where it differs from *early* —
+    no owner write, or setuid / setgid / sticky bits (a write clears setuid,
+    so they are set last). A refusal keeps *early*; the data is safe."""
+    if perm != early or perm & 0o7000:
+        _chmod(sftp, path, perm)
+
+
+def _no_room_maybe(exc) -> bool:
+    """Could this write failure be a full disk / quota? SFTP v3 has no code
+    for it: ENOSPC arrives as a plain "Failure" (no errno), like EIO, EFBIG
+    and others that cannot be told apart."""
+    return getattr(exc, "errno", None) in _NO_ROOM and not _rename_unsupported(exc)
+
+
+def _size_or_zero(sftp, path: str) -> int:
+    try:
+        return int(getattr(sftp.stat(path), "st_size", 0) or 0)
+    except socket.timeout:
+        raise
+    except (IOError, TypeError, ValueError):
+        return 0
+
+
 def _create(sftp, fl, size, path, callback, mode) -> None:
     """Nothing at *path*: write a temporary file and rename it into place."""
-    tmp = remote_temp(path)
-    fh = _open_temp(sftp, tmp)
+    fh, tmp, _slot = _open_temp(sftp, path)
     try:
+        perm = _perm(mode)
+        if perm is not None:                 # before the data (see _early_mode)
+            _chmod(sftp, tmp, _early_mode(perm))   # refused: the server's default
         done, err, acknowledged = _send(fh, fl, size, callback)
         if err is not None:
             raise err
         if not acknowledged:
             _confirm(sftp, tmp, done)
-        if _perm(mode) is not None:
-            try:
-                sftp.chmod(tmp, _perm(mode))
-            except socket.timeout:
-                raise
-            except IOError:
-                pass                     # the server's default; still a good file
+        if perm is not None:
+            _late_mode(sftp, tmp, perm, _early_mode(perm))
         rename_over(sftp, tmp, path, existed=False)
     except BaseException as exc:
+        if not isinstance(exc, socket.timeout):
+            _close_quietly(fh)
         _cleanup(sftp, tmp, exc)
         raise
 
@@ -507,9 +641,8 @@ def _replace(sftp, fl, size, path, old, callback) -> None:
     owner, group and mode, then rename it over the old file. :class:`_InPlace`
     where that cannot be done (nothing is left behind then)."""
     folder = posixpath.dirname(path)
-    tmp = remote_temp(path)
     try:
-        fh = _open_temp(sftp, tmp)
+        fh, tmp, slot = _open_temp(sftp, path)
     except socket.timeout:
         raise
     except IOError as exc:
@@ -530,6 +663,16 @@ def _replace(sftp, fl, size, path, old, callback) -> None:
             except IOError:
                 raise _InPlace(f"the new copy could not be given its owner "
                                f"{uid}:{gid}") from None
+        # The old file's mode BEFORE the data: the copy was created with the
+        # server's default (0644), and a 0600 secret was world-readable while
+        # it uploaded. A server that refuses it gets the file written in place,
+        # which keeps its mode (the copy would not have it).
+        want = _perm(getattr(old, "st_mode", None))
+        early = None if want is None else _early_mode(want)
+        if early is not None and (made is None or made[2] != early):
+            if not _chmod(sftp, tmp, early):
+                raise _InPlace(f"the new copy could not be given its mode "
+                               f"{want:o}")
         done, err, acknowledged = _send(fh, fl, size, callback)
         if err is None and not acknowledged:
             try:
@@ -539,20 +682,27 @@ def _replace(sftp, fl, size, path, old, callback) -> None:
             except IOError as exc:
                 err = exc
         if err is not None:
-            if getattr(err, "errno", None) in _NO_ROOM:
+            if _no_room_maybe(err):
                 # ENOSPC is a plain "Failure" in SFTP v3: replacing needs room
-                # for two copies; 2.0 truncated and rewrote the one
-                raise _InPlace(f"no room for a second copy ({err})")
+                # for two copies, and 2.0 truncated and rewrote the one. That
+                # is done only where the new data fits: in the old file's room
+                # plus what the copy took (freed again). Otherwise the old file
+                # is kept as it is — written in place, a bigger new one would
+                # truncate it and stop part-way.
+                room = (int(getattr(old, "st_size", 0) or 0)
+                        + _size_or_zero(sftp, tmp))
+                if size <= room:
+                    raise _InPlace(f"no room for a second copy ({err})")
+                why = (f"{err} — while writing a copy of {path}: probably no "
+                       f"room for its {size} bytes; {path} was left as it was")
+                code = getattr(err, "errno", None)
+                raise (IOError(code, why) if code is not None else IOError(why)) \
+                    from err
             raise err
-        want = _perm(getattr(old, "st_mode", None))
-        if want is not None and (made is None or made[2] != want):
-            try:
-                sftp.chmod(tmp, want)
-            except socket.timeout:
-                raise
-            except IOError:
-                pass
-        rename_over(sftp, tmp, path, existed=True)
+        if want is not None:
+            _late_mode(sftp, tmp, want, early)
+        rename_over(sftp, tmp, path, existed=True,
+                    aside=remote_temp(path, ASIDE_SUFFIX, slot))
     except BaseException as exc:
         if not isinstance(exc, socket.timeout):
             _close_quietly(fh)
@@ -669,25 +819,125 @@ def move_into_place(tmp: str, target: str) -> str:
     return ""
 
 
+def _can_stop_prefetch() -> bool:
+    """Paramiko starts a download's read-ahead with SFTPFile._start_prefetch
+    (chunks, max_concurrent_requests) on a thread that walks *chunks*; given an
+    iterable that can be stopped, a cancelled download sends no more reads."""
+    fn = getattr(paramiko.SFTPFile, "_start_prefetch", None)
+    try:
+        return fn is not None and list(inspect.signature(fn).parameters)[1:3] == [
+            "chunks", "max_concurrent_requests"]
+    except (TypeError, ValueError):
+        return False
+
+
+_CAN_STOP_PREFETCH = _can_stop_prefetch()
+
+
+class _ReadAhead:
+    """The (offset, length) reads of a download's read-ahead, handed out until
+    :meth:`stop` — Paramiko's own list made its thread go on sending reads for
+    the whole file after a cancelled download had closed it."""
+
+    def __init__(self, start: int, size: int, step: int):
+        self.start, self.size, self.step = start, size, step
+        self.stopped = False
+
+    def __iter__(self):
+        n = self.start
+        while n < self.size and not self.stopped:
+            length = min(self.step, self.size - n)
+            yield n, length
+            n += length
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def _get_stoppable(sftp, remote: str, local: str, callback) -> None:
+    """SFTPClient.get (Paramiko 3.3+), with at most :data:`PREFETCH` reads in
+    flight and the read-ahead stopped when the download ends early."""
+    file_size = sftp.stat(remote).st_size
+    with open(local, "wb") as fl:
+        with sftp.open(remote, "rb") as fr:
+            ahead = None
+            if file_size:                # (no read-ahead for nothing: it would wait)
+                ahead = _ReadAhead(0, file_size,
+                                   getattr(fr, "MAX_REQUEST_SIZE", _CHUNK))
+                fr._start_prefetch(ahead, PREFETCH)
+            try:
+                size = 0
+                while True:
+                    data = fr.read(_CHUNK)
+                    fl.write(data)
+                    size += len(data)
+                    if not data:
+                        break
+                    if callback is not None:
+                        callback(size, file_size)
+            finally:
+                if ahead is not None:
+                    ahead.stop()
+    written = os.stat(local).st_size
+    if written != size:
+        raise IOError(f"size mismatch in get!  {written} != {size}")
+
+
 def sftp_get(sftp, remote: str, local: str, callback=None) -> None:
     """``sftp.get`` with at most :data:`PREFETCH` reads in flight where this
-    Paramiko can limit them."""
+    Paramiko can limit them (and, where it can, no reads sent on after a
+    cancelled download)."""
     if GET_TAKES_PREFETCH_LIMIT and isinstance(sftp, paramiko.SFTPClient):
-        sftp.get(remote, local, callback=callback,
-                 max_concurrent_prefetch_requests=PREFETCH)
+        if _CAN_STOP_PREFETCH:
+            _get_stoppable(sftp, remote, local, callback)
+        else:
+            sftp.get(remote, local, callback=callback,
+                     max_concurrent_prefetch_requests=PREFETCH)
     else:
         sftp.get(remote, local, callback=callback)
 
 
+def _abandoned_local(path: str) -> bool:
+    try:
+        return time.time() - os.lstat(path).st_mtime > STALE_AFTER
+    except OSError:
+        return False
+
+
+def _reserve_local_temp(target: str) -> str:
+    """Create (exclusively, empty) the first free temporary name next to the
+    local *target* — ``.<name>.0.tsp``, ``.<name>.1.tsp``, … — so two
+    downloads to one file never share one (they did: the second removed or
+    wrote into the first's). One left by an interrupted run is reused once it
+    has not changed for :data:`STALE_AFTER` seconds."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    for slot in _slots():
+        tmp = local_temp(target, slot)
+        for _ in range(2):
+            try:
+                os.close(os.open(tmp, flags, 0o666))
+                return tmp
+            except FileExistsError:
+                pass
+            except PermissionError:
+                # Windows: a name still being deleted, or a read-only leftover
+                if not os.path.lexists(tmp):
+                    raise
+            if not _abandoned_local(tmp):
+                break                        # in use: the next name
+            remove_local(tmp)                # abandoned: take it over
+    raise FileExistsError(errno.EEXIST, f"no temporary name next to {target} "
+                                        f"is free")
+
+
 def get_file(sftp, remote: str, local: str, callback=None):
-    """Download *remote* to *local* through ``.<name>.tsp`` next to it, moved
-    into place once complete: a failed or aborted download leaves an existing
-    *local* untouched and no partial file behind. Through a local symlink, the
-    file it points at is replaced. Returns ``(size, how)`` (see
+    """Download *remote* to *local* through ``.<name>.<n>.tsp`` next to it,
+    moved into place once complete: a failed or aborted download leaves an
+    existing *local* untouched and no partial file behind. Through a local
+    symlink, the file it points at is replaced. Returns ``(size, how)`` (see
     :func:`move_into_place`)."""
     target = os.path.realpath(local) if os.path.islink(local) else local
-    tmp = local_temp(target)
-    remove_local(tmp)                    # what an interrupted run left
+    tmp = _reserve_local_temp(target)
     try:
         sftp_get(sftp, remote, tmp, callback)
         size = os.path.getsize(tmp)

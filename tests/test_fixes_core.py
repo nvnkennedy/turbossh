@@ -186,7 +186,7 @@ def test_windows_stream_records_its_pid_only_once_open_and_stops_its_reader(ssh,
     # the tracked stale holder first, then Open(), and only then the PID file
     assert (src.index("Stop-Process -Id $op") < src.index("$p.Open()")
             < src.index("Set-Content -LiteralPath $pf -Value $PID"))
-    failed = src[src.index("if(-not $ok)"):]
+    failed = src[src.index("if(-not $p.IsOpen)"):]
     failed = failed[:failed.index("exit 2")]
     assert "Remove-Item" not in failed, "a failed open deleted the real holder's record"
     assert core._PS_DROP_OWN_PIDFILE in src          # removed only while it is ours
@@ -198,18 +198,22 @@ def test_windows_stream_records_its_pid_only_once_open_and_stops_its_reader(ssh,
 
 def test_force_and_the_tracked_holder_are_scoped_to_one_port(ssh, ssh_server):
     ssh.serial_bridge("COM5", force=True).close()
-    cmd = ssh_server.server.execs[-1]
-    src = decode_ps(cmd)
+    stop_cmd, cmd = ssh_server.server.execs[-2:]
     port_tag = core._ps_b64(core._serial_ps_header("COM5"))
-    # a forced open looks for the holders of COM5 by the tag its own command
-    # line starts with — no longer every TurboSSH serial reader on the machine
+    # a forced open looks for the holders of COM5 by the header their script
+    # starts with (the tag their command line starts with) — no longer every
+    # TurboSSH serial reader on the machine
     assert encoded_arg(cmd).startswith(port_tag)
-    assert f"$hit=$_.CommandLine -like '*{port_tag}*'" in src
-    # neither of two ports' tags is a prefix of the other's
-    for a, b in (("COM5", "COM50"), ("COM9", "COM98"), ("COM1", "COM10")):
+    head = core._serial_ps_header("COM5").replace("\n", "`n")
+    assert f'$s.StartsWith("{head}",[StringComparison]::Ordinal)' in decode_ps(stop_cmd)
+    # neither of two ports' tags (or headers) is a prefix of the other's
+    for a, b in (("COM5", "COM50"), ("COM9", "COM98"), ("COM1", "COM10"),
+                 ("COM12", "COM123")):
         ta = core._ps_b64(core._serial_ps_header(a))
         tb = core._ps_b64(core._serial_ps_header(b))
         assert not ta.startswith(tb) and not tb.startswith(ta)
+        ha, hb = core._serial_ps_header(a), core._serial_ps_header(b)
+        assert not ha.startswith(hb) and not hb.startswith(ha)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="runs the Windows scripts for real")
@@ -221,7 +225,7 @@ def test_force_and_release_stop_only_this_ports_readers_for_real(monkeypatch, tm
     release: a PID file naming a PowerShell that is not ours is not obeyed."""
     handler = SSHHandler(SSHConfig(host="x"), quiet=True)
     sent = []
-    handler.run = lambda cmd, **kw: sent.append(cmd)
+    handler.run = handler._run = lambda cmd, **kw: sent.append(cmd)
 
     def run_sent():
         return subprocess.run(["powershell", "-NoProfile", "-EncodedCommand",
@@ -272,7 +276,7 @@ def test_serial_in_use_is_busy_only_when_access_is_denied(ssh, ssh_server, scrip
     script(lambda cmd: (reply, b"", 0))
     assert ssh.serial_in_use("COM9") is busy
     src = decode_ps(ssh_server.server.execs[-1])
-    assert "[System.UnauthorizedAccessException]" in src
+    assert "[UnauthorizedAccessException]" in src
 
 
 def test_serial_write_failure_raises_with_the_reason(ssh, ssh_server, script):
@@ -570,13 +574,19 @@ def test_the_sftp_channel_has_a_timeout_and_downloads_bound_prefetch(
     original = paramiko.SFTPClient.get
 
     def spy(self, remote, local, **kw):
-        seen.append(kw)
+        seen.append(kw.get("max_concurrent_prefetch_requests"))
         return original(self, remote, local, **kw)
     monkeypatch.setattr(paramiko.SFTPClient, "get", spy)
+    start = getattr(paramiko.SFTPFile, "_start_prefetch", None)
+    if start is not None:                   # where the read-ahead can be stopped
+        def spy_start(self, chunks, max_concurrent_requests=None):
+            seen.append(max_concurrent_requests)
+            return start(self, chunks, max_concurrent_requests)
+        monkeypatch.setattr(paramiko.SFTPFile, "_start_prefetch", spy_start)
     (ssh_server.root / "f.bin").write_bytes(b"x" * 1000)
     ssh.pull("/f.bin", str(tmp_path / "f.bin"))
     if core._GET_TAKES_PREFETCH_LIMIT:
-        assert seen[-1].get("max_concurrent_prefetch_requests") == core._SFTP_PREFETCH
+        assert seen[-1] == core._SFTP_PREFETCH
 
 
 def test_sftp_opens_outside_the_connection_lock(ssh, monkeypatch):
@@ -764,7 +774,7 @@ def test_each_camera_stream_is_marked_and_a_restart_stops_only_its_own(ssh, ssh_
 
 def test_webcam_release_stops_only_this_handlers_streams(ssh, ssh_server):
     n = len(ssh_server.server.execs)
-    assert ssh.webcam_release().ok
+    assert not ssh.webcam_release().ok          # nothing of ours: says so (round 4)
     assert len(ssh_server.server.execs) == n, "nothing of ours to stop: no remote call"
     ssh._cam_tokens = {"turbossh_cam_aaaaaaaaaa", "turbossh_cam_bbbbbbbbbb"}
     ssh.webcam_release()

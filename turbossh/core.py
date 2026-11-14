@@ -11,6 +11,7 @@ Designed for three consumers from one object:
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import shlex
 import socket
@@ -83,51 +84,88 @@ def _serial_ps_header(port_key: str, run: Optional[str] = None) -> str:
 # (pasted from Word or Jira) ends a '...' literal just like ' does.
 _PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
 
-# Shared PowerShell fragments ($pf = the port's PID file).
-#
+# Shared PowerShell fragments of the serial scripts ($pf = the port's PID file,
+# $dev = the port). They are kept SHORT: Windows OpenSSH's default shell runs a
+# command as `cmd /c <command>`, and cmd refuses a line over 8,191 characters
+# ("The command line is too long"); an -EncodedCommand costs 8/3 characters per
+# script character. So each script carries only the fragments it uses, and the
+# default aliases (gc, sleep, ?, %) stand in for long cmdlet names. All
+# Windows commands stay under _WIN_CMD_MAX (a test checks every builder).
+_WIN_CMD_MAX = 8000
+
+# $P: every process, read once; $A: this process and its ancestors (never
+# stopped: under a PowerShell default shell, sshd's wrapper is one of them and
+# carries this script's text).
+_PS_LOAD = (
+    "$P=@(Get-CimInstance Win32_Process);$A=@($PID);$q=$PID;"
+    "foreach($i in 1..8){$q=($P|?{$_.ProcessId -eq $q}).ParentProcessId;"
+    "if(-not $q){break};$A+=$q};"
+)
 # TsOurs: is this Win32_Process one of OUR serial PowerShells? Its command line
 # must BE "powershell [switches] -EncodedCommand <tagged script>" (any version:
 # the tag is the common prefix) — not merely contain the tag: under a
 # PowerShell default shell, sshd's wrapper "powershell -c "powershell ...
 # -EncodedCommand <tag...>"" carries the same text, and a forced open killed its
-# own parent with it. This process and its ancestors are never matched either.
+# own parent with it. This process and its ancestors ($A) are never matched.
 _PS_OURS_FN = (
-    "function TsOurs($w){if(-not $w -or $w.Name -ne 'powershell.exe' -or "
-    "([string]$w.CommandLine) -notmatch '^\\s*(\"[^\"]*powershell(\\.exe)?\"|"
-    "[^\\s\"]*powershell(\\.exe)?)(\\s+-\\w+)*\\s+-EncodedCommand\\s+__ANYTAG__'){"
-    "return $false};if($null -eq $global:tsAnc){$global:tsAnc=@($PID);$q=$PID;"
-    "for($i=0;$i -lt 8;$i++){$x=Get-CimInstance Win32_Process -Filter "
-    "\"ProcessId=$q\";if(-not $x -or -not $x.ParentProcessId){break};"
-    "$q=[int]$x.ParentProcessId;$global:tsAnc+=$q}};"
-    "$global:tsAnc -notcontains [int]$w.ProcessId};"
+    "function TsOurs($w){$w.Name -eq 'powershell.exe' -and "
+    "$A -notcontains $w.ProcessId -and $w.CommandLine -match "
+    "'^\\s*(\"[^\"]*powershell(\\.exe)?\"|[^\\s\"]*powershell(\\.exe)?)"
+    "(\\s+-\\w+)*\\s+-EncodedCommand\\s+__ANYTAG__'};"
 )
-# The tracked holder is killed only if it is still a TurboSSH serial PowerShell,
-# so a PID Windows has since reused is never touched.
-_PS_KILL_TRACKED = (
-    "if(Test-Path -LiteralPath $pf){"
-    "$old=[string](Get-Content -LiteralPath $pf|Select-Object -First 1);"
-    "if($old -match '^\\s*(\\d+)\\s*$'){$op=[int]$Matches[1];"
-    "if($op -ne $PID){$w=Get-CimInstance Win32_Process -Filter \"ProcessId=$op\";"
-    "if(TsOurs $w){"
-    "try{Stop-Process -Id $op -Force}catch{};Start-Sleep -Milliseconds 200}}}};"
+
+
+def _ps_kill_tracked(load: bool) -> str:
+    """Stop the port's tracked holder — only if it is still a TurboSSH serial
+    PowerShell, so a PID Windows has since reused is never touched. $n is 1 if
+    it was stopped. *load*: read the process list ($P, $A) here, i.e. only when
+    there is a PID to check (a forced script reads it first)."""
+    return ("$n=0;$old=[string](gc -LiteralPath $pf -TotalCount 1);"
+            "if($old -match '^\\s*(\\d+)\\s*$'){$op=[int]$Matches[1];"
+            + (_PS_LOAD if load else "") +
+            "if(TsOurs ($P|?{$_.ProcessId -eq $op})){"
+            "Stop-Process -Id $op -Force;$n=1;sleep -m 200}};")
+
+
+# Force: stop every TurboSSH serial PowerShell holding THIS port — the ones
+# whose script starts with this port's header (the decoded form of the port
+# tag their command line starts with), or (a reader started by 2.0, whose
+# header has no port line) names the port. Never this process or its ancestors.
+_PS_KILL_PORT = (
+    "$P|?{TsOurs $_}|%{if($_.CommandLine -match 'EncodedCommand\\s+(\\S+)'){try{$s="
+    "[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]));"
+    "if($s.StartsWith(__PORTHEAD__,[StringComparison]::Ordinal) -or "
+    "(-not $s.Contains('#port=') -and $s.Contains(__DEVNEEDLE__))){"
+    "Stop-Process -Id $_.ProcessId -Force}}catch{}}};sleep -m 300;"
 )
-# TsBusy: did opening the port fail because another process holds it? Access
-# denied, or — from some USB-serial drivers — an IOException for a sharing
-# violation / "in use" (by its Win32 code, so a localized message counts too).
-_PS_BUSY_FN = (
-    "function TsBusy($e){if($e -is [System.UnauthorizedAccessException]){return $true};"
-    "if($e -is [System.IO.IOException]){$c=$e.HResult -band 0xFFFF;"
-    "return ($c -eq 5 -or $c -eq 32 -or $c -eq 33 -or $c -eq 170 -or $c -eq 2404 -or "
-    "([string]$e.Message) -match 'in use|being used|sharing violation|busy')};"
-    "return $false};"
-)
+
+
+def _ps_busy(var: str) -> str:
+    """PowerShell: did opening the port fail because another process holds it
+    (*var* = the .NET exception)? Access denied, or — from some USB-serial
+    drivers — an IOException for a sharing violation / "in use" (by its Win32
+    code, so a localized message counts too)."""
+    return (f"({var} -is [UnauthorizedAccessException] -or ({var} -is "
+            f"[IO.IOException] -and ((5,32,33,170,2404) -contains "
+            f"({var}.HResult -band 65535) -or {var}.Message -match "
+            f"'in use|being used|sharing violation|busy')))")
+
+
 # remove the PID file only while it still names this process
 _PS_DROP_OWN_PIDFILE = (
-    "try{if([string](Get-Content -LiteralPath $pf|Select-Object -First 1) -eq "
-    "[string]$PID){Remove-Item -LiteralPath $pf -Force}}catch{}"
+    "if((gc -LiteralPath $pf -TotalCount 1) -eq $PID){"
+    "Remove-Item -LiteralPath $pf -Force}"
 )
 # unwrap PowerShell's MethodInvocationException to the .NET exception
 _PS_INNER = "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
+
+
+def _ps_open_port(baudrate, retries: int) -> str:
+    """Open $dev as $p (8N1, SerialPort's defaults), retrying; $why is the
+    reason it would not open."""
+    return (f"$p=New-Object IO.Ports.SerialPort $dev,{int(baudrate)};"
+            f"for($i=0;$i -lt {int(retries)};$i++){{try{{$p.Open();break}}catch{{"
+            + _PS_INNER + "$why=$e;sleep -m 350}};")
 
 # The ffmpeg kill script for the remote camera. TsHas = case-insensitive
 # "contains" (a short name like H would lose to PowerShell's alias for
@@ -148,10 +186,19 @@ _PS_FFMPEG_KILL = (
 # line is passed behind --%, which stops at a | (even inside quotes) and expands
 # %VAR% — and cmd.exe expands %VAR% too. Control characters end the line.
 _CMD_UNSAFE = re.compile(r'["|%\x00-\x1f]')
+# A path keeps its %VAR%: both shells expand it, which is what the user meant
+# (ffmpeg="%ProgramFiles%\ffmpeg\bin\ffmpeg.exe" worked in 2.0).
+_CMD_UNSAFE_PATH = re.compile(r'["|\x00-\x1f]')
 
 
 def _cmd_safe(value) -> str:
+    """A camera name for "…" on a cmd.exe line (taken literally: no %VAR%)."""
     return _CMD_UNSAFE.sub("", str(value))
+
+
+def _cmd_safe_path(value) -> str:
+    """A program path for "…" on a cmd.exe line (%VAR% is expanded)."""
+    return _CMD_UNSAFE_PATH.sub("", str(value))
 
 
 # How many bytes of a camera ffmpeg's stderr are kept for diagnostics (the
@@ -200,6 +247,54 @@ def _safe_local_name(name: str, windows: Optional[bool] = None) -> str:
     if out in ("", ".", ".."):
         out = "_" * max(1, len(out))
     return out
+
+
+_DIGEST_SALT = os.urandom(16)      # per process: a digest says nothing elsewhere
+
+
+def _secret_digest(value) -> Optional[str]:
+    raw = value.reveal() if isinstance(value, Secret) else value
+    if raw is None:
+        return None
+    return hashlib.sha256(_DIGEST_SALT + str(raw).encode(
+        "utf-8", "surrogatepass")).hexdigest()
+
+
+def _link_key(cfg) -> Optional[tuple]:
+    """What a connection is made with: the target, the login and how it
+    authenticates, and the jump host (secrets as digests only). connect()
+    keeps a live connection only while the config still says the same."""
+    if cfg is None:
+        return None
+    return (cfg.host, cfg.port, cfg.auth_username, _secret_digest(cfg.password),
+            tuple(cfg.normalized_key_files()), _secret_digest(cfg.key_passphrase),
+            bool(cfg.passwordless), bool(cfg.allow_agent), bool(cfg.look_for_keys),
+            bool(cfg.enable_legacy_algorithms), repr(cfg.disabled_algorithms),
+            _link_key(cfg.jump_host))
+
+
+def _close_soon(sftp) -> None:
+    """Close an SFTP client without making anyone wait for it: on a stalled
+    link, closing a channel waits for room in the send buffer — for ever, or
+    until the transport is closed. One whose channel is closed already (its
+    transport was closed) is closed here; it sends nothing."""
+    if sftp is None:
+        return
+    try:
+        chan = sftp.get_channel()
+    except Exception:
+        chan = None
+
+    def close():
+        try:
+            sftp.close()
+        except Exception:
+            pass
+    if chan is None or getattr(chan, "closed", True):
+        close()
+    else:
+        threading.Thread(target=close, name="turbossh-sftp-close",
+                         daemon=True).start()
 
 
 _KNOWN_HOSTS_LOCK = threading.Lock()
@@ -494,6 +589,8 @@ class SSHHandler:
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
         self._jump: Optional["SSHHandler"] = None
+        # what the connection was made with (see _link_key)
+        self._made_with: Optional[tuple] = None
         self._bootstrap_attempted = False
         # Serialises connect / reconnect / disconnect, so two threads that find
         # the link down don't both reconnect (and leak one of the clients).
@@ -610,64 +707,115 @@ class SSHHandler:
         ssh.connect()`` opens a fresh connection, as it did in 2.0."""
         return self._guard("connect", self._connect_explicit, safe=safe)
 
-    # Seconds connect() waits for a live server to answer the keepalive probe.
-    _LIVENESS_TIMEOUT = 5.0
+    # The least time (s) connect() gives a connected server to show it is alive;
+    # the connect timeout, when longer. A slow VPN with bulk data in flight can
+    # hold the answer back for seconds.
+    _LIVENESS_TIMEOUT = 10.0
 
     def _connect_explicit(self) -> "SSHHandler":
         with self._conn_lock:
             self._closed = False
             client = self._client
             if client is not None and self.is_connected:
-                if self._link_alive(client.get_transport(), self._liveness_timeout()):
+                if self._made_with != _link_key(self.config):
+                    # ``ssh.config.host = new_ip; ssh.connect()`` means the new
+                    # target (2.0 always reconnected)
+                    self._emit(logging.INFO,
+                               f"The connection settings changed; connecting to "
+                               f"{self.config.host} again…")
+                    if not self._jump_is_current():
+                        self._close_jump()           # first: see _drop_dead_link
+                    self._drop_dead_link(client, check_jump=False)
+                elif self._link_alive(client.get_transport(), self._liveness_timeout()):
                     return self
-                self._emit(logging.WARNING,
-                           f"The connection to {self.config.host} no longer answers "
-                           f"(the target rebooted, or the link dropped); "
-                           f"opening a new one…")
-                self._drop_dead_link(client)
+                else:
+                    self._emit(logging.WARNING,
+                               f"The connection to {self.config.host} no longer "
+                               f"answers (the target rebooted, or the link dropped); "
+                               f"opening a new one…")
+                    self._drop_dead_link(client)
             return self._connect_with_retries()
 
     def _liveness_timeout(self) -> float:
-        return max(0.5, min(self._LIVENESS_TIMEOUT, self.config.connect_timeout or 5.0))
+        return max(self._LIVENESS_TIMEOUT, self.config.connect_timeout or 0.0)
 
     @staticmethod
-    def _link_alive(transport, timeout: float) -> bool:
-        """True if the server answers a keepalive request within *timeout*.
+    def _received(transport):
+        """What this transport has received so far (Paramiko's own packet and
+        byte counters; None where this Paramiko has other names for them).
+        Any change means a packet arrived — the server is alive."""
+        p = getattr(transport, "packetizer", None)
+        return (getattr(p, "_Packetizer__received_packets", None),
+                getattr(p, "_Packetizer__received_bytes", None))
 
-        Any answer counts (OpenSSH answers an unknown request with a failure).
-        Paramiko's global_request waits without a limit, so it runs on a helper
-        thread; on a dead link that thread ends when the transport is closed."""
+    @classmethod
+    def _link_alive(cls, transport, timeout: float) -> bool:
+        """True if the server shows within *timeout* that it is alive.
+
+        The probe is a session channel: every SSH server answers that, with
+        CONFIRMATION or OPEN_FAILURE (both mean alive; the channel is closed
+        again at once). A keepalive request does not do: Paramiko ignores a
+        server's SSH_MSG_UNIMPLEMENTED reply, and that live link looked dead.
+        Any packet that arrives meanwhile counts as well, so an answer queued
+        behind bulk data on a slow link is not needed. The probe runs on a
+        helper thread; on a dead link it ends when the transport is closed."""
         if transport is None or not transport.is_active():
             return False
         answered = threading.Event()
 
         def probe():
             try:
-                transport.global_request("keepalive@openssh.com", wait=True)
+                chan = transport.open_session(timeout=timeout)
+            except paramiko.ChannelException:      # OPEN_FAILURE: an answer
+                answered.set()
+                return
+            except Exception:                      # closed, or no answer
+                return
+            answered.set()
+            try:
+                chan.close()
             except Exception:
                 pass
-            finally:
-                answered.set()
+        before = cls._received(transport)
         threading.Thread(target=probe, name="turbossh-liveness", daemon=True).start()
-        return answered.wait(timeout) and transport.is_active()
+        deadline = time.monotonic() + timeout
+        while True:
+            if not transport.is_active():
+                return False
+            if answered.is_set():
+                return True
+            now = cls._received(transport)
+            if now != before and None not in now:
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            answered.wait(min(0.1, left))
 
-    def _drop_dead_link(self, client) -> None:
-        """Close a connection that stopped answering (and its SFTP session), and
-        the jump-host connection too if that one is dead as well."""
-        self._drop_shared_sftp()
+    def _drop_dead_link(self, client, check_jump: bool = True) -> None:
+        """Close a connection that stopped answering (and with it its SFTP
+        session), and the jump-host connection too if that one is dead as well.
+
+        Nothing is sent on the dead link: with its send buffer full (another
+        thread uploading), closing a channel waits for room that never comes,
+        and this runs under the connection lock. Closing the transport first
+        stops it (the writer gets an error), and the channels go with it. A
+        dead jump connection is closed before the target's, whose socket is a
+        channel through it."""
+        jump = self._jump
+        if check_jump and jump is not None:
+            jclient = jump._client
+            alive = jclient is not None and self._link_alive(
+                jclient.get_transport(), self._liveness_timeout())
+            if not alive:
+                self._close_jump()
         if self._client is client:
             self._client = None
         try:
             client.close()
         except Exception:
             pass
-        jump = self._jump
-        if jump is not None:
-            jclient = jump._client
-            alive = jclient is not None and self._link_alive(
-                jclient.get_transport(), self._liveness_timeout())
-            if not alive:
-                self._close_jump()
+        self._forget_shared_sftp()            # its channel closed with the transport
 
     @staticmethod
     def _request(chan, timeout: Optional[float], fn, *args, **kwargs):
@@ -814,14 +962,23 @@ class SSHHandler:
                        f"SSH library can't use (e.g. @cert-authority / @revoked) "
                        f"— first at line {skipped[0]}.")
 
+    def _jump_is_current(self) -> bool:
+        """True if the jump connection there is one made with the jump-host
+        settings the config has now."""
+        jump, cfg = self._jump, self.config.jump_host
+        return (jump is not None and cfg is not None
+                and jump._made_with == _link_key(cfg))
+
     def _open_jump_channel(self):
         """Return a NEW direct-tcpip channel to the target through the jump host.
 
         The jump connection is made once and reused: every auth strategy and
         every retry needs its own channel (a failed attempt closes the one it
         used), but reconnecting the jump host each time leaked a connection per
-        attempt."""
-        if self._jump is None or not self._jump.is_connected:
+        attempt. One made with other settings (the config's jump host was
+        changed) is replaced."""
+        if (self._jump is None or not self._jump.is_connected
+                or not self._jump_is_current()):
             self._close_jump()
             self._jump = SSHHandler(
                 self.config.jump_host,
@@ -1213,26 +1370,35 @@ class SSHHandler:
 
     def _install_client(self, client: paramiko.SSHClient) -> None:
         """Make *client* the connection, closing the one it replaces (a reconnect
-        after the link died) and that connection's SFTP session."""
+        after the link died) and with it that connection's SFTP session. The old
+        transport is closed first, so nothing is sent on a link that may have
+        stalled (see _drop_dead_link)."""
         old, self._client = self._client, client
-        self._drop_shared_sftp()
+        self._made_with = _link_key(self.config)
         if old is not None and old is not client:
             try:
                 old.close()
             except Exception:
                 pass
+        self._drop_shared_sftp()
 
-    def _drop_shared_sftp(self, only=None) -> None:
-        """Forget (and close) the shared SFTP client — or only if it is *only*."""
+    def _forget_shared_sftp(self, only=None):
+        """Forget the shared SFTP client — or only if it is *only* — and return
+        it (None if nothing was forgotten)."""
         with self._conn_lock:
             sftp = self._sftp
             if sftp is None or (only is not None and sftp is not only):
-                return
+                return None
             self._sftp = None
-        try:
-            sftp.close()
-        except Exception:
-            pass
+        return sftp
+
+    def _drop_shared_sftp(self, only=None) -> None:
+        """Forget (and close) the shared SFTP client — or only if it is *only*.
+        Closing a channel waits for room in the link's send buffer, which on a
+        stalled link (a timed-out client, a peer that stopped reading) never
+        comes: an SFTP client whose channel is still open is closed on a helper
+        thread, so no caller waits on it."""
+        _close_soon(self._forget_shared_sftp(only))
 
     def _post_connect(self) -> None:
         t = self._client.get_transport()
@@ -1247,18 +1413,23 @@ class SSHHandler:
         ``sticky=True`` is for disposing of the handler for good: until the next
         explicit connect(), nothing reconnects it — a worker thread still running
         after a GUI tab closed gets SSHNotConnectedError instead of opening a
-        connection nobody would ever close."""
+        connection nobody would ever close.
+
+        Nothing is sent on the link on the way (a link whose peer stopped
+        reading kept this waiting for ever): the jump connection is closed
+        first, then the transport, and the channels — the shared SFTP
+        session's too — close with it."""
         with self._conn_lock:
             self._closed = bool(sticky)
-            self._drop_shared_sftp()
-            if self._client is not None:
+            self._close_jump()
+            client, self._client = self._client, None
+            if client is not None:
                 try:
-                    self._client.close()
+                    client.close()
                 except Exception:
                     pass
                 self._emit(logging.INFO, f"Disconnected from {self.config.host}.")
-                self._client = None
-            self._close_jump()
+            self._drop_shared_sftp()
 
     close = disconnect
 
@@ -1318,11 +1489,15 @@ class SSHHandler:
                            get_pty=get_pty, environment=environment,
                            encoding=encoding, safe=safe)
 
-    def _run(self, command, *, timeout, check, get_pty, environment, encoding):
+    def _run(self, command, *, timeout, check, get_pty, environment, encoding,
+             expected=()):
+        """*expected*: exit codes besides 0 that are an answer, not a failure
+        (logged as information, not as a warning)."""
         eff_timeout = timeout if timeout is not None else self.config.command_timeout
         result = self._exec(command, timeout=eff_timeout, get_pty=get_pty,
                             environment=environment, encoding=encoding)
-        lvl = logging.INFO if result.ok else logging.WARNING
+        lvl = (logging.INFO if result.ok or result.exit_code in expected
+               else logging.WARNING)
         self._emit(lvl, f"exit={result.exit_code} ({result.duration:.2f}s)")
         if check and not result.ok:
             raise SSHCommandError(command, result)
@@ -1626,30 +1801,42 @@ class SSHHandler:
     def _posix_kill_tracked() -> str:
         """sh: kill the processes listed in "$__pf" (the two cats of an earlier
         bridge on this port) and remove it. On Linux a PID is killed only while
-        /proc says it is still a cat, so a PID reused since is left alone."""
-        return ("for __p in $(cat \"$__pf\" 2>/dev/null); do "
+        /proc says it is still a cat, so a PID reused since is left alone.
+        $__n counts the ones stopped."""
+        return ("__n=0; for __p in $(cat \"$__pf\" 2>/dev/null); do "
                 "case $__p in ''|*[!0-9]*) continue;; esac; "
                 "if [ -r /proc/$__p/cmdline ]; then "
                 "case $(tr '\\000' ' ' < /proc/$__p/cmdline 2>/dev/null) in "
                 "cat*|*/cat*) ;; *) continue;; esac; fi; "
-                "kill $__p 2>/dev/null; done; "
+                "kill $__p 2>/dev/null && __n=$((__n+1)); done; "
                 "[ -n \"$__pf\" ] && rm -f \"$__pf\"; ")
 
-    # Windows: stop every TurboSSH serial PowerShell holding THIS port (force):
-    # found by the port tag, or — for a reader started by 2.0 (whose header has
-    # no port line) — by the port name in its decoded script. Never this process
-    # or its ancestors (TsOurs).
-    _PS_KILL_PORT = (
-        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\"|"
-        "Where-Object{TsOurs $_}|ForEach-Object{$hit="
-        "$_.CommandLine -like '*__PORTTAG__*';"
-        "if(-not $hit -and $_.CommandLine -match 'EncodedCommand\\s+(\\S+)'){"
-        "try{$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("
-        "$Matches[1]));$q=[char]39;$hit=$s.IndexOf('#port=') -lt 0 -and "
-        "$s.Contains($q+'__DEVSQ__'+$q)}catch{}};"
-        "if($hit){try{Stop-Process -Id $_.ProcessId -Force}catch{}}};"
-        "Start-Sleep -Milliseconds 300;"
-    )
+    def _win_serial_script(self, device: str, body: str, *, force: bool,
+                           tracked: bool = True) -> str:
+        """The common head of a Windows serial script, then *body*: the PID
+        file ($pf), the port ($dev), and — *tracked* — the port's tracked holder
+        stopped if it is still ours; *force* also stops every TurboSSH serial
+        reader of the port (see _PS_KILL_PORT)."""
+        key = _port_key(device)
+        needle = "'" + self._ps_sq(device) + "'"          # as a 2.0 script has it
+        head = '"' + _serial_ps_header(key).replace("\n", "`n") + '"'
+        ps = ("$ErrorActionPreference='SilentlyContinue';"
+              f"$dev='{self._ps_sq(device)}';"
+              f"$pf=Join-Path $env:TEMP turbossh_ser_{key}.pid;")
+        if force:
+            ps += _PS_LOAD
+        if tracked or force:
+            ps += _PS_OURS_FN.replace("__ANYTAG__", _serial_ps_tag_b64())
+        if tracked:
+            ps += _ps_kill_tracked(load=not force)
+        if force:
+            ps += (_PS_KILL_PORT.replace("__PORTHEAD__", head)
+                   .replace("__DEVNEEDLE__", "'" + self._ps_sq(needle) + "'"))
+        return ps + body
+
+    @staticmethod
+    def _ps_command(script: str) -> str:
+        return f"powershell -NoProfile -EncodedCommand {_ps_b64(script)}"
 
     def serial_stream(self, device: str = "/dev/ttyUSB0", *, baudrate: int = 115200,
                       mode: str = "auto", on_line=None, on_match=None, match=None,
@@ -1690,44 +1877,28 @@ class SSHHandler:
             # reader, and the reader is stopped when the stream ends. (The PID
             # file used to be written before Open() and deleted on failure: a
             # retry on a busy port erased the record of the real holder, which
-            # then kept the port until a reboot.) The tracked holder is killed
+            # then kept the port until a reboot.) The tracked holder is touched
             # only with force: it may be a LIVE bridge — the GUI's serial tab on
             # this port — and a script's stream used to kill it.
-            key = _port_key(device)
             run = os.urandom(6).hex()
-            forceblock = (_PS_KILL_TRACKED + self._PS_KILL_PORT) if force else ""
-            ps = (
-                "$ErrorActionPreference='SilentlyContinue';"
-                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
-                "$dev='__DEV__';"
-                "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
-                + _PS_OURS_FN + _PS_BUSY_FN + forceblock +
-                "$p=New-Object System.IO.Ports.SerialPort $dev,__BAUD__,'None',8,'One';"
-                "$p.Encoding=[System.Text.Encoding]::UTF8;$ok=$false;$why=$null;"
-                "for($i=0;$i -lt __RETRIES__;$i++){try{$p.Open();$ok=$true;break}catch{"
-                + _PS_INNER + "$why=$e;Start-Sleep -Milliseconds 350}};"
+            body = (
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                + _ps_open_port(baudrate, 15 if force else 3) +
+                "$p.Encoding=[Text.Encoding]::UTF8;"
                 # say so and stop if the port will not open — otherwise the loop
                 # below just spins on a closed port and the stream looks empty
-                "if(-not $ok){$m='[serial] cannot open '+$dev+': '+$why.Message;"
-                "if(TsBusy $why){$m+=' (it is in use; force=True stops a stale TurboSSH "
-                "reader of it first)'};"
+                "if(-not $p.IsOpen){$m='[serial] cannot open '+$dev+': '+$why.Message;"
+                "if(" + _ps_busy("$why") + "){$m+=' (it is in use; force=True stops "
+                "a stale TurboSSH reader of it first)'};"
                 "[Console]::Out.WriteLine($m);[Console]::Out.Flush();exit 2};"
                 "Set-Content -LiteralPath $pf -Value $PID;"
-                "try{while($true){"
-                "if($p.BytesToRead -gt 0){"
-                "$s=$p.ReadExisting();[Console]::Out.Write($s);[Console]::Out.Flush()}"
-                "else{Start-Sleep -Milliseconds 30}}}"
+                "try{while(1){if($p.BytesToRead -gt 0){"
+                "[Console]::Out.Write($p.ReadExisting());[Console]::Out.Flush()}"
+                "else{sleep -m 30}}}"
                 "finally{try{$p.Close()}catch{};" + _PS_DROP_OWN_PIDFILE + "}"
             )
-            ps = (ps.replace("__ANYTAG__", _serial_ps_tag_b64())
-                    .replace("__PORTTAG__", _ps_b64(_serial_ps_header(key)))
-                    .replace("__RETRIES__", "15" if force else "3")
-                    .replace("__KEY__", key)
-                    .replace("__BAUD__", str(int(baudrate)))
-                    .replace("__DEVSQ__", self._ps_sq(device))
-                    .replace("__DEV__", self._ps_sq(device)))
-            cmd = ("powershell -NoProfile -EncodedCommand "
-                   + self._ps_encode(_serial_ps_header(key, run) + ps))
+            ps = self._win_serial_script(device, body, force=force, tracked=force)
+            cmd = self._ps_command(_serial_ps_header(_port_key(device), run) + ps)
         else:
             dev = shlex.quote(device)
             if configure:
@@ -1744,6 +1915,20 @@ class SSHHandler:
             if run is not None:
                 self._serial_stop_run(device, run)
 
+    def _serial_stop_run_cmd(self, device: str, run: str) -> str:
+        key = _port_key(device)
+        ps = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"$pf=Join-Path $env:TEMP turbossh_ser_{key}.pid;"
+            "$own=[string](gc -LiteralPath $pf -TotalCount 1);"
+            "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\"|"
+            "?{$_.ProcessId -ne $PID -and $_.CommandLine -like '*__RUNTAG__*'}|%{"
+            "Stop-Process -Id $_.ProcessId -Force;"
+            "if($own.Trim() -eq [string]$_.ProcessId){"
+            "Remove-Item -LiteralPath $pf -Force}};'stopped'"
+        ).replace("__RUNTAG__", _ps_b64(_serial_ps_header(key, run)))
+        return self._ps_command(ps)
+
     def _serial_stop_run(self, device: str, run: str) -> None:
         """Stop the Windows reader of one serial_stream run (found by the run id
         in its command line, never another holder of the port) and drop the PID
@@ -1751,25 +1936,36 @@ class SSHHandler:
         open (``force=True``) frees the port then."""
         if not self.is_connected:
             return
-        key = _port_key(device)
-        ps = (
-            "$ErrorActionPreference='SilentlyContinue';"
-            "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
-            "$own=[string](Get-Content -LiteralPath $pf|Select-Object -First 1);"
-            "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\"|"
-            "Where-Object{$_.ProcessId -ne $PID -and "
-            "$_.CommandLine -like '*__RUNTAG__*'}|ForEach-Object{"
-            "try{Stop-Process -Id $_.ProcessId -Force}catch{};"
-            "if($own.Trim() -eq [string]$_.ProcessId){"
-            "Remove-Item -LiteralPath $pf -Force}};'stopped'"
-        ).replace("__KEY__", key).replace(
-            "__RUNTAG__", _ps_b64(_serial_ps_header(key, run)))
         try:
-            self._run(f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}",
-                      timeout=15, check=False, get_pty=False, environment=None,
-                      encoding="utf-8")
+            self._run(self._serial_stop_run_cmd(device, run), timeout=15,
+                      check=False, get_pty=False, environment=None, encoding="utf-8")
         except Exception as exc:
             self._emit(logging.DEBUG, f"Stopping the serial reader failed: {exc}")
+
+    # Bytes per serial_write command: their base64 travels inside the encoded
+    # script (8/3 characters each), and the command must stay under cmd's limit.
+    _SERIAL_WRITE_CHUNK = 1536
+
+    def _serial_write_cmds(self, device: str, raw: bytes, baudrate: int) -> list:
+        cmds = []
+        step = self._SERIAL_WRITE_CHUNK
+        for start in range(0, max(1, len(raw)), step):
+            chunk = raw[start:start + step]
+            # time for the bytes to leave the port (10 bits a byte) before Close
+            drain = 200 + len(chunk) * 10000 // max(1, int(baudrate))
+            ps = (
+                "$ErrorActionPreference='Stop';"
+                f"try{{$b=[Convert]::FromBase64String("
+                f"'{base64.b64encode(chunk).decode('ascii')}');"
+                f"$p=New-Object IO.Ports.SerialPort '{self._ps_sq(device)}',"
+                f"{int(baudrate)};$p.WriteTimeout=5000;$p.Open();"
+                f"try{{$p.Write($b,0,$b.Length);Start-Sleep -Milliseconds {drain}}}"
+                "finally{$p.Close()}}"
+                "catch{" + _PS_INNER +
+                "[Console]::Error.WriteLine('serial write failed: '+$e.Message);exit 3}"
+            )
+            cmds.append(self._ps_command(ps))
+        return cmds
 
     def serial_write(self, device: str, data: str, *, baudrate: int = 115200,
                      mode: str = "auto", newline: bool = True,
@@ -1781,35 +1977,30 @@ class SSHHandler:
 
         A port that can't be opened or written raises :class:`SSHCommandError`
         with the reason in its stderr (``safe=True``: a failed OperationResult);
-        it used to report success with nothing sent.
+        it used to report success with nothing sent. On Windows, data longer
+        than a command line can carry is written in several steps, in order.
         """
         raw = data + ("\n" if newline else "")
         if self._is_windows_port(device, mode):
             # The bytes travel base64-encoded (no payload can break the quoting)
             # and are written as UTF-8 (SerialPort's default encoding is ASCII,
             # which turned every non-ASCII character into '?').
-            ps = (
-                "$ErrorActionPreference='Stop';"
-                "try{$b=[Convert]::FromBase64String('__DATA__');"
-                "$p=New-Object System.IO.Ports.SerialPort '__DEV__',__BAUD__,"
-                "'None',8,'One';$p.WriteTimeout=5000;$p.Open();"
-                "try{$p.Write($b,0,$b.Length);Start-Sleep -Milliseconds 200}"
-                "finally{$p.Close()}}"
-                "catch{" + _PS_INNER +
-                "[Console]::Error.WriteLine('serial write failed: '+$e.Message);exit 3}"
-            )
-            ps = (ps.replace("__DATA__",
-                             base64.b64encode(raw.encode("utf-8")).decode("ascii"))
-                    .replace("__BAUD__", str(int(baudrate)))
-                    .replace("__DEV__", self._ps_sq(device)))
-            cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
+            cmds = self._serial_write_cmds(device, raw.encode("utf-8"), baudrate)
         else:
             dev = shlex.quote(device)
             # `> dev` on a missing device would create a plain file there instead
-            cmd = (f"if [ -c {dev} ]; then printf %s {shlex.quote(raw)} > {dev}; "
-                   f"else echo 'serial write failed: '{dev}' is not a serial "
-                   f"device' >&2; exit 2; fi")
-        return self.run(cmd, timeout=60, check=True, safe=safe)
+            cmds = [f"if [ -c {dev} ]; then printf %s {shlex.quote(raw)} > {dev}; "
+                    f"else echo 'serial write failed: '{dev}' is not a serial "
+                    f"device' >&2; exit 2; fi"]
+        if len(cmds) == 1:
+            return self.run(cmds[0], timeout=60, check=True, safe=safe)
+
+        def _do():
+            res = None
+            for cmd in cmds:
+                res = self.run(cmd, timeout=60, check=True, safe=False)
+            return res
+        return self._guard("serial_write", _do, safe=safe)
 
     def serial_bridge(self, device: str, *, baudrate: int = 115200,
                       mode: str = "auto", force: bool = False):
@@ -1834,95 +2025,20 @@ class SSHHandler:
         the user confirms taking a port that's already in use.
         """
         self._ensure_connected()
-        key = _port_key(device)
-        if self._is_windows_port(device, mode):
-            forceblock = self._PS_KILL_PORT if force else ""
-            retries = "15" if force else "3"
-            ps = (
-                "$ErrorActionPreference='SilentlyContinue';"
-                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
-                "$dev='__DEV__';"
-                "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
-                + _PS_OURS_FN + _PS_BUSY_FN +
-                # always clear our own tracked stale holder for this port
-                _PS_KILL_TRACKED +
-                "__FORCEKILL__"
-                "$p=New-Object System.IO.Ports.SerialPort $dev,__BAUD__,'None',8,'One';"
-                "$p.ReadTimeout=50;$p.WriteTimeout=500;$ok=$false;$why=$null;"
-                "for($i=0;$i -lt __RETRIES__;$i++){try{$p.Open();$ok=$true;break}"
-                "catch{" + _PS_INNER + "$why=$e;Start-Sleep -Milliseconds 350}};"
-                # BUSY only when another process holds the port (access denied,
-                # or a driver's "in use" / sharing violation); a missing or
-                # unplugged port says what is wrong instead
-                "if(-not $ok){if(TsBusy $why){"
-                "[Console]::Out.Write('BUSY:'+$dev)}else{[Console]::Out.Write("
-                "'[serial] cannot open '+$dev+': '+$why.Message)};"
-                "[Console]::Out.Flush();exit 2};"
-                "Set-Content -LiteralPath $pf -Value $PID;"
-                # RAW console input: no line buffering, no echo, Ctrl-C as a byte
-                "try{$t=Add-Type -Name TSio -Namespace TS -PassThru -MemberDefinition "
-                "'[DllImport(\"kernel32.dll\")] public static extern System.IntPtr GetStdHandle(int n);"
-                "[DllImport(\"kernel32.dll\")] public static extern bool GetConsoleMode(System.IntPtr h,out uint m);"
-                "[DllImport(\"kernel32.dll\")] public static extern bool SetConsoleMode(System.IntPtr h,uint m);';"
-                "$h=$t::GetStdHandle(-10);$m=0;"
-                "if($t::GetConsoleMode($h,[ref]$m)){$t::SetConsoleMode($h,($m -band 0xFFFFFFF8))|Out-Null}}catch{};"
-                "$out=[Console]::OpenStandardOutput();"
-                "$in=[Console]::OpenStandardInput();$ib=New-Object byte[] 4096;"
-                "$ar=$in.BeginRead($ib,0,4096,$null,$null);"
-                "try{while($true){"
-                "try{if($p.BytesToRead -gt 0){$s=$p.ReadExisting();"
-                "if($s){$b=[System.Text.Encoding]::UTF8.GetBytes($s);"
-                "$out.Write($b,0,$b.Length);$out.Flush()}}}catch{};"
-                "if($ar.IsCompleted){try{$n=$in.EndRead($ar)}catch{$n=0};"
-                "if($n -le 0){break};try{$p.Write($ib,0,$n)}catch{};"
-                "$ar=$in.BeginRead($ib,0,4096,$null,$null)};"
-                "Start-Sleep -Milliseconds 5}}"
-                "finally{try{$p.Close()}catch{};" + _PS_DROP_OWN_PIDFILE + "}"
-            )
-            ps = (ps.replace("__FORCEKILL__", forceblock)
-                    .replace("__RETRIES__", retries)
-                    .replace("__BAUD__", str(int(baudrate)))
-                    .replace("__KEY__", key)
-                    .replace("__ANYTAG__", _serial_ps_tag_b64())
-                    .replace("__PORTTAG__", _ps_b64(_serial_ps_header(key)))
-                    .replace("__DEVSQ__", self._ps_sq(device))
-                    .replace("__DEV__", self._ps_sq(device)))
-            cmd = ("powershell -NoProfile -EncodedCommand "
-                   + self._ps_encode(_serial_ps_header(key) + ps))
-        else:
-            dev = shlex.quote(device)
-            baud = int(baudrate)
-            fk = f"fuser -k {dev} 2>/dev/null; " if force else ""
-            # The PTY (needed for interactive input) starts out cooked: it echoed
-            # every keystroke a second time, held input back until Enter, and made
-            # Ctrl-C a SIGINT that killed the bridge. So stdin goes raw as well
-            # (-isig: Ctrl-C is just byte 0x03 for the device) — but keeps the two
-            # translations 2.0's cooked PTY did and terminals rely on: output
-            # LF -> CR LF (opost onlcr; without it a device printing a bare LF
-            # staircases) and input Enter, CR -> LF (icrnl). They are
-            # set on their own, so an stty without one of them still goes raw.
-            # QNX's stty has no -F; it configures the device given as stdin. The
-            # two cats' PIDs are recorded (in a folder of the user's own) so
-            # serial_release() stops exactly this bridge (it used to `fuser -k`
-            # every process holding the device). The writer reads a copy of stdin
-            # on fd 3: a background job's stdin is /dev/null in a non-interactive
-            # shell. __drop removes the PID file only while it still names this
-            # bridge.
-            cmd = (
-                self._posix_pid_setup(device)
-                + self._posix_kill_tracked() + fk +
-                f"stty -F {dev} {baud} raw -echo 2>/dev/null || "
-                f"stty {baud} raw -echo < {dev} 2>/dev/null; "
-                "stty raw -echo -isig 2>/dev/null || stty raw -echo 2>/dev/null; "
-                "stty icrnl opost onlcr 2>/dev/null; "
-                "__drop() { [ \"$(cat \"$__pf\" 2>/dev/null)\" = \"$__r $__w\" ] "
-                "&& rm -f \"$__pf\"; }; "
-                "exec 3<&0; "
-                f"cat {dev} & __r=$!; cat <&3 > {dev} & __w=$!; "
-                "[ -n \"$__pf\" ] && echo \"$__r $__w\" > \"$__pf\"; "
-                "trap 'kill $__r $__w 2>/dev/null; __drop; exit' HUP INT TERM; "
-                "wait $__w; kill $__r 2>/dev/null; __drop"
-            )
+        if force and self._is_windows_port(device, mode):
+            # The forced stop is serial_release(force=True), run first as a
+            # command of its own: in one script with the bridge, the command
+            # line was longer than cmd.exe takes (8,191), and every forced open
+            # under a cmd default shell failed. The bridge then retries the
+            # open for a few seconds while the port is let go.
+            try:
+                self._run(self._serial_release_cmd(device, mode, True), timeout=30,
+                          check=False, get_pty=False, environment=None,
+                          encoding="utf-8")
+            except (SSHCommandError, SSHTimeoutError) as exc:
+                self._emit(logging.WARNING, f"Stopping the holders of {device} "
+                                            f"failed: {exc}")
+        cmd = self._serial_bridge_cmd(device, baudrate, mode, force)
         to = self.config.connect_timeout
         chan = self.transport.open_session(timeout=to)
         try:
@@ -1935,6 +2051,87 @@ class SSHHandler:
             raise
         return chan
 
+    def _serial_bridge_cmd(self, device: str, baudrate: int, mode: str,
+                           force: bool) -> str:
+        if self._is_windows_port(device, mode):
+            body = (
+                "$u=[Text.Encoding]::UTF8;[Console]::OutputEncoding=$u;"
+                + _ps_open_port(baudrate, 15 if force else 3) +
+                "$p.WriteTimeout=500;"
+                # BUSY only when another process holds the port (access denied,
+                # or a driver's "in use" / sharing violation); a missing or
+                # unplugged port says what is wrong instead
+                "if(-not $p.IsOpen){[Console]::Out.Write($(if(" + _ps_busy("$why") +
+                "){'BUSY:'+$dev}else{'[serial] cannot open '+$dev+': '+$why.Message}));"
+                "[Console]::Out.Flush();exit 2};"
+                "Set-Content -LiteralPath $pf -Value $PID;"
+                # RAW console input: no line buffering, no echo, Ctrl-C as a byte
+                "try{$t=Add-Type -Name TSio -Namespace TS -PassThru -MemberDefinition "
+                "'[DllImport(\"kernel32\")]public static extern IntPtr GetStdHandle(int n);"
+                "[DllImport(\"kernel32\")]public static extern bool GetConsoleMode(IntPtr h,out int m);"
+                "[DllImport(\"kernel32\")]public static extern bool SetConsoleMode(IntPtr h,int m);';"
+                "$h=$t::GetStdHandle(-10);$m=0;"
+                "if($t::GetConsoleMode($h,[ref]$m)){$t::SetConsoleMode($h,$m -band -8)|Out-Null}}catch{};"
+                "$out=[Console]::OpenStandardOutput();"
+                "$in=[Console]::OpenStandardInput();$ib=New-Object byte[] 4096;"
+                "$ar=$in.BeginRead($ib,0,4096,$null,$null);"
+                "try{while(1){"
+                "try{if($p.BytesToRead -gt 0){$s=$p.ReadExisting();"
+                "if($s){$b=$u.GetBytes($s);"
+                "$out.Write($b,0,$b.Length);$out.Flush()}}}catch{};"
+                "if($ar.IsCompleted){try{$k=$in.EndRead($ar)}catch{$k=0};"
+                "if($k -le 0){break};try{$p.Write($ib,0,$k)}catch{};"
+                "$ar=$in.BeginRead($ib,0,4096,$null,$null)};"
+                "sleep -m 5}}"
+                "finally{try{$p.Close()}catch{};" + _PS_DROP_OWN_PIDFILE + "}"
+            )
+            # always clears our own tracked stale holder of this port (a forced
+            # open has stopped every holder of ours first: see serial_bridge)
+            ps = self._win_serial_script(device, body, force=False)
+            return self._ps_command(_serial_ps_header(_port_key(device)) + ps)
+        dev = shlex.quote(device)
+        baud = int(baudrate)
+        fk = f"fuser -k {dev} 2>/dev/null; " if force else ""
+        # The PTY (needed for interactive input) starts out cooked: it echoed
+        # every keystroke a second time, held input back until Enter, and made
+        # Ctrl-C a SIGINT that killed the bridge. So stdin goes raw as well
+        # (-isig: Ctrl-C is just byte 0x03 for the device) — but keeps the two
+        # translations 2.0's cooked PTY did and terminals rely on: output
+        # LF -> CR LF (opost onlcr; without it a device printing a bare LF
+        # staircases) and input Enter, CR -> LF (icrnl). They are
+        # set on their own, so an stty without one of them still goes raw.
+        # QNX's stty has no -F; it configures the device given as stdin. The
+        # two cats' PIDs are recorded (in a folder of the user's own) so
+        # serial_release() stops exactly this bridge (it used to `fuser -k`
+        # every process holding the device). The writer reads a copy of stdin
+        # on fd 3: a background job's stdin is /dev/null in a non-interactive
+        # shell. __drop removes the PID file only while it still names this
+        # bridge.
+        return (
+            self._posix_pid_setup(device)
+            + self._posix_kill_tracked() + fk +
+            f"stty -F {dev} {baud} raw -echo 2>/dev/null || "
+            f"stty {baud} raw -echo < {dev} 2>/dev/null; "
+            "stty raw -echo -isig 2>/dev/null || stty raw -echo 2>/dev/null; "
+            "stty icrnl opost onlcr 2>/dev/null; "
+            "__drop() { [ \"$(cat \"$__pf\" 2>/dev/null)\" = \"$__r $__w\" ] "
+            "&& rm -f \"$__pf\"; }; "
+            "exec 3<&0; "
+            f"cat {dev} & __r=$!; cat <&3 > {dev} & __w=$!; "
+            "[ -n \"$__pf\" ] && echo \"$__r $__w\" > \"$__pf\"; "
+            "trap 'kill $__r $__w 2>/dev/null; __drop; exit' HUP INT TERM; "
+            "wait $__w; kill $__r 2>/dev/null; __drop"
+        )
+
+    def _serial_in_use_cmd(self, device: str) -> str:
+        # BUSY: access denied, or a driver's "in use" / sharing violation
+        # (some USB-serial drivers report a held port as an IOException)
+        ps = (f"$p=New-Object IO.Ports.SerialPort '{self._ps_sq(device)}',9600;"
+              "try{$p.Open();$p.Close();'FREE'}catch{" + _PS_INNER +
+              "if(" + _ps_busy("$e") + "){'BUSY'}"
+              "else{'UNAVAILABLE: '+$e.Message}}")
+        return self._ps_command(ps)
+
     def serial_in_use(self, device: str, *, mode: str = "auto",
                       safe: Optional[bool] = None) -> bool:
         """Return True if *device* is currently in use (another process holds
@@ -1942,22 +2139,31 @@ class SSHHandler:
         busy. A missing or unplugged port is not "in use": opening it then
         reports the real reason."""
         if self._is_windows_port(device, mode):
-            # BUSY: access denied, or a driver's "in use" / sharing violation
-            # (some USB-serial drivers report a held port as an IOException)
-            ps = (_PS_BUSY_FN +
-                  "$p=New-Object System.IO.Ports.SerialPort '__DEV__',9600;"
-                  "try{$p.Open();$p.Close();'FREE'}catch{" + _PS_INNER +
-                  "if(TsBusy $e){'BUSY'}"
-                  "else{'UNAVAILABLE: '+$e.Message}}"
-                  ).replace("__DEV__", self._ps_sq(device))
-            cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
-            res = self.run(cmd, timeout=15, safe=False)
+            res = self.run(self._serial_in_use_cmd(device), timeout=15, safe=False)
         else:
             dev = shlex.quote(device)
             res = self.run(f"fuser {dev} >/dev/null 2>&1 && echo BUSY || echo FREE",
                            timeout=15, safe=False)
         text = getattr(res, "text", "") or ""
         return any(line.strip() == "BUSY" for line in text.splitlines())
+
+    # What serial_release says when it had nothing of its own to stop.
+    _NOTHING_TRACKED = ("nothing to release: no TurboSSH bridge of this port is "
+                        "recorded on that machine, so nothing was stopped; "
+                        "force=True stops whatever TurboSSH holds it")
+
+    def _serial_release_cmd(self, device: str, mode: str, force: bool) -> str:
+        if self._is_windows_port(device, mode):
+            outcome = ("'released'" if force else
+                       "if($n){'released'}else{[Console]::Error.WriteLine("
+                       f"'{self._NOTHING_TRACKED}');exit 1}}")
+            return self._ps_command(self._win_serial_script(
+                device, "Remove-Item -LiteralPath $pf -Force;" + outcome, force=force))
+        dev = shlex.quote(device)
+        outcome = (f"fuser -k {dev} 2>/dev/null; echo released" if force else
+                   "if [ \"$__n\" -gt 0 ]; then echo released; else "
+                   f"echo {shlex.quote(self._NOTHING_TRACKED)} >&2; exit 1; fi")
+        return self._posix_pid_setup(device) + self._posix_kill_tracked() + outcome
 
     def serial_release(self, device: str, *, mode: str = "auto", force: bool = False,
                        safe: Optional[bool] = None):
@@ -1970,27 +2176,18 @@ class SSHHandler:
         Only TurboSSH's own bridge is stopped. ``force=True`` also stops any other
         holder: on Windows every TurboSSH serial reader of this port, on Linux /
         QNX every process holding the device (``fuser -k``).
+
+        Returns the command's result. Without ``force``, when no bridge of this
+        port was tracked (none left running, or one this machine has no record
+        of), nothing is stopped and it says so: exit status 1 and a hint to use
+        ``force=True`` in its stderr (it used to report "released"). That is an
+        answer, not an error: it is logged as information (a GUI tab whose
+        bridge ended by itself releases nothing on close).
         """
-        key = _port_key(device)
-        if self._is_windows_port(device, mode):
-            ps = (
-                "$ErrorActionPreference='SilentlyContinue';"
-                "$pf=Join-Path $env:TEMP 'turbossh_ser___KEY__.pid';"
-                + _PS_OURS_FN + _PS_KILL_TRACKED +
-                "Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue;"
-                + (self._PS_KILL_PORT if force else "") + "'released'"
-            )
-            ps = (ps.replace("__KEY__", key)
-                    .replace("__ANYTAG__", _serial_ps_tag_b64())
-                    .replace("__PORTTAG__", _ps_b64(_serial_ps_header(key)))
-                    .replace("__DEVSQ__", self._ps_sq(device)))
-            cmd = f"powershell -NoProfile -EncodedCommand {self._ps_encode(ps)}"
-            return self.run(cmd, timeout=15, safe=safe)
-        dev = shlex.quote(device)
-        cmd = (self._posix_pid_setup(device)
-               + self._posix_kill_tracked()
-               + (f"fuser -k {dev} 2>/dev/null; " if force else "") + "echo released")
-        return self.run(cmd, timeout=15, safe=safe)
+        return self._guard("serial_release", self._run,
+                           self._serial_release_cmd(device, mode, force), timeout=15,
+                           check=False, get_pty=False, environment=None,
+                           encoding="utf-8", expected=(1,), safe=safe)
 
     def remote_serial_ports(self, *, safe: Optional[bool] = None):
         """
@@ -2101,7 +2298,7 @@ class SSHHandler:
         ``ffmpeg`` is the remote ffmpeg path. Returns a list of camera names."""
         def _do():
             self._ensure_connected()
-            exe = _cmd_safe(ffmpeg)
+            exe = _cmd_safe_path(ffmpeg)
             # ffmpeg prints the device list to stderr; -list_devices then exits.
             cmd = self._cmd_line(f'"{exe}" -hide_banner -list_devices true '
                                  f'-f dshow -i dummy')
@@ -2196,8 +2393,9 @@ class SSHHandler:
         # dshow device names sit inside double quotes (`-i video="Name"`): a
         # quote would end the argument, and a | or %VAR% would break the line
         # under a PowerShell default shell (see _cmd_safe), so they are dropped.
+        # The ffmpeg path keeps its %VAR% (both shells expand it, as in 2.0).
         camera = _cmd_safe(camera)
-        exe = _cmd_safe(ffmpeg)
+        exe = _cmd_safe_path(ffmpeg)
         to = self.config.connect_timeout
         token = f"turbossh_cam_{os.urandom(5).hex()}"
         # Clear a stale ffmpeg first: closing an SSH exec channel doesn't kill the
@@ -2344,18 +2542,22 @@ class SSHHandler:
         clean-up: every ffmpeg whose path or command line contains the marker
         (default ``turbossh_cam``, the folder the GUI pushes ffmpeg to). A
         handler that started no stream (a fresh one, e.g. in a clean-up script)
-        has nothing of its own to stop: it says so in the log and does nothing."""
+        has nothing of its own to stop: it does nothing and says so — in the
+        log, and in the result, whose exit status is 1 (``res.ok`` is False)
+        with the hint to use ``force=True`` in its stderr. (It used to report
+        "released 0" as a success, and a clean-up script took the camera for
+        freed.)"""
         def _do():
             with self._cam_lock:
                 tokens = list(self._cam_tokens)
             wide = force or ffmpeg_marker is not None
             if not tokens and not wide:
-                self._emit(logging.WARNING,
-                           f"webcam_release(): this handler started no camera "
-                           f"stream on {self.config.host}, so nothing was stopped. "
-                           f"To stop a camera ffmpeg an earlier session left "
-                           f"running there, call webcam_release(force=True).")
-                return CommandResult("webcam_release", 0, "released 0\n", "", 0.0,
+                hint = (f"webcam_release(): this handler started no camera stream "
+                        f"on {self.config.host}, so nothing was stopped. To stop a "
+                        f"camera ffmpeg an earlier session left running there, call "
+                        f"webcam_release(force=True).")
+                self._emit(logging.WARNING, hint)
+                return CommandResult("webcam_release", 1, "released 0\n", hint, 0.0,
                                      host=self.config.host)
             res = self._webcam_kill(
                 tokens=tokens,
@@ -2464,7 +2666,7 @@ class SSHHandler:
                 if self._client is client and self._sftp is None:
                     self._sftp = new
                     return new
-            new.close()               # another thread won, or the link was replaced
+            _close_soon(new)          # another thread won, or the link was replaced
         raise SSHNotConnectedError(f"Not connected to {self.config.host}.")
 
     def open_sftp(self) -> paramiko.SFTPClient:
@@ -2834,7 +3036,7 @@ class SSHHandler:
         _transfer.sftp_get(sftp, remote, local, callback)
 
     def _get_file(self, sftp, remote_path, local_path, callback) -> None:
-        """Download to ``.<name>.tsp`` next to *local_path* and move it into
+        """Download to ``.<name>.<n>.tsp`` next to *local_path* and move it into
         place only when complete (keeping the old file's permissions): a failed
         or aborted download leaves an existing file untouched and no partial
         file behind. Through a symlink, the file it points at is replaced."""
