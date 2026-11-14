@@ -21,7 +21,6 @@ from __future__ import annotations
 import codecs
 import os
 import subprocess
-import time
 
 _WINDOWS = os.name == "nt"
 _UTF8 = ("$e=New-Object System.Text.UTF8Encoding $false;"
@@ -86,6 +85,8 @@ def _descendants(pid: int) -> list:
     # A process's parent PID is only a number: one whose parent ended long ago
     # names a PID Windows may since have given to *pid* (or a child of it).
     # Such a process is older than its "parent" and none of ours: left alone.
+    # (Start times are wall-clock: a minute's leeway, so the clock being set
+    # back a little after the shell started does not hide its real children.)
     started: dict = {}
 
     def start(p):
@@ -100,11 +101,15 @@ def _descendants(pid: int) -> list:
             if child in found or child == pid:
                 continue
             born, parent_born = start(child), start(parent)
-            if born is not None and parent_born is not None and born < parent_born:
+            if (born is not None and parent_born is not None
+                    and born < parent_born - _CLOCK_LEEWAY):
                 continue
             found.append(child)
             queue.append(child)
     return found
+
+
+_CLOCK_LEEWAY = 60 * 10_000_000         # a minute, in FILETIME units (100 ns)
 
 
 def _start_time(pid: int):
@@ -220,9 +225,10 @@ class LocalShell:
         """Whether the shell runs in a Windows pseudo console."""
         return self._console is not None
 
-    def at_prompt(self) -> bool:
-        """A pseudo console's shell is at its prompt: nothing it started still
-        runs. (Looks at the process tree: not on the GUI thread.)"""
+    def runs_nothing(self) -> bool:
+        """A pseudo console's shell has no program of its own running (it may
+        still be busy itself: a cmdlet, a batch file, ``Read-Host``, ``set /p``).
+        Looks at the process tree: not on the GUI thread."""
         console = self._console
         if console is None:
             return False
@@ -230,23 +236,6 @@ class LocalShell:
             return not _descendants(console.pid)
         except Exception:
             return False
-
-    def clear_console(self) -> None:
-        """A pseudo console keeps its own screen and draws on it with absolute
-        positions, so only the shell can clear it: this sends, at its prompt
-        (see :meth:`at_prompt`), what clears it there — Ctrl+L, PSReadLine's
-        Clear Screen, which keeps the line being typed; for cmd, Esc to empty
-        the line, then ``cls`` (which ends with ESC[3J). On the terminal's
-        writer thread: the pause keeps the console from reading Esc + "c" as
-        Alt+C."""
-        if self._console is None:
-            return
-        if self.label == "PowerShell":
-            self.write(b"\x0c")
-        else:
-            self.write(b"\x1b")
-            time.sleep(0.15)
-            self.write(b"cls\r")
 
     def read(self, size: int = 65536):
         if self._console is not None:

@@ -24,7 +24,6 @@ needs and pyte leaves out. No Qt in here, so it is unit-testable headless.
 from __future__ import annotations
 
 import copy
-import time
 import unicodedata
 from typing import Callable, List, Optional
 
@@ -117,7 +116,6 @@ class TermScreen(pyte.Screen):
         self._reply = reply
         self._alt = None                 # the saved main screen while alt is shown
         self._cells: dict = {}           # attrs -> {char: Char}; see draw()
-        self._keep_history_until = 0.0   # see keep_history_once()
         super().__init__(columns, lines)
 
     # ------------------------------------------------------------- replies
@@ -248,17 +246,8 @@ class TermScreen(pyte.Screen):
         if how not in (0, 1, 2, 3):
             return
         if how == 3 and self._alt is None:
-            if time.monotonic() < self._keep_history_until:
-                self._keep_history_until = 0.0
-            else:
-                self.clear_history()     # ESC[3J: what `clear` sends to drop scrollback
+            self.clear_history()         # ESC[3J: what `clear` sends to drop scrollback
         super().erase_in_display(how, *args, **kwargs)
-
-    def keep_history_once(self, seconds: float = 5.0) -> None:
-        """The next ESC[3J, if it comes within *seconds*, leaves the scrollback
-        alone: the terminal's Clear button moved the screen there, and then has
-        cmd clear its console with ``cls`` — which ends with one."""
-        self._keep_history_until = time.monotonic() + seconds
 
     # ------------------------------------------------------------- drawing
     def _cells_for(self, attrs) -> dict:

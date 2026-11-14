@@ -24,7 +24,7 @@ class LocalTerminalWidget(QWidget):
     for good with ``ping -t``, where not even Ctrl-C could be pressed."""
     session_kind = "local"
     log = pyqtSignal(str)
-    _clear_ready = pyqtSignal(object)    # the shell whose console Clear may clear now
+    _clear_ready = pyqtSignal(object)    # (shell, nothing running): Clear, from the writer thread
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -131,33 +131,55 @@ class LocalTerminalWidget(QWidget):
                          daemon=True).start()
 
     def _clear(self):
-        """Clear: what is on screen goes into the scrollback. A Windows console
-        keeps a screen of its own and draws on it with absolute positions —
-        clearing only ours put what came next in the wrong places — so its
-        shell clears it, at its prompt (looked at on the writer thread, as it
-        walks the process tree). While a command runs, Clear says so instead."""
-        shell, writer = self.shell, self.writer
-        if shell is not None and writer is not None and getattr(shell, "console", False):
-            gate, log = self._clear_gate, self._log_gate
+        """Clear: what is on screen goes into the scrollback.
 
-            def check():
-                if shell.at_prompt():
-                    gate.emit(shell)
-                else:
-                    log.emit("[INFO] Local terminal: a command is running — Clear "
-                             "works at the shell's prompt")
+        A Windows console keeps a screen of its own and draws on it with
+        absolute positions: clearing only ours put what came next in the wrong
+        places. Nothing is typed into the shell for it — a command (``set /p``,
+        ``Read-Host``, ``pause``) may be reading its input — except at
+        PowerShell's own prompt, where Ctrl+L is PSReadLine's Clear Screen
+        (it keeps the line being typed). Everywhere else the console is made
+        to start afresh from the line the cursor is on (see _restart_console);
+        PSReadLine, which remembers where its line began, is not, as it would
+        then draw that line in the wrong place."""
+        shell, writer = self.shell, self.writer
+        if shell is None or writer is None or not getattr(shell, "console", False):
+            self.term.clear()
+        elif shell.label == "PowerShell" and self._at_powershell_prompt():
+            gate = self._clear_gate
+
+            def check():                 # walks the process tree: not here
+                gate.emit((shell, shell.runs_nothing()))
             writer.call(check)
         else:
-            self.term.clear()
+            self._clear_console((shell, False))
         self.term.setFocus()
 
-    def _clear_console(self, shell):
+    def _at_powershell_prompt(self) -> bool:
+        """The cursor is on a line that starts with PowerShell's prompt."""
+        screen = self.term.screen
+        line = screen.row_text(len(screen.history.top) + screen.cursor.y)
+        head = line[:screen.cursor.x]
+        return head.startswith("PS ") and "> " in head
+
+    def _clear_console(self, args):
+        shell, at_prompt = args
         if shell is not self.shell or self.writer is None:
             return                       # restarted or closed meanwhile
         self.term.clear()
-        if shell.label != "PowerShell":
-            self.term.screen.keep_history_once()     # cls ends with ESC[3J
-        self.writer.call(shell.clear_console)
+        if at_prompt:
+            self.writer.send(b"\x0c")
+        else:
+            self._restart_console(shell)
+
+    def _restart_console(self, shell):
+        """Have the console redraw from the cursor's line: it redraws all of its
+        screen when its size changes, and shrunk to one row and grown back, it
+        shows that line on top with blank rows below — cleared, and it knows.
+        Back to back, so hardly any output meets the one-row console (which
+        keeps only its last line)."""
+        shell.resize(self.term.cols, 1)
+        shell.resize(self.term.cols, self.term.rows)
 
     def _interrupt(self):
         if self.shell is not None:

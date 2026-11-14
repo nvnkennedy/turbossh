@@ -342,6 +342,34 @@ def test_ctrl_c_reaches_the_shells_program_when_turbossh_was_started_ignoring_it
     assert report.read_text() == "stopped"
 
 
+def test_ctrl_c_is_let_through_only_without_a_console():
+    """A process with a hidden console (CREATE_NO_WINDOW) has no console
+    window either: GetConsoleWindow could not tell it from one with no console,
+    and TurboSSH turned Ctrl+C back on for itself there."""
+    from turbossh.gui import conpty
+
+    class Kernel:
+        def __init__(self, cp):
+            self.cp, self.calls = cp, []
+
+        def GetConsoleCP(self):
+            return self.cp
+
+        def GetConsoleWindow(self):
+            return None                          # hidden console: no window
+
+        def SetConsoleCtrlHandler(self, handler, add):
+            self.calls.append((handler, add))
+            return 1
+
+    hidden = Kernel(850)
+    conpty._let_ctrl_c_through(hidden)
+    assert hidden.calls == []
+    none = Kernel(0)
+    conpty._let_ctrl_c_through(none)
+    assert none.calls == [(None, False)]
+
+
 @needs_console
 def test_the_local_terminal_tab_runs_the_shell_in_a_console(qapp, console_ctrl_c):
     """The tab end to end: Tab completes, Ctrl+C (the key) stops a running
@@ -415,26 +443,6 @@ def test_the_pipe_fallback_stays_when_asked_for(monkeypatch):
 
 
 # ====================================================================== review
-def test_one_esc_3j_after_clear_keeps_the_scrollback():
-    """Clear moves the screen into the scrollback, then has cmd run cls — which
-    ends with ESC[3J. That one must not wipe the scrollback; later ones do."""
-    pytest.importorskip("pyte")
-    import pyte
-    from turbossh.gui.termscreen import TermScreen
-    screen = TermScreen(40, 5, history=100)
-    stream = pyte.ByteStream(screen)
-    stream.feed(b"\r\n".join(b"line %d" % i for i in range(12)))
-    assert len(screen.history.top) == 7
-    screen.keep_history_once()
-    stream.feed(b"\x1b[H\x1b[2J\x1b[3J")
-    assert len(screen.history.top) == 7
-    stream.feed(b"\x1b[3J")                     # the next one is a real `clear`
-    assert screen.history.top == []
-    screen.keep_history_once(seconds=-1)        # expired: no effect
-    stream.feed(b"\r\n" * 8 + b"\x1b[3J")
-    assert screen.history.top == []
-
-
 def test_after_output_runs_in_order_with_the_output(qapp):
     term = _term(qapp)
     try:
@@ -490,6 +498,12 @@ def test_a_process_older_than_its_parent_pid_is_not_its_child(monkeypatch):
         monkeypatch.setattr(localshell, "_start_time",
                             lambda pid: 0 if pid != parent.pid else real(pid))
         assert localshell._descendants(parent.pid) == []     # "older": not ours
+        # the clock set back a little after the shell started: still its child
+        parent_born = real(parent.pid)
+        monkeypatch.setattr(localshell, "_start_time",
+                            lambda pid: parent_born - 30 * 10_000_000
+                            if pid != parent.pid else parent_born)
+        assert localshell._descendants(parent.pid)
     finally:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(parent.pid)],
                        capture_output=True)
@@ -515,9 +529,11 @@ def test_a_write_while_the_console_closes_is_not_an_error(tmp_path):
 @pytest.mark.parametrize("label", ["PowerShell", "Command Prompt"])
 def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c):
     """Clear blanked only the widget: the console, which draws with absolute
-    positions, put the next lines in the wrong places. Now the shell clears it
-    at its prompt; with a command running Clear says so. Restart kept nothing
-    of the previous screen (the new console wipes it)."""
+    positions, put the next lines in the wrong places. Now the console clears
+    too — and nothing is typed into a command that reads its input (an
+    earlier cut sent Esc + cls / Ctrl+L, which became the answer to `set /p` /
+    `Read-Host`). Restart kept nothing of the previous screen (the new console
+    wipes it)."""
     _console_or_skip()
     from PyQt5.QtTest import QTest
     from turbossh.gui import qtutil
@@ -561,6 +577,7 @@ def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c)
                     and not any("first-line" in r for r in shown))
         assert wait_until(only_the_prompt, 15), rows()
         assert "first-line" in history()                      # kept, not wiped
+        QTest.qWait(500)                                      # a person's pause
         widget._on_keys(b"echo after-clear\r")
 
         def answer_below_command():
@@ -568,20 +585,26 @@ def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c)
             return any(shown[i + 1] == "after-clear" and shown[i].endswith("after-clear")
                        for i in range(len(shown) - 1))
         assert wait_until(answer_below_command, 15), rows()
-        sleeper = f'"{sys.executable}" -c "import time; print(7*191, flush=True); time.sleep(60)"'
+        # a command of the shell's own reading its input: Clear types nothing
         if label == "PowerShell":
-            sleeper = "& " + sleeper
-        widget._on_keys(sleeper.encode() + b"\r")
-        assert wait_until(lambda: any("1337" in r for r in rows()))
+            ask, show = b"$x = Read-Host 'name'\r", b"\"[$x]\"\r"
+        else:
+            ask, show = b"set /p x=name: \r", b"echo [%x%]\r"
+        widget._on_keys(ask)
+        assert wait_until(lambda: any("name:" in r for r in rows()), 15), rows()
+        QTest.qWait(500)
         widget._clear()
-        assert wait_until(lambda: any("Clear works at" in m for m in logs), 15)
-        assert any("1337" in r for r in rows())                 # left as it was
-        widget._interrupt()
-        assert wait_until(lambda: any("KeyboardInterrupt" in r for r in rows()), 20)
+        QTest.qWait(1500)
+        shown = [r for r in rows() if r]
+        assert shown and shown[0].startswith("name:"), rows()   # cleared, in step
+        widget._on_keys(b"abc\r")
+        QTest.qWait(1000)
+        widget._on_keys(show)
+        assert wait_until(lambda: "[abc]" in rows(), 15), rows()  # nothing slipped in
         widget.restart()
         assert wait_until(lambda: widget.shell is not None
                           and any(r.endswith(">") for r in rows())
-                          and "1337" in history(), 30), (rows(), history()[-5:])
+                          and "[abc]" in history(), 30), (rows(), history()[-5:])
     finally:
         widget.close_session()
         assert qtutil.wait_for_teardowns(15)
