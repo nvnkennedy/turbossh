@@ -72,6 +72,47 @@ _CAPTURE_TOUCH_MS = 3600 * 1000
 # open: the sweep leaves their parts alone, and removes what closed ones left
 _LIVE_CAPTURES: set = set()
 
+# Monospaced families to fall back on, in order: for glyphs the chosen font
+# lacks, and in its place when it is not monospaced at all.
+_MONO_FALLBACK = ("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Courier New")
+# Characters a proportional font draws at very different widths and a terminal
+# font at one: if they do not all advance alike, the font cannot sit on the
+# cell grid. ("M" * 64 against 64 "M"s, the check this replaces, held for a
+# proportional font too: the text then came out narrower than the grid, and the
+# cursor stood far to the right of where the typing was.)
+_WIDTH_PROBE = "iIl.:|1MWm@#_ 0"
+
+
+def _monospaced(fm: QFontMetrics) -> bool:
+    return len({fm.horizontalAdvance(c) for c in _WIDTH_PROBE}) == 1
+
+
+def _terminal_font(families, size: int) -> QFont:
+    font = QFont(families[0], size)
+    # crisp, MobaXterm-like rendering: monospace hint, antialiasing, and a
+    # fallback chain for glyphs the first family does not have
+    font.setStyleHint(QFont.Monospace, QFont.PreferAntialias)
+    try:
+        font.setFamilies(list(families))
+    except Exception:
+        pass
+    font.setFixedPitch(True)
+    font.setHintingPreference(QFont.PreferFullHinting)
+    return font
+
+
+def terminal_font(family: str, size: int) -> QFont:
+    """The font a terminal draws with for the *family* chosen in Settings: that
+    one if it is monospaced, else (a proportional font, or one this machine
+    does not have) the first monospaced fallback. Text in a proportional font
+    cannot keep to the cell grid the cursor and the program's cursor moves use."""
+    family = (family or "").strip() or _MONO_FALLBACK[0]
+    font = _terminal_font([family] + [f for f in _MONO_FALLBACK if f != family], size)
+    if not _monospaced(QFontMetrics(font)):
+        font = _terminal_font(list(_MONO_FALLBACK), size)
+    return font
+
+
 _MODIFIER_KEYS = (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta,
                   Qt.Key_AltGr, Qt.Key_CapsLock, Qt.Key_NumLock, Qt.Key_ScrollLock)
 # xterm key encodings: cursor keys end in a letter, the editing keypad and
@@ -230,8 +271,9 @@ class Vt100Terminal(QWidget):
         # terminals share, so they share one time budget too
         self._pull = None
         self._dropped = None
-        # what comes after the current source: notices (bytes) and the next
-        # source ((pull, dropped)) — see notice() / set_source()
+        # what comes after the current source: notices (bytes), the next
+        # source ((pull, dropped)) and calls — see notice() / set_source() /
+        # after_output()
         self._queued: deque = deque()
         _pump().add(self)
 
@@ -249,7 +291,17 @@ class Vt100Terminal(QWidget):
         # the live buffer (see _visible_rows).
         self._view_offset = 0           # 0 = live tail; >0 = scrolled back
         self._prev_pushed = 0           # scrollback lines ever pushed, last tick
-        self._last_cursor_row = 0
+        # the cursor as last painted: (x, y, hidden). A move along its row (Left
+        # arrow, a shell putting it back after completing a word, CR) or a show /
+        # hide changes no text, and used to repaint nothing: the cursor stayed
+        # drawn where it had been.
+        self._last_cursor = (0, 0, False)
+        # the cursor blinks while the terminal has the keyboard, at the system's
+        # caret rate (none if the system says so); typing or output shows it
+        # solid again at once
+        self._blink_on = True
+        self._blink = QTimer(self)
+        self._blink.timeout.connect(self._toggle_blink)
         self._sb_w = 13
         self._sb = QScrollBar(Qt.Vertical, self)
         self._sb.setStyleSheet(
@@ -299,6 +351,15 @@ class Vt100Terminal(QWidget):
         self._queued.append(data)
         self._tick()
 
+    def after_output(self, fn):
+        """Run ``fn()`` (on the GUI thread) once the output received so far,
+        and the notices before it, are shown — in order with them."""
+        if self._pull is None and not self._queued:
+            fn()
+            return
+        self._queued.append(fn)
+        self._tick()
+
     def _reply(self, text: str):
         """The screen answering a query from the program (cursor position …)."""
         if self._send:
@@ -310,25 +371,16 @@ class Vt100Terminal(QWidget):
     # ---- font ---------------------------------------------------------------
     def _apply_font(self):
         # NB: store as _font, not `font` — `self.font` would shadow QWidget.font().
-        self._font = QFont(self._font_family, self._font_size)
-        # crisp, MobaXterm-like rendering: monospace hint, antialiasing, and a
-        # fallback chain so it stays a clean mono even if the chosen font is absent.
-        self._font.setStyleHint(QFont.Monospace, QFont.PreferAntialias)
-        try:
-            self._font.setFamilies([self._font_family, "Cascadia Mono", "Consolas",
-                                    "DejaVu Sans Mono", "Courier New"])
-        except Exception:
-            pass
-        self._font.setFixedPitch(True)
-        self._font.setHintingPreference(QFont.PreferFullHinting)
+        self._font = terminal_font(self._font_family, self._font_size)
         fm = QFontMetrics(self._font)
         self.cw = max(1, fm.horizontalAdvance("M"))
         self.ch = fm.height()
         self._ascent = fm.ascent()
-        # A whole run of text is drawn in one call only if the font really
-        # advances cw pixels per character; otherwise the run would drift off the
-        # cell grid, so fall back to one cell at a time.
-        self._batch = fm.horizontalAdvance("M" * 64) == 64 * self.cw
+        # A whole run of text is drawn in one call only if the font advances cw
+        # pixels for every character; otherwise the run would drift off the cell
+        # grid (and away from the cursor), so it is drawn one cell at a time.
+        self._batch = (_monospaced(fm)
+                       and fm.horizontalAdvance("M" * 64) == 64 * self.cw)
         self._fonts.clear()
 
     def _font_for(self, key):
@@ -471,8 +523,13 @@ class Vt100Terminal(QWidget):
             item = self._queued.popleft()
             if type(item) is bytes:
                 self._feed(item)
-            else:
+            elif type(item) is tuple:
                 self._pull, self._dropped = item
+            else:                        # after_output()
+                try:
+                    item()
+                except Exception:
+                    pass
 
     def _after_feed(self):
         """End of a pump tick: show a gap the reader reported, then repaint."""
@@ -510,19 +567,54 @@ class Vt100Terminal(QWidget):
         self._prev_pushed = pushed
         self._update_scrollbar()
         dirty = screen.dirty
-        cursor_row = screen.cursor.y
-        if not dirty and cursor_row == self._last_cursor_row and not scrolled:
+        cur = screen.cursor
+        cursor = (cur.x, cur.y, bool(cur.hidden))
+        last = self._last_cursor
+        if not dirty and cursor == last and not scrolled:
             return
+        self._restart_blink()            # solid while the screen changes
         if (scrolled or self._view_offset or self._sel is not None
                 or len(dirty) > self.rows // 2):
             self.update()
         else:
-            # typing / a status line: repaint only the rows that changed
+            # typing / a status line: repaint only the rows that changed, and
+            # the rows the cursor left and is on now
             width = self.width() - self._sb_w
-            for y in set(dirty) | {cursor_row, self._last_cursor_row}:
+            for y in set(dirty) | {cursor[1], last[1]}:
                 self.update(QRect(0, y * self.ch, width, self.ch))
         dirty.clear()
-        self._last_cursor_row = cursor_row
+        self._last_cursor = cursor
+
+    # ---- cursor blink ----
+    @staticmethod
+    def _blink_interval() -> int:
+        """Half the system's caret flash cycle in ms; 0: the caret does not blink."""
+        flash = QApplication.cursorFlashTime()
+        return flash // 2 if flash > 0 else 0
+
+    def _cursor_cell(self) -> QRect:
+        cur = self.screen.cursor
+        return QRect(min(cur.x, self.cols - 1) * self.cw, cur.y * self.ch,
+                     self.cw, self.ch)
+
+    def _restart_blink(self):
+        """Show the cursor now and blink it from here (while focused)."""
+        if not self._blink_on:
+            self._blink_on = True
+            self.update(self._cursor_cell())
+        interval = self._blink_interval()
+        if interval and self.hasFocus() and self.isVisible():
+            self._blink.start(interval)
+        else:
+            self._blink.stop()
+
+    def _toggle_blink(self):
+        if not (self.hasFocus() and self.isVisible()):
+            self._blink.stop()
+            self._blink_on = True
+        else:
+            self._blink_on = not self._blink_on
+        self.update(self._cursor_cell())
 
     # ---- scrollback ----
     def _update_scrollbar(self):
@@ -574,15 +666,25 @@ class Vt100Terminal(QWidget):
         # When the widget is re-shown (tab switch, or split<->tabs reparenting),
         # nothing has marked us dirty, so force a re-render.
         super().showEvent(event)
+        self._restart_blink()
         self.update()
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
+        self._blink_on = True
+        self._restart_blink()
         self.update()                            # solid cursor
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
+        self._blink.stop()
+        self._blink_on = True
         self.update()                            # hollow cursor
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._blink.stop()
+        self._blink_on = True
 
     # ---- sizing ----
     def resizeEvent(self, event):
@@ -634,6 +736,12 @@ class Vt100Terminal(QWidget):
             table = _BRIGHT if bright else _PALETTE
             if name in table:
                 color = QColor(table[name])
+            elif (isinstance(name, str) and name[:6] in ("bright", "bfight")
+                    and name[6:] in _BRIGHT):
+                # SGR 90-97 / 100-107 (PSReadLine's colours, many `ls` colours):
+                # pyte names them "bright…" (one "bfight…") — they came out in
+                # the default colour
+                color = QColor(_BRIGHT[name[6:]])
             elif isinstance(name, str) and len(name) == 6:   # 256 / true colour hex
                 color = QColor("#" + name)
                 if not color.isValid():
@@ -726,10 +834,10 @@ class Vt100Terminal(QWidget):
             if cy < self.rows:
                 cur = QColor(self._color("green")); cur.setAlpha(150)
                 box = QRect(cx * cw, cy * ch, cw, ch)
-                if self.hasFocus():
-                    p.fillRect(box, cur)
-                else:                    # hollow when another widget has the keys
+                if not self.hasFocus():  # hollow when another widget has the keys
                     p.setPen(cur); p.drawRect(box.adjusted(0, 0, -1, -1))
+                elif self._blink_on:     # solid, blinking
+                    p.fillRect(box, cur)
         p.end()
 
     def _paint_row(self, p, py, line, sel_cols):
@@ -852,6 +960,7 @@ class Vt100Terminal(QWidget):
         if not self._following:          # typing snaps back to the live tail
             self.scroll_to_bottom()
         self.clear_selection()
+        self._restart_blink()            # the cursor stays solid while typing
         try:
             self._send(data)
         except Exception:
@@ -1192,6 +1301,7 @@ class Vt100Terminal(QWidget):
         self._saved_gate.close()
         try:
             self._resize_timer.stop()
+            self._blink.stop()
             if self._cap_timer is not None:
                 self._cap_timer.stop()
             _pump().remove(self)

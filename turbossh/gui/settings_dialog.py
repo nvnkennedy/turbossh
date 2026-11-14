@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QListWidget, QListWidgetItem, QStackedWidget,
                              QApplication)
 from PyQt5.QtCore import QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QFontInfo
 
 from . import settings as settings_mod
 from . import theme
@@ -147,7 +147,18 @@ class SettingsDialog(QDialog):
             self.theme.setEnabled(False)
             self.theme.setToolTip("Set by the application TurboSSH is embedded in.")
         self.font = QFontComboBox()
-        self.font.setCurrentFont(QFont(self.cfg.get("term_font", "Cascadia Mono")))
+        # a terminal draws on a grid of equal cells: monospaced fonts only
+        self.font.setFontFilters(QFontComboBox.MonospacedFonts)
+        # Shown: the font the terminal really draws with — the one in the
+        # settings, or (not installed here, or not monospaced) its fallback.
+        # The picker used to land on some other font then (the first it had),
+        # and OK saved that: a proportional one put the text off the cell grid,
+        # far from the cursor. The setting changes only if another is picked.
+        from .vt100 import terminal_font
+        self._font_setting = self.cfg.get("term_font") or "Cascadia Mono"
+        self.font.setCurrentFont(QFont(
+            QFontInfo(terminal_font(self._font_setting, 11)).family()))
+        self._font_shown = self.font.currentFont().family()
         self.font_size = QSpinBox(); self.font_size.setRange(7, 28)
         self.font_size.setValue(self.cfg.get("term_font_size", 11))
         self.scrollback = QSpinBox(); self.scrollback.setRange(2000, 50000)
@@ -256,6 +267,13 @@ class SettingsDialog(QDialog):
             self._machines = dlg.result_machines()
             self._update_manage_label()
 
+    def _chosen_font(self) -> str:
+        """The terminal font to save: the one picked, or — none picked — the
+        setting as it was (not the stand-in shown for a font this machine
+        lacks: the setting still works on a machine that has it)."""
+        family = self.font.currentFont().family()
+        return self._font_setting if family == self._font_shown else family
+
     def result_settings(self) -> dict:
         """The settings to save. The shared jump host is saved here already, and
         only if it was changed in this dialog: its host, user, domain and
@@ -284,7 +302,7 @@ class SettingsDialog(QDialog):
                 self.jump_notes = SessionStore().shared_jump_changing(old, new) or []
         result = {
             "machines": self._machines,
-            "term_font": self.font.currentFont().family(),
+            "term_font": self._chosen_font(),
             "term_font_size": self.font_size.value(),
             "term_scrollback": self.scrollback.value(),
             "highlight_keywords": self.highlight.isChecked(),

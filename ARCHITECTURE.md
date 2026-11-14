@@ -67,6 +67,7 @@ turbossh/
     ├── remote_edit.py     edit a remote text file in place
     ├── local_terminal.py  a local shell in a tab
     ├── localshell.py      its process + line editor (no Qt)
+    ├── conpty.py          a Windows pseudo console for it (no Qt)
     ├── toast.py           corner notifications
     ├── logs_tab.py        the live-log viewer (level colours, find)
     ├── theme.py           dark/light stylesheet

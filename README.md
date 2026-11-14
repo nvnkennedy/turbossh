@@ -551,7 +551,9 @@ turbossh-gui
 - **Logs** tab — follow `journalctl -f` / `slog2info -w`, filter by regex, lines
   coloured by level, Ctrl+F to find.
 - **Local terminal** — PowerShell or Command Prompt (your shell on Linux / macOS)
-  in a tab, next to the remote sessions.
+  in a tab, next to the remote sessions. On Windows 10 1809 and later it is a
+  real console: Tab completion, the shell's own line editing and history, and
+  Ctrl+C.
 - **Split view** tiles several sessions at once.
 - **Toasts** in the corner for news that needs no click: connected, connection
   lost, transfer finished.

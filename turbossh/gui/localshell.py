@@ -1,11 +1,17 @@
-"""A shell process on this machine, and the line editing it needs on Windows.
+"""A shell process on this machine, and the line editing it needs without a
+terminal.
 
 On POSIX the shell runs on a real pty, so it is a full terminal. On Windows it
-runs over plain pipes (no ConPTY: that needs Windows 10 1809+ and a lot of
-Win32 plumbing), which means the shell has no terminal to echo keystrokes or
-edit the line — :class:`LineEditor` does that locally, with history — and Ctrl+C
-cannot be delivered as a signal, so "interrupt" stops whatever the shell started
-and leaves the shell itself at its prompt.
+runs in a pseudo console (ConPTY, Windows 10 1809 and later; see
+:mod:`turbossh.gui.conpty`): a real console too, so the shell completes words on
+Tab, keeps its own history and line editing, places its cursor itself, and
+gets Ctrl+C as Ctrl+C.
+
+Where Windows has no pseudo console (or ``TURBOSSH_NO_CONPTY`` is set), the
+shell runs over plain pipes: it then has no terminal to echo keystrokes or edit
+the line — :class:`LineEditor` does that locally, with history, but cannot
+complete words — and Ctrl+C cannot be delivered as a signal, so "interrupt"
+stops whatever the shell started and leaves the shell itself at its prompt.
 
 No Qt in here: the widget is :mod:`turbossh.gui.local_terminal`.
 """
@@ -15,6 +21,7 @@ from __future__ import annotations
 import codecs
 import os
 import subprocess
+import time
 
 _WINDOWS = os.name == "nt"
 _UTF8 = ("$e=New-Object System.Text.UTF8Encoding $false;"
@@ -24,6 +31,12 @@ _UTF8 = ("$e=New-Object System.Text.UTF8Encoding $false;"
 WINDOWS_SHELLS = {
     "PowerShell": ["powershell.exe", "-NoLogo", "-NoExit", "-Command", _UTF8],
     "Command Prompt": ["cmd.exe", "/Q", "/K", "chcp 65001>nul"],
+}
+# The same in a pseudo console. cmd keeps its echo on there: it is what shows
+# its prompt, and the console (not cmd) echoes what is typed.
+CONSOLE_SHELLS = {
+    "PowerShell": WINDOWS_SHELLS["PowerShell"],
+    "Command Prompt": ["cmd.exe", "/K", "chcp 65001>nul"],
 }
 
 
@@ -70,13 +83,49 @@ def _descendants(pid: int) -> list:
             more = kernel.Process32Next(snapshot, ctypes.byref(entry))
     finally:
         kernel.CloseHandle(snapshot)
+    # A process's parent PID is only a number: one whose parent ended long ago
+    # names a PID Windows may since have given to *pid* (or a child of it).
+    # Such a process is older than its "parent" and none of ours: left alone.
+    started: dict = {}
+
+    def start(p):
+        if p not in started:
+            started[p] = _start_time(p)
+        return started[p]
+
     found, queue = [], [pid]
     while queue:
-        for child in children.get(queue.pop(), []):
-            if child not in found and child != pid:
-                found.append(child)
-                queue.append(child)
+        parent = queue.pop()
+        for child in children.get(parent, []):
+            if child in found or child == pid:
+                continue
+            born, parent_born = start(child), start(parent)
+            if born is not None and parent_born is not None and born < parent_born:
+                continue
+            found.append(child)
+            queue.append(child)
     return found
+
+
+def _start_time(pid: int):
+    """When process *pid* started (a FILETIME count), or None if not known."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return None
+        return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def _terminate(pid: int) -> None:
@@ -98,15 +147,24 @@ def _terminate(pid: int) -> None:
 class LocalShell:
     """A shell process on this machine. ``read()`` blocks and returns bytes, or
     None once the shell has exited; ``uses_pty`` says whether keystrokes can be
-    written to it raw (POSIX) or must go through a :class:`LineEditor`."""
+    written to it raw (a pty, a Windows pseudo console) or must go through a
+    :class:`LineEditor` (Windows pipes).
 
-    def __init__(self, shell: str | None = None, cwd: str | None = None):
+    *console*: on Windows, whether to use a pseudo console — None: when this
+    Windows has one (and ``TURBOSSH_NO_CONPTY`` is not set)."""
+
+    def __init__(self, shell: str | None = None, cwd: str | None = None, *,
+                 console: bool | None = None):
         self.label = shell or available_shells()[0]
         self.cwd = cwd or os.path.expanduser("~")
         self.uses_pty = not _WINDOWS
         # PowerShell repeats each line it reads from a pipe after its prompt;
         # cmd (/Q) does not. The line editor must not show the command twice.
         self.echoes_input = _WINDOWS and self.label == "PowerShell"
+        if console is None:
+            console = not os.environ.get("TURBOSSH_NO_CONPTY")
+        self._want_console = _WINDOWS and console
+        self._console = None             # the pseudo console (Windows)
         self._proc = None
         self._master = None
         self._slave_name = None          # the pty's terminal side, for tcflush
@@ -117,6 +175,8 @@ class LocalShell:
 
     def start(self) -> None:
         if _WINDOWS:
+            if self._want_console and self._start_console():
+                return
             argv = WINDOWS_SHELLS.get(self.label) or WINDOWS_SHELLS["PowerShell"]
             self._proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -141,7 +201,56 @@ class LocalShell:
             os.close(slave)
         self._master = master
 
+    def _start_console(self) -> bool:
+        """Start the shell in a pseudo console; False where that is not
+        possible (the caller then uses pipes)."""
+        try:
+            from .conpty import PseudoConsole
+            argv = CONSOLE_SHELLS.get(self.label) or CONSOLE_SHELLS["PowerShell"]
+            console = PseudoConsole(argv, cwd=self.cwd)
+        except Exception:
+            return False
+        self._console = self._proc = console
+        self.uses_pty = True             # keystrokes go to it raw
+        self.echoes_input = False        # the console echoes, not the shell
+        return True
+
+    @property
+    def console(self) -> bool:
+        """Whether the shell runs in a Windows pseudo console."""
+        return self._console is not None
+
+    def at_prompt(self) -> bool:
+        """A pseudo console's shell is at its prompt: nothing it started still
+        runs. (Looks at the process tree: not on the GUI thread.)"""
+        console = self._console
+        if console is None:
+            return False
+        try:
+            return not _descendants(console.pid)
+        except Exception:
+            return False
+
+    def clear_console(self) -> None:
+        """A pseudo console keeps its own screen and draws on it with absolute
+        positions, so only the shell can clear it: this sends, at its prompt
+        (see :meth:`at_prompt`), what clears it there — Ctrl+L, PSReadLine's
+        Clear Screen, which keeps the line being typed; for cmd, Esc to empty
+        the line, then ``cls`` (which ends with ESC[3J). On the terminal's
+        writer thread: the pause keeps the console from reading Esc + "c" as
+        Alt+C."""
+        if self._console is None:
+            return
+        if self.label == "PowerShell":
+            self.write(b"\x0c")
+        else:
+            self.write(b"\x1b")
+            time.sleep(0.15)
+            self.write(b"cls\r")
+
     def read(self, size: int = 65536):
+        if self._console is not None:
+            return self._console.read(size)
         try:
             if self._master is not None:
                 data = os.read(self._master, size)
@@ -155,20 +264,23 @@ class LocalShell:
         """Blocks until the shell has taken *data* (a busy shell may not read for
         a long time): the terminal tab calls this from its writer thread."""
         try:
-            if self._master is not None:
+            if self._console is not None:
+                self._console.write(data)
+            elif self._master is not None:
                 view = memoryview(data)
                 while view:              # a pty may take only part of a write
                     view = view[os.write(self._master, view):]
             elif self._proc is not None and self._proc.stdin:
                 self._proc.stdin.write(data)
                 self._proc.stdin.flush()
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError, AttributeError):
+            pass                         # closed (AttributeError: while closing)
 
     def write_ready(self) -> bool:
         """POSIX: whether the pty takes a write now, without blocking. False
         when it is full of input the program has not read (a paste while a
-        command runs). A shell's stdin pipe is not asked: True."""
+        command runs). A shell's stdin pipe and a pseudo console (it takes its
+        input as it comes) are not asked: True."""
         if self._master is None:
             return True
         try:
@@ -186,7 +298,10 @@ class LocalShell:
         the program does not read — does SIGINT go to the job directly (unless
         *signalled*: the caller did that already); the byte follows once there
         is room. May block until then: the terminal tab calls it on its writer
-        thread."""
+        thread. A pseudo console turns the byte into Ctrl+C for the program."""
+        if self._console is not None:
+            self.write(b"\x03")
+            return
         if self._master is None:
             return
         if not signalled and not self.write_ready():
@@ -242,17 +357,23 @@ class LocalShell:
             os.close(fd)
 
     def interrupt(self) -> None:
-        """Stop the running command. POSIX: Ctrl+C through the pty (see
-        :meth:`send_interrupt`). Windows: end the processes the shell started (a
-        pipe cannot carry a Ctrl+C, and Ctrl+Break is ignored by many programs);
-        the shell stays at its prompt."""
-        if self._master is not None:
+        """Stop the running command. POSIX and a pseudo console: Ctrl+C through
+        it (see :meth:`send_interrupt`). Windows pipes: end the processes the
+        shell started (a pipe cannot carry a Ctrl+C, and Ctrl+Break is ignored by
+        many programs); the shell stays at its prompt."""
+        if self._master is not None or self._console is not None:
             self.send_interrupt()
         elif self.alive:
             for pid in _descendants(self._proc.pid):
                 _terminate(pid)
 
     def resize(self, cols: int, rows: int) -> None:
+        if self._console is not None:
+            try:
+                self._console.resize(cols, rows)
+            except Exception:
+                pass
+            return
         if self._master is None:
             return                       # pipes have no window size
         try:
@@ -265,6 +386,25 @@ class LocalShell:
             pass
 
     def close(self) -> None:
+        console = self._console
+        if console is not None:
+            # _proc first: a write() in between must find neither (it would
+            # take the console for a Popen and ask for its stdin)
+            self._proc = None
+            self._console = None
+            try:
+                # what the shell started first (as with pipes: a console's
+                # programs do not all end with it), then the shell and its console
+                for pid in _descendants(console.pid):
+                    _terminate(pid)
+            except Exception:
+                pass
+            console.close()
+            try:
+                console.wait(timeout=5)
+            except Exception:
+                pass
+            return
         proc, self._proc = self._proc, None
         if proc is not None:
             try:

@@ -97,13 +97,31 @@ class Collector:
             time.sleep(0.05)
         return needle in self.data
 
+    def wait_quiet(self, quiet: float, timeout=10.0) -> None:
+        """Until no output came for *quiet* seconds."""
+        deadline = time.monotonic() + timeout
+        seen, since = len(self.data), time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            if len(self.data) != seen:
+                seen, since = len(self.data), time.monotonic()
+            elif time.monotonic() - since >= quiet:
+                return
 
+
+@pytest.mark.parametrize("console", [None, False] if os.name == "nt" else [None])
 @pytest.mark.parametrize("label", available_shells())
-def test_local_shell_runs_commands_and_stops_the_running_one(label, tmp_path):
-    shell = LocalShell(label, cwd=str(tmp_path))
+def test_local_shell_runs_commands_and_stops_the_running_one(label, console, tmp_path,
+                                                           console_ctrl_c):
+    shell = LocalShell(label, cwd=str(tmp_path), console=console)
     shell.start()
+    if os.name == "nt":
+        from turbossh.gui import conpty
+        assert shell.console == (console is None and conpty.available())
     out = Collector(shell)
-    newline = b"\n" if shell.uses_pty else b"\r\n"
+    # Enter: what a terminal sends to a console is CR (LF there is Ctrl+J: a
+    # continuation line in PowerShell); a pty's line discipline takes LF
+    newline = (b"\r" if shell.console else b"\n") if shell.uses_pty else b"\r\n"
     try:
         shell.write(b"echo hello-local" + newline)
         assert out.wait_for(b"hello-local"), out.data[-300:]
@@ -117,7 +135,14 @@ def test_local_shell_runs_commands_and_stops_the_running_one(label, tmp_path):
             sleeper = "& " + sleeper
         shell.write(sleeper.encode() + newline)
         assert out.wait_for(b"1337"), out.data[-300:]
+        mark = len(out.data)
         shell.interrupt()
+        if shell.console:
+            # a console throws away what is typed while it handles Ctrl+C (as
+            # Windows Terminal does): type again once the program has stopped
+            # and the prompt is back
+            assert out.wait_for(b"KeyboardInterrupt"), out.data[mark:][-300:]
+            out.wait_quiet(0.7)
         shell.write(b"echo after-interrupt" + newline)
         assert out.wait_for(b"after-interrupt", 20), out.data[-300:]
         assert shell.alive

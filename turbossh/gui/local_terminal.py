@@ -24,6 +24,7 @@ class LocalTerminalWidget(QWidget):
     for good with ``ping -t``, where not even Ctrl-C could be pressed."""
     session_kind = "local"
     log = pyqtSignal(str)
+    _clear_ready = pyqtSignal(object)    # the shell whose console Clear may clear now
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -35,6 +36,8 @@ class LocalTerminalWidget(QWidget):
         self.writer = None
         self._closed = False
         self._log_gate = qtutil.SignalGate(self.log)  # the writer thread reports here
+        self._clear_ready.connect(self._clear_console)
+        self._clear_gate = qtutil.SignalGate(self._clear_ready)   # (writer thread)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
@@ -52,7 +55,7 @@ class LocalTerminalWidget(QWidget):
         ctrlc.setToolTip("Stop the running command")
         ctrlc.clicked.connect(self._interrupt)
         clear = QPushButton("Clear"); clear.setProperty("role", "ghost")
-        clear.clicked.connect(lambda: (self.term.clear(), self.term.setFocus()))
+        clear.clicked.connect(self._clear)
         row.addWidget(self.status, 1); row.addWidget(self.which)
         row.addWidget(restart); row.addWidget(ctrlc); row.addWidget(clear)
         lay.addLayout(row)
@@ -80,6 +83,11 @@ class LocalTerminalWidget(QWidget):
             echo=self.term.feed,
             submit=lambda line, w=writer: w.send((line + "\r\n").encode("utf-8")),
             interrupt=self._stop_running, shell_echoes=shell.echoes_input)
+        if getattr(shell, "console", False):
+            # a new console starts by wiping the screen: what the previous shell
+            # left there (Restart) goes into the scrollback first, as it did
+            # over pipes, where the new shell's output came below it
+            self.term.after_output(self.term.clear)
         self.reader = ReaderThread(shell.read)
         self.reader.closed.connect(self._on_exit)
         self.reader.start()
@@ -121,6 +129,35 @@ class LocalTerminalWidget(QWidget):
             self.writer.interrupt(None)
         threading.Thread(target=shell.interrupt, name="local-shell-interrupt",
                          daemon=True).start()
+
+    def _clear(self):
+        """Clear: what is on screen goes into the scrollback. A Windows console
+        keeps a screen of its own and draws on it with absolute positions —
+        clearing only ours put what came next in the wrong places — so its
+        shell clears it, at its prompt (looked at on the writer thread, as it
+        walks the process tree). While a command runs, Clear says so instead."""
+        shell, writer = self.shell, self.writer
+        if shell is not None and writer is not None and getattr(shell, "console", False):
+            gate, log = self._clear_gate, self._log_gate
+
+            def check():
+                if shell.at_prompt():
+                    gate.emit(shell)
+                else:
+                    log.emit("[INFO] Local terminal: a command is running — Clear "
+                             "works at the shell's prompt")
+            writer.call(check)
+        else:
+            self.term.clear()
+        self.term.setFocus()
+
+    def _clear_console(self, shell):
+        if shell is not self.shell or self.writer is None:
+            return                       # restarted or closed meanwhile
+        self.term.clear()
+        if shell.label != "PowerShell":
+            self.term.screen.keep_history_once()     # cls ends with ESC[3J
+        self.writer.call(shell.clear_console)
 
     def _interrupt(self):
         if self.shell is not None:
@@ -167,6 +204,7 @@ class LocalTerminalWidget(QWidget):
             return
         self._closed = True
         self._log_gate.close()
+        self._clear_gate.close()
         self._stop_shell()
         try:
             self.term.cleanup()

@@ -680,7 +680,7 @@ def test_local_terminal_paste_never_blocks_and_ctrl_c_still_works(qapp, monkeypa
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the stdin pipe of a Windows shell")
-def test_real_shell_busy_with_a_command_does_not_freeze_a_paste(qapp, tmp_path):
+def test_real_shell_busy_with_a_command_does_not_freeze_a_paste(qapp, tmp_path, console_ctrl_c):
     from turbossh.gui import qtutil
     from turbossh.gui.local_terminal import LocalTerminalWidget
 
@@ -701,6 +701,11 @@ def test_real_shell_busy_with_a_command_does_not_freeze_a_paste(qapp, tmp_path):
         widget._on_keys(b"echo queued-while-busy\r" * 1500)   # ~35 KB > the pipe
         assert time.perf_counter() - t0 < 5.0, "the paste blocked the GUI thread"
         widget._interrupt()
+        if widget.shell.console:
+            # a console throws away what is typed while it handles Ctrl+C (the
+            # rest of the paste too): type again once the prompt is back
+            assert wait_until(lambda: "KeyboardInterrupt" in screen(), 30)
+            wait_until(lambda: False, 0.7)
         widget._on_keys(b"echo after-the-interrupt\r")
         assert wait_until(lambda: screen().count("after-the-interrupt") >= 2, 30)
     finally:

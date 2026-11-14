@@ -24,6 +24,19 @@ import pytest  # noqa: E402
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
 
+@pytest.fixture
+def console_ctrl_c():
+    """Windows: Ctrl+C typed into a pseudo console reaches the programs in it.
+    Some runners start the test process in a new process group, which makes it
+    ignore Ctrl+C — and everything it starts inherits that, a shell's programs
+    in a pseudo console too. (TurboSSH's windowed exe clears the setting itself:
+    it has no console. This process has one, so the test does it.)"""
+    if os.name == "nt":
+        import ctypes
+        ctypes.WinDLL("kernel32").SetConsoleCtrlHandler(None, False)
+    yield
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _memory_keyring():
     """Route keyring to an in-memory backend for the whole run, so no test can
