@@ -172,9 +172,18 @@ def test_throughput_is_far_above_plain_pyte():
     line = (b"Jan 01 12:00:00 host \x1b[32mservice\x1b[0m[1234]: "
             + b"payload " * 12 + b"\r\n")
     blob = line * 400
-    slow = pyte.HistoryScreen(160, 45, history=10000, ratio=0.5)
-    slow_stream = pyte.ByteStream(slow)
-    t0 = time.perf_counter(); slow_stream.feed(blob); slow_dt = time.perf_counter() - t0
-    screen, stream = make(cols=160, rows=45, history=10000)
-    t0 = time.perf_counter(); stream.feed(blob); fast_dt = time.perf_counter() - t0
+
+    def best_of_three(new_stream):
+        # the best of three fresh runs: one run alone can land on a GC pause or
+        # a busy CI runner, and that failed the floor once by chance
+        times = []
+        for _ in range(3):
+            feeder = new_stream()
+            t0 = time.perf_counter()
+            feeder.feed(blob)
+            times.append(time.perf_counter() - t0)
+        return min(times)
+    slow_dt = best_of_three(lambda: pyte.ByteStream(
+        pyte.HistoryScreen(160, 45, history=10000, ratio=0.5)))
+    fast_dt = best_of_three(lambda: make(cols=160, rows=45, history=10000)[1])
     assert fast_dt * 3 < slow_dt, (fast_dt, slow_dt)

@@ -158,7 +158,10 @@ def test_posix_bridge_and_release_end_to_end(monkeypatch, tmp_path):
         assert "raw -echo -isig" in (tmp_path / "stty.log").read_text()
 
         other = subprocess.Popen(["sleep", "30"])        # PID listed, not a cat
-        handler.run = lambda cmd, **kw: subprocess.run(["sh", "-c", cmd], env=env)
+        # serial_release runs its command through _run (it tells it that exit 1,
+        # "nothing tracked", is an answer, not a failure): both go to sh here
+        handler.run = handler._run = (
+            lambda cmd, **kw: subprocess.run(["sh", "-c", cmd], env=env))
         handler.serial_release(dev)
         out, _ = bridge.communicate(timeout=10)
         assert out == b"hi\x03\n"

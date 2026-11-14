@@ -29,6 +29,9 @@ class _Handle(paramiko.SFTPHandle):
             return paramiko.SFTPServer.convert_errno(exc.errno)
 
     def chattr(self, attr):
+        log = getattr(self, "chmod_log", None)          # set by StubSFTP.open
+        if log is not None and attr._flags & attr.FLAG_PERMISSIONS:
+            log.append((self.filename, attr.st_mode & 0o7777))
         return paramiko.SFTP_OK
 
 
@@ -39,13 +42,20 @@ class StubSFTP(paramiko.SFTPServerInterface):
         super().__init__(server, *args, **kwargs)
         self._srv = server
 
+    def _plain(self, path):
+        """The tidied server path, rooted at one "/". Paramiko's default asks
+        os.path.isabs, which on Windows from Python 3.13 says "/x" is not
+        absolute, and then gives "//x" (the files were the same, but a path
+        compared as text was not)."""
+        return "/" + super().canonicalize(path).lstrip("/")
+
     def _real(self, path):
-        return self._srv.sftp_root + super().canonicalize(path)
+        return self._srv.sftp_root + self._plain(path)
 
     def canonicalize(self, path):
         """realpath. OpenSSH's sftp-server resolves symlinks here; some servers
         only tidy the string (``server.resolve_links = False`` imitates those)."""
-        plain = super().canonicalize(path)
+        plain = self._plain(path)
         if not self._srv.resolve_links:
             return plain
         root = os.path.realpath(self._srv.sftp_root)
@@ -97,6 +107,7 @@ class StubSFTP(paramiko.SFTPServerInterface):
             mode = "rb"
         fh = os.fdopen(fd, mode)
         handle = _Handle(flags)
+        handle.chmod_log = self._srv.chmod_calls
         handle.filename = real
         handle.readfile = fh
         handle.writefile = fh
@@ -142,6 +153,14 @@ class StubSFTP(paramiko.SFTPServerInterface):
         return paramiko.SFTP_OK
 
     def chattr(self, path, attr):
+        if attr._flags & attr.FLAG_PERMISSIONS:
+            self._srv.chmod_calls.append((path, attr.st_mode & 0o7777))
+        if (self._srv.apply_modes and os.name != "nt"
+                and attr._flags & attr.FLAG_PERMISSIONS):
+            try:
+                os.chmod(self._real(path), attr.st_mode & 0o7777)
+            except OSError as exc:
+                return self._err(exc)
         return paramiko.SFTP_OK
 
 
@@ -156,6 +175,11 @@ class Server(paramiko.ServerInterface):
         self.sudo_password = "good"
         self.posix_rename_supported = True
         self.resolve_links = True
+        # chmod requests are accepted and ignored unless this is set (POSIX
+        # only: on Windows a mode without owner write makes the file read-only,
+        # which other tests' later writes would trip over)
+        self.apply_modes = False
+        self.chmod_calls = []            # (path, mode) of every chmod asked for
         self.rename_calls = []
         self.tcpip_dest = {}             # chanid -> (host, port)
         self.execs = []

@@ -106,6 +106,7 @@ def test_a_temporary_copy_gets_no_setuid_bit_before_its_data():
 def test_a_set_uid_file_keeps_its_bits_after_the_upload(ssh, ssh_server, tmp_path):
     if os.name == "nt":
         pytest.skip("this file system keeps no setuid bit")
+    ssh_server.server.apply_modes = True          # a server that really chmods
     target = ssh_server.root / "tool"
     target.write_bytes(b"old")
     os.chmod(str(target), 0o4755)
@@ -113,6 +114,38 @@ def test_a_set_uid_file_keeps_its_bits_after_the_upload(ssh, ssh_server, tmp_pat
     src.write_bytes(b"new")
     ssh.push(str(src), "/tool")
     assert stat.S_IMODE(os.stat(str(target)).st_mode) == 0o4755
+
+
+def test_the_setuid_bit_is_asked_for_only_after_the_data(ssh, ssh_server, tmp_path,
+                                                        monkeypatch):
+    """What the upload asks the server for, in order (runs on every system):
+    the copy's mode without the setuid bit before the data, the exact mode
+    after it — then the rename."""
+    import turbossh._transfer as transfer
+    target = ssh_server.root / "tool"
+    target.write_bytes(b"old")
+    old_mode = os.stat(str(target)).st_mode
+    # Windows keeps no setuid bit: the old file's mode is said to be 4755, and
+    # the new copy's own mode is not known (so the mode is always asked for)
+    monkeypatch.setattr(transfer, "_perm", lambda mode: 0o4755 if mode == old_mode
+                        else (stat.S_IMODE(mode) if mode else None))
+    monkeypatch.setattr(transfer, "_temp_owner", lambda *a, **kw: None)
+    asked = ssh_server.server.chmod_calls
+    data_starts = []                       # how many chmods came before the data
+    real_send = transfer._send
+
+    def send(*a, **kw):
+        data_starts.append(len(asked))
+        return real_send(*a, **kw)
+    monkeypatch.setattr(transfer, "_send", send)
+    src = tmp_path / "tool"
+    src.write_bytes(b"new")
+    ssh.push(str(src), "/tool")
+    assert len(data_starts) == 1
+    before = [mode for _path, mode in asked[:data_starts[0]]]
+    after = [mode for _path, mode in asked[data_starts[0]:]]
+    assert before == [0o755], before       # the mode, without the setuid bit
+    assert after == [0o4755], after        # the exact mode, once the data is in
 
 
 def test_a_split_serial_write_that_fails_says_what_went_out(monkeypatch):
