@@ -115,6 +115,8 @@ def _kernel32():
     k.TerminateProcess.restype = wintypes.BOOL
     k.GetConsoleCP.argtypes = []
     k.GetConsoleCP.restype = wintypes.UINT
+    k.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+    k.GetConsoleProcessList.restype = wintypes.DWORD
     k.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
     k.SetConsoleCtrlHandler.restype = wintypes.BOOL
     _k32 = k
@@ -126,13 +128,19 @@ def _let_ctrl_c_through(k) -> None:
     — the shell, and what the shell runs — and a process started in a new
     process group ignores it: the updater relaunches TurboSSH that way, and a
     host application may start it so. Ctrl+C in the console then stopped
-    nothing. With no console of its own Ctrl+C never reaches this process, so
-    the setting only matters for what it starts: it is cleared. A process with
-    a console — also a hidden one (CREATE_NO_WINDOW), which has no console
-    window — keeps whatever its console's owner chose. (GetConsoleCP is 0
-    exactly when there is no console.)"""
+    nothing. Without a console, or with one nobody else is attached to (a
+    hidden one of its own: CREATE_NO_WINDOW), no one can send this process a
+    Ctrl+C, so the setting only matters for what it starts: it is cleared. A
+    console shared with others (started from a terminal) keeps what its owner
+    chose. (GetConsoleCP is 0 exactly when there is no console; a hidden
+    console has no console window either, so that cannot tell.)"""
     try:
         if not k.GetConsoleCP():
+            alone = True
+        else:
+            pids = (wintypes.DWORD * 4)()
+            alone = k.GetConsoleProcessList(pids, 4) == 1
+        if alone:
             k.SetConsoleCtrlHandler(None, False)
     except Exception:
         pass

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import threading
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPushButton,
                              QVBoxLayout, QWidget)
 
@@ -23,8 +23,8 @@ class LocalTerminalWidget(QWidget):
     the pipe / pty buffer (4-8 KB) used to block the window until it did —
     for good with ``ping -t``, where not even Ctrl-C could be pressed."""
     session_kind = "local"
+    _HINT_MS = 6000                      # how long a hint stays in the status line
     log = pyqtSignal(str)
-    _clear_ready = pyqtSignal(object)    # (shell, nothing running): Clear, from the writer thread
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -36,8 +36,10 @@ class LocalTerminalWidget(QWidget):
         self.writer = None
         self._closed = False
         self._log_gate = qtutil.SignalGate(self.log)  # the writer thread reports here
-        self._clear_ready.connect(self._clear_console)
-        self._clear_gate = qtutil.SignalGate(self._clear_ready)   # (writer thread)
+        self._hint_text = self._hint_before = ""
+        self._hint_timer = QTimer(self)
+        self._hint_timer.setSingleShot(True)
+        self._hint_timer.timeout.connect(self._end_hint)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 1, 2, 2); lay.setSpacing(2)
@@ -135,42 +137,56 @@ class LocalTerminalWidget(QWidget):
 
         A Windows console keeps a screen of its own and draws on it with
         absolute positions: clearing only ours put what came next in the wrong
-        places. Nothing is typed into the shell for it — a command (``set /p``,
-        ``Read-Host``, ``pause``) may be reading its input — except at
-        PowerShell's own prompt, where Ctrl+L is PSReadLine's Clear Screen
-        (it keeps the line being typed). Everywhere else the console is made
-        to start afresh from the line the cursor is on (see _restart_console);
-        PSReadLine, which remembers where its line began, is not, as it would
-        then draw that line in the wrong place."""
+        places. So the console is cleared too, and nothing is typed into a
+        command that may be reading its input (``set /p``, ``Read-Host``,
+        ``pause``):
+
+        * at PowerShell's prompt (the cursor's line starts with it): Ctrl+L,
+          PSReadLine's Clear Screen, which keeps the line being typed — in
+          order with what was typed before and after the click;
+        * where nothing waits for input on the cursor's line — cmd, whose
+          console edits its line, or a command printing away — the console
+          starts afresh from the cursor's line (see _restart_console);
+        * otherwise (PowerShell at a prompt of another look, or a command
+          asking something): nothing is touched — PSReadLine, which remembers
+          where its line began, would draw it in the wrong place after that,
+          and Ctrl+L would become part of an answer. The status line says how
+          to clear there."""
         shell, writer = self.shell, self.writer
         if shell is None or writer is None or not getattr(shell, "console", False):
             self.term.clear()
-        elif shell.label == "PowerShell" and self._at_powershell_prompt():
-            gate = self._clear_gate
-
-            def check():                 # walks the process tree: not here
-                gate.emit((shell, shell.runs_nothing()))
-            writer.call(check)
         else:
-            self._clear_console((shell, False))
+            head = self._cursor_line_head()
+            if head.startswith("PS ") and "> " in head:
+                self.term.clear()
+                writer.send(b"\x0c")
+            elif shell.label != "PowerShell" or not head.strip():
+                self.term.clear()
+                self._restart_console(shell)
+            else:
+                self._hint("Clear: at a prompt PowerShell clears itself — press Ctrl+L "
+                           "(or type cls)")
         self.term.setFocus()
 
-    def _at_powershell_prompt(self) -> bool:
-        """The cursor is on a line that starts with PowerShell's prompt."""
+    def _cursor_line_head(self) -> str:
+        """The text on the cursor's line before the cursor."""
         screen = self.term.screen
         line = screen.row_text(len(screen.history.top) + screen.cursor.y)
-        head = line[:screen.cursor.x]
-        return head.startswith("PS ") and "> " in head
+        return line[:screen.cursor.x]
 
-    def _clear_console(self, args):
-        shell, at_prompt = args
-        if shell is not self.shell or self.writer is None:
-            return                       # restarted or closed meanwhile
-        self.term.clear()
-        if at_prompt:
-            self.writer.send(b"\x0c")
-        else:
-            self._restart_console(shell)
+    def _hint(self, text: str):
+        """*text* in the status line for a few seconds. (The timer is the
+        tab's own, so it dies with the tab: a free one fired into a closed tab,
+        and an error in a slot ends a PyQt application.)"""
+        if self.status.text() != self._hint_text or not self._hint_timer.isActive():
+            self._hint_before = self.status.text()
+        self._hint_text = text
+        self.status.setText(text)
+        self._hint_timer.start(self._HINT_MS)
+
+    def _end_hint(self):
+        if self.status.text() == self._hint_text:   # (not replaced meanwhile)
+            self.status.setText(self._hint_before)
 
     def _restart_console(self, shell):
         """Have the console redraw from the cursor's line: it redraws all of its
@@ -226,7 +242,7 @@ class LocalTerminalWidget(QWidget):
             return
         self._closed = True
         self._log_gate.close()
-        self._clear_gate.close()
+        self._hint_timer.stop()
         self._stop_shell()
         try:
             self.term.cleanup()

@@ -342,15 +342,16 @@ def test_ctrl_c_reaches_the_shells_program_when_turbossh_was_started_ignoring_it
     assert report.read_text() == "stopped"
 
 
-def test_ctrl_c_is_let_through_only_without_a_console():
-    """A process with a hidden console (CREATE_NO_WINDOW) has no console
-    window either: GetConsoleWindow could not tell it from one with no console,
-    and TurboSSH turned Ctrl+C back on for itself there."""
+def test_ctrl_c_is_let_through_only_where_nobody_else_can_send_it():
+    """No console, or a hidden one nobody else is attached to (the embed
+    client starts TurboSSH so): cleared. A console shared with a terminal:
+    kept. (GetConsoleWindow, used at first, is empty for any hidden console,
+    shared or not.)"""
     from turbossh.gui import conpty
 
     class Kernel:
-        def __init__(self, cp):
-            self.cp, self.calls = cp, []
+        def __init__(self, cp, attached):
+            self.cp, self.attached, self.calls = cp, attached, []
 
         def GetConsoleCP(self):
             return self.cp
@@ -358,16 +359,17 @@ def test_ctrl_c_is_let_through_only_without_a_console():
         def GetConsoleWindow(self):
             return None                          # hidden console: no window
 
+        def GetConsoleProcessList(self, pids, size):
+            return self.attached
+
         def SetConsoleCtrlHandler(self, handler, add):
             self.calls.append((handler, add))
             return 1
 
-    hidden = Kernel(850)
-    conpty._let_ctrl_c_through(hidden)
-    assert hidden.calls == []
-    none = Kernel(0)
-    conpty._let_ctrl_c_through(none)
-    assert none.calls == [(None, False)]
+    for cp, attached, cleared in ((0, 0, True), (850, 1, True), (850, 3, False)):
+        kernel = Kernel(cp, attached)
+        conpty._let_ctrl_c_through(kernel)
+        assert (kernel.calls == [(None, False)]) is cleared, (cp, attached)
 
 
 @needs_console
@@ -498,15 +500,80 @@ def test_a_process_older_than_its_parent_pid_is_not_its_child(monkeypatch):
         monkeypatch.setattr(localshell, "_start_time",
                             lambda pid: 0 if pid != parent.pid else real(pid))
         assert localshell._descendants(parent.pid) == []     # "older": not ours
-        # the clock set back a little after the shell started: still its child
+        # 30 s "older": a stranger — unless the clock was set back that much
+        # since the shell started (the leeway is what was measured, no more)
         parent_born = real(parent.pid)
         monkeypatch.setattr(localshell, "_start_time",
                             lambda pid: parent_born - 30 * 10_000_000
                             if pid != parent.pid else parent_born)
-        assert localshell._descendants(parent.pid)
+        assert localshell._descendants(parent.pid) == []
+        assert localshell._descendants(parent.pid, clock_back=10) == []
+        assert localshell._descendants(parent.pid, clock_back=40)
     finally:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(parent.pid)],
                        capture_output=True)
+
+
+def test_a_hint_showing_when_the_tab_closes_does_not_end_the_app(qapp, monkeypatch):
+    """The status hint first ran on a free single-shot timer: it fired into the
+    closed tab, and an error in a slot aborts a PyQt application. The timer is
+    the tab's own now; the hint also leaves a status that changed alone."""
+    pytest.importorskip("pyte")
+    from PyQt5.QtTest import QTest
+    from turbossh.gui import local_terminal, qtutil
+    monkeypatch.setattr(local_terminal.LocalTerminalWidget, "_HINT_MS", 200)
+
+    class Shell:
+        label, uses_pty, echoes_input, console, alive = "PowerShell", True, False, True, True
+
+        def start(self):
+            pass
+
+        def read(self, size=65536):
+            time.sleep(0.05)
+            return b""
+
+        def write(self, data):
+            pass
+
+        def resize(self, cols, rows):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(local_terminal, "LocalShell", lambda label=None, cwd=None: Shell())
+    widget = local_terminal.LocalTerminalWidget()
+    try:
+        before = widget.status.text()
+        widget._hint("hint one")
+        assert widget.status.text() == "hint one"
+        QTest.qWait(400)
+        assert widget.status.text() == before            # back when it ends
+        widget._hint("hint two")
+        widget.status.setText("The shell has exited")     # replaced meanwhile
+        QTest.qWait(400)
+        assert widget.status.text() == "The shell has exited"
+        widget._hint("hint three")
+    finally:
+        widget.close_session()
+        widget.deleteLater()
+    QTest.qWait(600)                                     # past the hint's end: no crash
+    qtutil.wait_for_teardowns(5)
+
+
+def test_the_clock_set_back_since_the_shell_started_is_measured(monkeypatch):
+    from turbossh.gui import localshell
+    shell = localshell.LocalShell(console=False)
+    assert shell._clock_back() == 0.0                    # not started
+    shell._started_at = (100.0, 5000.0)
+    monkeypatch.setattr(localshell.time, "monotonic", lambda: 160.0)
+    monkeypatch.setattr(localshell.time, "time", lambda: 5060.0)
+    assert shell._clock_back() == 0.0                    # in step
+    monkeypatch.setattr(localshell.time, "time", lambda: 5015.0)
+    assert shell._clock_back() == 45.0                   # set back 45 s
+    monkeypatch.setattr(localshell.time, "time", lambda: 5300.0)
+    assert shell._clock_back() == 0.0                    # set forward: no leeway
 
 
 @needs_console
@@ -596,11 +663,28 @@ def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c)
         widget._clear()
         QTest.qWait(1500)
         shown = [r for r in rows() if r]
-        assert shown and shown[0].startswith("name:"), rows()   # cleared, in step
+        if label == "PowerShell":
+            # PSReadLine or a question? It cannot tell: nothing is touched
+            assert "after-clear" in shown, rows()
+            assert "Ctrl+L" in widget.status.text()
+        else:
+            assert shown and shown[0].startswith("name:"), rows()   # cleared, in step
         widget._on_keys(b"abc\r")
         QTest.qWait(1000)
         widget._on_keys(show)
         assert wait_until(lambda: "[abc]" in rows(), 15), rows()  # nothing slipped in
+        if label == "PowerShell":
+            # PSReadLine at a prompt of its own look: the same — and the line
+            # being typed is drawn where it belongs afterwards
+            widget._on_keys(b"function prompt { 'MY> ' }\r")
+            assert wait_until(lambda: any(r == "MY>" for r in rows()), 15), rows()
+            widget._on_keys(b"echo zz")
+            QTest.qWait(500)
+            widget._clear()
+            QTest.qWait(1000)
+            widget._on_keys(b"z\r")
+            assert wait_until(lambda: any(r == "MY> echo zzz" for r in rows())
+                              and "zzz" in rows(), 15), rows()
         widget.restart()
         assert wait_until(lambda: widget.shell is not None
                           and any(r.endswith(">") for r in rows())

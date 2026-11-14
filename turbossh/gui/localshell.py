@@ -21,6 +21,7 @@ from __future__ import annotations
 import codecs
 import os
 import subprocess
+import time
 
 _WINDOWS = os.name == "nt"
 _UTF8 = ("$e=New-Object System.Text.UTF8Encoding $false;"
@@ -46,9 +47,11 @@ def available_shells() -> list:
     return [os.path.basename(os.environ.get("SHELL") or "/bin/sh")]
 
 
-def _descendants(pid: int) -> list:
+def _descendants(pid: int, clock_back: float = 0.0) -> list:
     """PIDs of every process started (directly or not) by *pid* — Windows. The
-    shell's console host is left out: ending it would take the shell with it."""
+    shell's console host is left out: ending it would take the shell with it.
+    *clock_back*: how many seconds the clock was set back since *pid* started
+    (see LocalShell._clock_back)."""
     import ctypes
     from ctypes import wintypes
 
@@ -85,8 +88,10 @@ def _descendants(pid: int) -> list:
     # A process's parent PID is only a number: one whose parent ended long ago
     # names a PID Windows may since have given to *pid* (or a child of it).
     # Such a process is older than its "parent" and none of ours: left alone.
-    # (Start times are wall-clock: a minute's leeway, so the clock being set
-    # back a little after the shell started does not hide its real children.)
+    # Start times are wall-clock, so the clock set back since *pid* started
+    # (and a second for their granularity) is allowed for: that does not hide
+    # its real children.
+    leeway = int((max(0.0, clock_back) + 1.0) * 10_000_000)    # FILETIME: 100 ns
     started: dict = {}
 
     def start(p):
@@ -102,14 +107,11 @@ def _descendants(pid: int) -> list:
                 continue
             born, parent_born = start(child), start(parent)
             if (born is not None and parent_born is not None
-                    and born < parent_born - _CLOCK_LEEWAY):
+                    and born < parent_born - leeway):
                 continue
             found.append(child)
             queue.append(child)
     return found
-
-
-_CLOCK_LEEWAY = 60 * 10_000_000         # a minute, in FILETIME units (100 ns)
 
 
 def _start_time(pid: int):
@@ -173,12 +175,14 @@ class LocalShell:
         self._proc = None
         self._master = None
         self._slave_name = None          # the pty's terminal side, for tcflush
+        self._started_at = None          # (monotonic, wall clock) at start()
 
     @property
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> None:
+        self._started_at = (time.monotonic(), time.time())
         if _WINDOWS:
             if self._want_console and self._start_console():
                 return
@@ -206,6 +210,14 @@ class LocalShell:
             os.close(slave)
         self._master = master
 
+    def _clock_back(self) -> float:
+        """Seconds the wall clock was set back since the shell started: the
+        start times _descendants compares are wall-clock."""
+        if self._started_at is None:
+            return 0.0
+        mono, wall = self._started_at
+        return max(0.0, (time.monotonic() - mono) - (time.time() - wall))
+
     def _start_console(self) -> bool:
         """Start the shell in a pseudo console; False where that is not
         possible (the caller then uses pipes)."""
@@ -224,18 +236,6 @@ class LocalShell:
     def console(self) -> bool:
         """Whether the shell runs in a Windows pseudo console."""
         return self._console is not None
-
-    def runs_nothing(self) -> bool:
-        """A pseudo console's shell has no program of its own running (it may
-        still be busy itself: a cmdlet, a batch file, ``Read-Host``, ``set /p``).
-        Looks at the process tree: not on the GUI thread."""
-        console = self._console
-        if console is None:
-            return False
-        try:
-            return not _descendants(console.pid)
-        except Exception:
-            return False
 
     def read(self, size: int = 65536):
         if self._console is not None:
@@ -353,7 +353,7 @@ class LocalShell:
         if self._master is not None or self._console is not None:
             self.send_interrupt()
         elif self.alive:
-            for pid in _descendants(self._proc.pid):
+            for pid in _descendants(self._proc.pid, self._clock_back()):
                 _terminate(pid)
 
     def resize(self, cols: int, rows: int) -> None:
@@ -384,7 +384,7 @@ class LocalShell:
             try:
                 # what the shell started first (as with pipes: a console's
                 # programs do not all end with it), then the shell and its console
-                for pid in _descendants(console.pid):
+                for pid in _descendants(console.pid, self._clock_back()):
                     _terminate(pid)
             except Exception:
                 pass
@@ -398,7 +398,7 @@ class LocalShell:
         if proc is not None:
             try:
                 if _WINDOWS:
-                    for pid in _descendants(proc.pid):
+                    for pid in _descendants(proc.pid, self._clock_back()):
                         _terminate(pid)
                     proc.kill()
                 else:
