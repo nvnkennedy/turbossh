@@ -525,6 +525,7 @@ def test_an_editor_save_through_an_unresolved_link_keeps_the_link(ssh_server, ss
     """On a server whose realpath does not resolve links, the save compared the
     target's stamp (right) but then told the writer "a regular file", and the
     link was replaced by a file with the new text; the real file kept the old."""
+    pytest.importorskip("PyQt5")
     from turbossh.gui import remote_edit
     root = ssh_server.root
     (root / "real").mkdir()
