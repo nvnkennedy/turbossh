@@ -281,21 +281,25 @@ def test_a_forced_release_never_stops_its_own_ancestors(tmp_path):
 # ===================================================================== L4
 @pytest.mark.skipif(not HAVE_PS, reason="runs the Windows scripts for real")
 def test_a_windows_release_with_nothing_tracked_says_so(monkeypatch, tmp_path):
+    # a port name of this test run's own: a forced release of a shared name in
+    # another run on this machine (it stops every TurboSSH reader of the port)
+    # would stop this run's tracked reader
+    port = f"COM8{os.getpid() % 100000}"
     handler = SSHHandler(SSHConfig(host="x"), quiet=True)
     sent = []
     handler.run = handler._run = lambda cmd, **kw: sent.append(cmd)
-    handler.serial_release("COM9387")
+    handler.serial_release(port)
     out = _run_ps(decode_ps(sent[-1]), tmp_path)
     assert out.returncode == 1 and b"force=True" in out.stderr, out
     assert b"released" not in out.stdout
     # one of ours tracked: stopped, "released"
     sleeper = subprocess.Popen(
         ["powershell", "-NoProfile", "-EncodedCommand",
-         core._ps_b64(core._serial_ps_header("COM9387", "b" * 12) + "Start-Sleep 60")],
+         core._ps_b64(core._serial_ps_header(port, "b" * 12) + "Start-Sleep 60")],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(3)
-        (tmp_path / "turbossh_ser_COM9387.pid").write_text(str(sleeper.pid))
+        (tmp_path / f"turbossh_ser_{port}.pid").write_text(str(sleeper.pid))
         out = _run_ps(decode_ps(sent[-1]), tmp_path)
         assert out.returncode == 0 and out.stdout.strip() == b"released", out
         sleeper.wait(20)
