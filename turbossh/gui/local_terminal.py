@@ -144,14 +144,14 @@ class LocalTerminalWidget(QWidget):
         * at PowerShell's prompt (the cursor's line starts with it): Ctrl+L,
           PSReadLine's Clear Screen, which keeps the line being typed — in
           order with what was typed before and after the click;
-        * where nothing waits for input on the cursor's line — cmd, whose
-          console edits its line, or a command printing away — the console
-          starts afresh from the cursor's line (see _restart_console);
-        * otherwise (PowerShell at a prompt of another look, or a command
-          asking something): nothing is touched — PSReadLine, which remembers
-          where its line began, would draw it in the wrong place after that,
-          and Ctrl+L would become part of an answer. The status line says how
-          to clear there."""
+        * in cmd, whose console edits its line (also for ``set /p``): the
+          console starts afresh from the cursor's line (see _restart_console);
+        * otherwise — PowerShell at a prompt of another look (custom, two
+          lines, the cursor at the start of a row), a command asking something,
+          or printing away: nothing is touched. PSReadLine, which remembers
+          where its line began, would draw it in the wrong place after the
+          console's redraw, and Ctrl+L could become part of an answer. The
+          status line says how to clear there."""
         shell, writer = self.shell, self.writer
         if shell is None or writer is None or not getattr(shell, "console", False):
             self.term.clear()
@@ -160,7 +160,7 @@ class LocalTerminalWidget(QWidget):
             if head.startswith("PS ") and "> " in head:
                 self.term.clear()
                 writer.send(b"\x0c")
-            elif shell.label != "PowerShell" or not head.strip():
+            elif shell.label != "PowerShell":
                 self.term.clear()
                 self._restart_console(shell)
             else:
@@ -242,7 +242,6 @@ class LocalTerminalWidget(QWidget):
             return
         self._closed = True
         self._log_gate.close()
-        self._hint_timer.stop()
         self._stop_shell()
         try:
             self.term.cleanup()

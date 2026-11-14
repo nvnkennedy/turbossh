@@ -113,10 +113,10 @@ themselves were reviewed again, so that what worked in 2.0.0 keeps working.
   away, including the rest of a paste. **Clear** still moves the screen into
   the scrollback, and clears the console's screen too. It never types into a
   command that asks something (`set /p`, `Read-Host`, `pause`). At
-  PowerShell's prompt it is PSReadLine's Clear Screen (Ctrl+L). If it cannot
-  tell PowerShell's prompt from such a question, for example with a custom
-  prompt, it leaves the screen as it is and the status line says to press
-  Ctrl+L. Older Windows gets the 2.0.0 behaviour:
+  PowerShell's prompt it is PSReadLine's Clear Screen (Ctrl+L). Elsewhere in
+  PowerShell (a custom prompt, a command running or asking something) it
+  cannot clear safely. It then leaves the screen as it is, and the status line
+  says to press Ctrl+L at the prompt. Older Windows gets the 2.0.0 behaviour:
   pipes, TurboSSH's own line editing, no Tab completion. Set
   `TURBOSSH_NO_CONPTY=1` to get it on newer Windows too.
 

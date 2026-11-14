@@ -89,9 +89,9 @@ def _descendants(pid: int, clock_back: float = 0.0) -> list:
     # names a PID Windows may since have given to *pid* (or a child of it).
     # Such a process is older than its "parent" and none of ours: left alone.
     # Start times are wall-clock, so the clock set back since *pid* started
-    # (and a second for their granularity) is allowed for: that does not hide
-    # its real children.
-    leeway = int((max(0.0, clock_back) + 1.0) * 10_000_000)    # FILETIME: 100 ns
+    # (and a few seconds more, as that is a net figure) is allowed for: that
+    # does not hide its real children.
+    leeway = int((max(0.0, clock_back) + 5.0) * 10_000_000)    # FILETIME: 100 ns
     started: dict = {}
 
     def start(p):

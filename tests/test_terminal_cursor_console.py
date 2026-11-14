@@ -562,6 +562,112 @@ def test_a_hint_showing_when_the_tab_closes_does_not_end_the_app(qapp, monkeypat
     qtutil.wait_for_teardowns(5)
 
 
+class _FakeConsoleShell:
+    """A LocalShell in a pseudo console, as far as the tab can tell."""
+
+    def __init__(self, label):
+        self.label, self.uses_pty, self.echoes_input = label, True, False
+        self.console, self.alive = True, True
+        self.written, self.resizes, self.closed = bytearray(), [], False
+
+    def start(self):
+        pass
+
+    def read(self, size=65536):
+        time.sleep(0.02)
+        return None if self.closed else b""
+
+    def write(self, data):
+        self.written += data
+
+    def write_ready(self):
+        return True
+
+    def send_interrupt(self, signalled=False):
+        self.write(b"\x03")
+
+    def signal_interrupt(self):
+        return False
+
+    def resize(self, cols, rows):
+        self.resizes.append((cols, rows))
+
+    def close(self):
+        self.closed = True
+
+
+def _console_tab(monkeypatch, label):
+    from turbossh.gui import local_terminal
+    shell = _FakeConsoleShell(label)
+    monkeypatch.setattr(local_terminal, "LocalShell", lambda label=None, cwd=None: shell)
+    widget = local_terminal.LocalTerminalWidget()
+    return widget, shell
+
+
+@pytest.mark.parametrize("label, screen, expect", [
+    # PowerShell's default prompt (also a nested one in a cmd tab): Ctrl+L
+    ("PowerShell", b"PS C:\\Users\\me> abc", "ctrl-l"),
+    ("Command Prompt", b"PS C:\\Users\\me> ", "ctrl-l"),
+    # cmd, also with set /p asking: the console redraws, nothing is typed
+    ("Command Prompt", b"C:\\Users\\me>dir", "redraw"),
+    ("Command Prompt", b"name: ", "redraw"),
+    # PowerShell otherwise — custom prompt, Read-Host, a prompt ending in a
+    # newline (the cursor at the start of an empty row), output going on:
+    # nothing is touched, the status line says what to do
+    ("PowerShell", b"MY> abc", "hint"),
+    ("PowerShell", b"name: ", "hint"),
+    ("PowerShell", b"MY>\r\n", "hint"),
+    ("PowerShell", b"Reply from 127.0.0.1\r\n", "hint"),
+])
+def test_clear_in_a_console_tab(qapp, monkeypatch, label, screen, expect):
+    pytest.importorskip("pyte")
+    from PyQt5.QtTest import QTest
+    from turbossh.gui import qtutil
+    widget, shell = _console_tab(monkeypatch, label)
+    try:
+        widget.term.feed(b"earlier output\r\n" + screen)
+        QTest.qWait(100)
+        shell.written.clear()
+        shell.resizes.clear()                            # (the tab's first size)
+        widget._clear()
+        QTest.qWait(200)                                 # the writer thread
+        shown = [widget.term.screen.row_text(len(widget.term.screen.history.top) + y)
+                 .rstrip() for y in range(widget.term.screen.lines)]
+        if expect == "hint":
+            assert "earlier output" in shown             # left as it was
+            assert "Ctrl+L" in widget.status.text()
+            assert not shell.written and not shell.resizes
+        else:
+            assert "earlier output" not in shown         # into the scrollback
+            if expect == "ctrl-l":
+                assert bytes(shell.written) == b"\x0c" and not shell.resizes
+            else:
+                cols, rows = widget.term.cols, widget.term.rows
+                assert not shell.written and shell.resizes == [(cols, 1), (cols, rows)]
+    finally:
+        widget.close_session()
+        qtutil.wait_for_teardowns(5)
+        widget.deleteLater()
+
+
+def test_close_session_tears_down_when_the_tab_is_already_deleted(qapp, monkeypatch):
+    """A host may delete the tab before closing its session (the embedding API
+    copes with that): stopping the hint timer raised on the deleted Qt object
+    first, and the shell and its reader thread were left running."""
+    pytest.importorskip("pyte")
+    from PyQt5 import sip
+    from turbossh.gui import qtutil
+    widget, shell = _console_tab(monkeypatch, "PowerShell")
+    widget._hint("a hint")
+    reader = widget.reader
+    sip.delete(widget)
+    widget.close_session()
+    assert widget.shell is None and widget.reader is None
+    assert qtutil.wait_for_teardowns(5) and shell.closed
+    reader.wait(5000)
+    assert not reader.isRunning()
+
+
 def test_the_clock_set_back_since_the_shell_started_is_measured(monkeypatch):
     from turbossh.gui import localshell
     shell = localshell.LocalShell(console=False)
