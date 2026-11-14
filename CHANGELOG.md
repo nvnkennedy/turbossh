@@ -2,6 +2,220 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.1.0 — 2026-11-14
+
+A reliability release. The whole project was reviewed for what can make the
+window stop responding, crash, lose data, or lock a lab account. Then the fixes
+themselves were reviewed again, so that what worked in 2.0.0 keeps working.
+
+### Changed — please read when upgrading
+- **FTPS checks the server's certificate and host name.**
+  - A self-signed lab server: `FTPConfig(..., verify_tls=False)`.
+  - A lab's own CA: `ca_file="lab-ca.pem"`.
+  - A server reached by an IP address its certificate does not list:
+    `check_hostname=False`. The certificate itself is still checked.
+
+  The same options exist on `FTPHandler(config, ...)`. The error says which one
+  you need.
+- **Transfers replace a file instead of writing into it.** `push`, `pull`, the
+  GUI's uploads and downloads and the remote editor write to a temporary
+  `.<name>.<n>.tsp` next to the target, which already has the target's mode.
+  They rename it over the target when complete, keeping its mode, owner and
+  group, so a dropped link or a Cancel leaves the old file untouched. The file is
+  written in place, as before, in these cases, and the log says so:
+  - it has more than one hard link;
+  - it is not a regular file (`/dev/null`, a FIFO, a device);
+  - the folder does not allow new files;
+  - the owner or mode cannot be kept;
+  - it cannot be renamed over (a bind mount, a file held open on Windows);
+  - the disk has no room for a second copy, and the new file fits where the old
+    one is.
+
+  A new file that does not fit fails the transfer, and the old file is kept
+  whole. Two transfers to one file (two tabs, a pool) no longer clobber each
+  other. A temporary file left by a failed attempt (a dropped link) is removed
+  by the next transfer to that file from the same TurboSSH, at once. One left
+  by another program or run is removed once it is 10 minutes old. A symlink
+  stays a symlink. Tools that watch a folder now see a `.tsp` file and a
+  rename.
+- **Serial writes have a timeout.** `SerialHandler.write()` raises
+  `SerialError` once no byte has gone out for `write_timeout` seconds (default
+  5). The error says how many bytes were sent. A slow port does not trigger it
+  while bytes keep moving. With flow control (`rtscts`, `xonxoff`, `dsrdtr`),
+  the default is still to wait for as long as the device holds the line. A USB
+  virtual COM port (CDC-ACM) can hold writes back without flow control while
+  the device is busy. Pass `write_timeout=None` there to wait, as 2.0.0 did.
+- **The remote camera and serial port are never taken from someone else
+  without `force`.**
+  - `webcam_release()` stops this handler's own camera streams.
+    `webcam_release(force=True)` stops every TurboSSH camera stream on that
+    machine. With nothing of its own to stop, it returns exit status 1 with
+    that hint, instead of reporting success.
+  - `serial_stream()` and `turbossh serial-ssh` do not take a port another
+    program or a GUI session holds. `force=True` / `--force` first stops a
+    stale TurboSSH reader of the port. After monitoring, the CLI no longer
+    releases the port's tracked holder, because that could be the GUI's live
+    session.
+  - `serial_release()` stops only the bridge's own processes; on Linux / QNX,
+    `fuser -k` runs only with `force`. With nothing of its own to stop, it
+    returns exit status 1 and suggests `force=True`.
+- **A remote shell that exits is not reconnected.** `exit` or a nologin account
+  ends the session. A dropped link, a reboot or an sshd restart still
+  reconnects, and a link that dies right after connecting is retried after 2,
+  4, 8 … 30 s.
+- **The Logs tab shows the latest 50,000 lines** (it held 500,000, about 315 MB
+  per tab). Save still writes every stored line that passes the filter. Find
+  also searches the older ones and offers **Filter for it**.
+- **The terminal's disk capture keeps the latest 256 MB** in four parts. It used
+  to stop at 256 MB, so Save all output missed everything after that.
+- **WinRM bootstrap commands have deadlines.** These are:
+  - probes and upload chunks: 2 minutes;
+  - the offline install: 10 minutes;
+  - the online install (`Add-WindowsCapability`): 45 minutes.
+
+  A command that runs over its deadline is stopped with `WinRMTimeoutError`.
+  To raise a deadline, use `command_timeout=`, `SSHConfig.winrm_command_timeout`
+  or `install-ssh-remote --timeout`.
+- **`install-ssh-remote` takes the password the way other commands do:**
+  `--password` (prompt), `--password-stdin`, `--use-stored`, or
+  `TURBOSSH_PASSWORD`. The environment variable is used only when there is no
+  terminal to prompt at. Without a terminal and without a password, the
+  command stops instead of waiting for input.
+- **Jump passwords.** The jump password in Settings belongs to the jump host and
+  user in Settings (compared without case). Sessions through that jump host use
+  it, and follow it when it changes. A session through another jump host uses
+  its own password, and no password means a key or agent login. The CLI follows
+  the same rule, also with `--jump-host`. Settings saves the jump host, user and
+  password together, and only when you change them. When the shared password
+  changes, the log names sessions that keep the old one under another spelling
+  of the jump host (a full DNS name, an IP address).
+- **The hosting protocol checks arguments** (EMBEDDING.md):
+  - flags must be real booleans; `null` means the default;
+  - numbers may be JSON numbers or whole-number strings such as `"22"`;
+  - `NaN`, `Infinity`, negative values and fractional ports are refused;
+  - a `shutdown` `wait` is clamped to 0–60 s;
+  - after `shutdown`, requests other than queries are refused instead of
+    answered `ok` and dropped.
+- **settings.json is shared, but the look is per process.** Each TurboSSH
+  process (desktop app, embedded GUI) keeps its own theme and Camera choice.
+  Saving writes only what that process changed, so it no longer undoes another
+  process's changes.
+
+### Added
+- `SSHHandler.disconnect(sticky=True)`: nothing reconnects the handler until
+  the next explicit `connect()`. The GUI uses it for closed tabs. Plain
+  `disconnect()` still lets `auto_reconnect` connect again, as in 2.0.0.
+- `SSHConfig.sftp_timeout` (60 s): an SFTP request the server never answers
+  fails instead of hanging. Also `SSHConfig.winrm_command_timeout`.
+- `FTPConfig` / `FTPHandler`: `verify_tls`, `ca_file`, `check_hostname`.
+- `SerialHandler(..., write_timeout=..., dsrdtr=...)`.
+- `SSHHandler.serial_stream(..., force=...)`, `turbossh serial-ssh --force`,
+  `turbossh install-ssh-remote --timeout / --password-stdin / --use-stored`.
+- `turbossh.WinRMTimeoutError`.
+- Quitting asks about remote-file editors with unsaved changes, and so does
+  `TurboSSHWidget.confirm_close()` for hosts. An editor whose session closed
+  stays open offline with **Save a copy…**.
+- The file browser carries on over a reconnected session, keeping its queue,
+  history and editors. The interrupted transfer starts again unless you
+  cancelled it.
+
+### Fixed — the window stopped responding
+- Typing, pasting and terminal resizes go out on a writer thread per session
+  (SSH, serial, serial over SSH, local shell). A rekey, a stalled link, a low
+  baud rate or a busy shell no longer freezes the window. Ctrl-C drops the
+  queued paste and goes out first. A paste to a small-window server over a slow
+  link is no longer cut off.
+- Logs tab: re-filtering 200k lines froze the window for 6–12 s. The view is
+  now built in timed steps, newest matches first, and Save runs on a worker
+  thread.
+- Transfers panel: cancelling 5,000 queued items took 3.4 s (now 5 ms). A tick
+  with 500 rows of history took 320 ms (now 7 ms).
+- Folder listings are sorted and formatted on the worker, and link targets are
+  looked up in one batch. The local pane's start folder is checked on a worker,
+  and deleting runs on one.
+- Every network wait has a deadline:
+  - SFTP clients give up after 30 s of silence;
+  - channel requests (PTY, exec, shell, subsystem) time out;
+  - opening a tunnel channel times out after 20 s;
+  - WinRM commands stop at their deadlines.
+
+  Cancel frees a transfer stuck on a dead link, but waits while a slow link
+  still moves data.
+- `connect()` on a handler that looks connected checks the link first. After a
+  target reboot, the dead connection is replaced instead of failing on the next
+  command, and the old client is closed. A live link that answers slowly is
+  kept. A changed config (host, port, login, authentication, jump host) gets a
+  new link, as in 2.0.0.
+- `connect()` and `disconnect()` no longer hang on a stalled link while another
+  thread uploads: the transport is closed first.
+- A cancelled download stops its read-ahead (Paramiko 3.3 and later). It used to
+  keep sending reads on the closed file.
+- Set up SSH server polls for its result once, not once per click.
+
+### Fixed — crashes
+- A Logs tab running a one-shot command (`journalctl`, `dmesg`, `slog2info`)
+  could abort the application when the command ended.
+- Closing the app during a slow update check could abort it.
+- A failed change to a saved session is reported in a message box instead of
+  crashing.
+- The CLI no longer fails printing a character the console's code page lacks
+  (cp1252, redirected output). paramiko errors, end of input and subprocess
+  errors end in an `ERROR` line instead of a traceback.
+
+### Fixed — lost or damaged data
+- Transfers: see above. A recursive download also maps names that are invalid
+  on Windows (reserved names, trailing dots, case-only clashes), never writes
+  outside the destination, and skips devices and FIFOs. Uploads ask about a
+  case-only clash on a Windows remote.
+- Remote editor:
+  - It opens only regular files, and reads at most its size limit.
+  - Saving checks that the file did not change on the remote since it was
+    opened.
+  - Text the editor would alter opens read-only: non-breaking spaces, lone CRs,
+    U+2028/9, mixed line ends, damaged UTF-8.
+- The terminal reads a channel's last output before it reports the end: logout
+  and reboot messages, and the serial bridge's BUSY line.
+- Save all output includes every capture part. If one is missing, it says that
+  earlier output is not included.
+- known_hosts is read line by line, so `@cert-authority` and `@revoked` lines no
+  longer break every connect. New keys are appended under a lock, never
+  rewritten.
+- A settings.json or sessions.json that another program (antivirus) holds is
+  retried. It is no longer set aside as corrupt or written over. The desktop
+  app reads sessions.json again once the file is free.
+- Serial over SSH (Windows): a retry on a busy port erased the record of the
+  real holder, which then kept the port until a reboot. A force open could
+  also stop its own sshd wrapper under a PowerShell default shell.
+- Serial over SSH (Linux / QNX): the bridge's terminal is raw but keeps the
+  newline translations, so output does not staircase and Enter sends a
+  newline.
+- `serial_write` over SSH reports a failed open or write instead of returning
+  quietly, and sends long data as several commands in order. If a later part
+  fails, the error says how many bytes had already been written.
+- FTP downloads go to a temporary file and replace the target only when
+  complete. A file another program holds open, or one in a folder that does not
+  allow new files, is written in place.
+- The SSH-server setup script keeps `PATH` as `REG_EXPAND_SZ` without expanding
+  it.
+
+### Fixed — security
+- The SSH-server setup result is written only into an Administrators-only
+  folder, never through a link. The POSIX serial bridge keeps its PID files in a
+  private 0700 folder and refuses symlinks.
+- PowerShell literals double the typographic quotes (U+2018–U+201B) too. A name
+  containing one could end the string early.
+- Camera names in remote command lines drop `"`, `%` and `|`, and the ffmpeg
+  path drops `"` and `|`; `%VAR%` in it still works. ffmpeg is never taken from
+  the current directory.
+- Drops from another session's remote pane are refused, so a file cannot land on
+  the wrong machine.
+- The Camera's Remote source filled in the jump host's password when you picked
+  the jump host, and kept it when you then picked another machine, so Scan sent
+  it there. It is now filled in only for the jump host's own account, and
+  cleared when you pick another machine.
+- A temporary copy gets no setuid, setgid or sticky bit until its data is
+  written.
+
 ## 2.0.0 — 2026-11-10
 
 Two things: the Camera is now there only when you want it, and the whole GUI

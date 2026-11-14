@@ -88,6 +88,24 @@ knowing:
   old embedded SSH servers.
 - **Safe mode** is implemented by a single `_guard` wrapper around every public
   method.
+- **Connection lifetime.** With `auto_reconnect`, a `run` / `push` after the
+  link dropped, or after `disconnect()`, connects again. The GUI disposes of a
+  handler with `disconnect(sticky=True)`, so a worker still running cannot bring
+  a closed tab's connection back. `connect()` on a handler that looks connected
+  checks the link first by opening a session channel, which every SSH server
+  must answer, yes or no. Any packet that arrives meanwhile also counts. After a
+  target reboot the old TCP link only looks alive. With no sign of life within
+  `max(connect_timeout, 10 s)`, the old client is closed and a new link is
+  opened. A changed config (host, port, login, authentication, jump host) also
+  gets a new link. Closing always stops the transport first and only then
+  forgets the SFTP client, so a link stalled under another thread's upload
+  cannot block `connect()` or `disconnect()`.
+- **Timeouts everywhere a peer can stall:** channel requests (PTY, exec, shell,
+  subsystem), SFTP requests (`SSHConfig.sftp_timeout`, 60 s), and the WinRM
+  bootstrap's remote commands. A timeout is raised, never taken for "file not
+  there".
+- **known_hosts** is read line by line (`@cert-authority` and `@revoked` lines
+  are skipped, not fatal). New keys are appended under a lock, never rewritten.
 
 ## GUI: the buffered pull model
 
@@ -101,12 +119,27 @@ Instead:
    bounded amount per tick into pyte.
 
 The UI thread only ever does a fixed slice of work per frame, so throughput
-can't lock it up. On Ctrl-C the reader buffer is flushed so a flood stops on
-screen immediately instead of trickling out for seconds.
+can't lock it up: one shared timer and one time budget serve every terminal, in
+2 KB slices. On Ctrl-C the reader buffer is flushed so a flood stops on screen
+immediately instead of trickling out for seconds.
 
-Scrollback is pyte's `HistoryScreen` (≈16 KB/line, so it's capped — 10k lines by
-default, configurable). The *full* session is teed to a file on disk as it
-streams, which is what **Save all output** reads — that part is unbounded.
+The other direction works the same way. Typing, pasting and PTY resizes are
+queued to a **writer thread** per session (SSH, serial, serial over SSH, local
+shell), so a rekey, a stalled link, a low baud rate or a busy shell never blocks
+the GUI thread. A full SSH window means "try again", not "give up". Ctrl-C drops
+the queued paste and goes out first. When a reader reaches end-of-file, it
+first hands over the output it already has (logout and reboot messages, the
+serial bridge's BUSY line), and only then reports the end.
+
+Scrollback lines are compact tuples of shared cells (about 1.8 KB a line).
+The default is 10k lines, and it is configurable. The *full* session is
+captured to disk as it streams, which is what **Save all output** reads. The
+capture keeps the latest 256 MB in four rotating parts. A shell that exits
+(`exit`, a nologin account) is not reconnected; a link that dies is.
+
+The **Logs tab** keeps every line its worker receives, but the view shows only
+the latest 50k lines. It is built in timed steps, newest matches first. Save
+writes every stored line that passes the filter, on a worker thread.
 
 ## GUI: one window, two hosts
 
@@ -191,16 +224,85 @@ details make it actually work:
 Port lifecycle is handled explicitly, because Windows OpenSSH likes to orphan
 the child process on disconnect:
 
-- Each bridge writes its PID to `%TEMP%\turbossh_ser_<port>.pid`.
-- **Open** is self-healing: it kills the previously-tracked holder, and on a
-  forced open clears any other TurboSSH serial process holding the port, then
-  retries.
+- Each bridge writes its PID to `%TEMP%\turbossh_ser_<port>.pid`, but only once
+  `Open()` has succeeded, and removes the file only while it still names that
+  bridge. A failed retry on a busy port therefore never erases the record of the
+  real holder.
+- **Open never takes a port someone holds.** A busy port reports `BUSY`.
+  "Busy" means access denied, or an `IOException` that says "in use" or names a
+  sharing violation (some USB-serial drivers). The GUI then asks. A **forced**
+  open stops only TurboSSH's own serial PowerShell processes for that port, then
+  retries. They are recognised by a port tag in the `-EncodedCommand` command
+  line, and the force never matches this process or its parents: under a
+  PowerShell default shell, the sshd wrapper carries the same text.
+- **A forced open is two commands:** first the forced stop (the same as
+  `serial_release(force=True)`), then the plain open, which retries while the
+  stopped process lets go of the port. Every Windows command stays under 8,000
+  characters, because Windows OpenSSH's default shell runs it through
+  `cmd /c`, which refuses lines over 8,191. Each script carries only the
+  pieces it uses, and `serial_write` sends long data as several commands in
+  order. A test checks the length of every command builder.
 - **`serial_in_use()`** lets the GUI ask before taking a busy port.
-- **`serial_release()`** kills the bridge by PID on close (session close, app
-  close), and the PTY teardown covers an unexpected crash.
+- **`serial_release()`** stops the bridge's own processes on close (session
+  close, app close). The PTY teardown covers an unexpected crash. With nothing
+  of its own to stop, it returns exit status 1 and suggests `force=True`.
+- **`serial_stream()`** (scripts, `turbossh serial-ssh`) stops its own reader
+  when it ends. It touches a port's tracked holder only with `force=True`,
+  because that holder may be the GUI's live session on the port.
 
-`/dev/*` ports use the equivalent shell construction (`stty raw` + paired `cat`,
-`fuser -k` to free a stale holder).
+`/dev/*` ports use the equivalent shell construction, a paired `cat`. The device
+is configured with `stty -F`, or through stdin where stty has no `-F` (QNX). The
+SSH PTY is set raw (`-echo -isig`) but keeps the newline translations
+(`icrnl opost onlcr`), so a device that prints bare `\n` does not staircase.
+The bridge records its two PIDs in a private folder
+(`${TMPDIR:-/tmp}/turbossh-<uid>/`, 0700, never a symlink). `serial_release`
+stops only those. `fuser -k` frees the device only with force.
+
+## Transfers: one policy
+
+`turbossh/_transfer.py` (no Qt) decides how a file is written, for
+`SSHHandler.push` / `pull`, the file browser's uploads and downloads, and the
+remote editor's saves:
+
+- **A new file** is written under a temporary name in the same folder and
+  renamed into place. No partial file ever has the real name, and it costs no
+  more round trips than writing it directly.
+- **An existing regular file with one link** is replaced the same way. The new
+  copy gets the old one's mode and, if they differ, its owner and group
+  (`chown`). A root push used to leave a service's 0600 config root-owned.
+- **Written in place, as 2.0 did,** where replacing would change what the file
+  is or cannot be done. That covers:
+  - more than one hard link;
+  - not a regular file (`/dev/null`, a FIFO, a block device);
+  - a folder the temporary file may not be created in;
+  - an owner or a mode the copy may not be given;
+  - a file that cannot be renamed over (a bind mount, a file another program
+    holds open on Windows);
+  - no room for a second copy (the server's "Failure" while writing it). This
+    applies only when the new data fits where the old file is. Otherwise the
+    transfer fails and the old file is kept whole.
+
+  The log says so.
+- **Symlinks** are resolved by the server (`realpath`), so the file they point
+  at is replaced and the link stays a link. A link the server cannot resolve is
+  written through.
+- **Temporary names are per attempt:** `.<name>.<n>.tsp`, with the first free
+  `n` from 0 to 7, else a random one. They are created exclusively, so two
+  transfers to one file (two tabs, a pool) never write into or remove each
+  other's copy. The temporary copy has the target's mode before any data goes
+  in. The setuid, setgid and sticky bits are set only after the data. A
+  leftover this process could not remove after a broken transfer is
+  remembered, per server, and the next transfer to that file removes it at
+  once. Any other leftover is removed once it has been unchanged for 10
+  minutes, measured by the server's clock.
+- Paramiko drops the replies to pipelined writes. `_transfer` reads them itself,
+  so a refused write is caught without an extra round trip.
+- **Downloads** go to a temporary local file and `os.replace` over the target. A
+  target another program holds without delete sharing (Windows) is written in
+  place instead. Read-ahead is capped at 64 requests, so a multi-GB file over a
+  slow VPN does not run into the SFTP timeout. On Paramiko 3.3 and later,
+  TurboSSH runs its own read loop, so a cancelled download also stops its
+  read-ahead thread.
 
 ## OpenSSH, bundled and offline
 

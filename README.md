@@ -228,6 +228,22 @@ for root, dirs, files in ssh.walk("/etc/network"):
 SCP is there too — `ssh.scp_push(...)` / `ssh.scp_pull(...)` — for servers where
 it's faster or SFTP is disabled.
 
+A transfer never leaves a half-written file under the real name. `push`,
+`pull`, the GUI's uploads and downloads and the remote editor all write to a
+temporary `.<name>.<n>.tsp` next to the target. They rename it over the target
+once complete, keeping the old file's mode, owner and group, so a dropped VPN
+link leaves the old file as it was. Where replacing would change what the file
+is, or cannot be done, it is written in place as before, and the log says so.
+That covers:
+- a file with hard links;
+- a device such as `/dev/null`;
+- a folder you may not create files in;
+- a bind mount;
+- a disk with no room for a second copy, when the new file fits where the old
+  one is. If it doesn't fit, the transfer fails and the old file is kept.
+
+A symlink stays a symlink, and the file it points at is the one replaced.
+
 **In the GUI.** Every SSH session has a **SFTP** tab: a two-pane browser. Double-
 click folders to navigate, use the buttons to upload, download, make a
 directory, rename, or delete. Transfers run on their own channel, so a big copy
@@ -257,6 +273,13 @@ with SerialHandler("COM5", baudrate=115200) as ser:
     ser.write("version\n")
     ser.stream(on_line=print, match="login:")     # follow it
 ```
+
+`write()` gives up when no byte has gone out for `write_timeout` seconds (5 by
+default), and its error says how many bytes were sent. A slow port does not
+trigger it as long as bytes keep moving. With flow control (`rtscts`,
+`xonxoff`, `dsrdtr`), the default is to wait as long as the device holds the
+line, as 2.0 did. A USB virtual COM port (CDC-ACM) can hold writes back without
+flow control while the device is busy. Pass `write_timeout=None` to wait there.
 
 **In the GUI.** New session → **Serial** → pick the **Device** and **Baud** →
 **OK**. The console is a native terminal: type straight into it.
@@ -309,7 +332,11 @@ turbossh serial-ssh --host 10.0.0.20 --user "CORP\\myuser" \
     --device COM4 --baud 115200 --save console.log
 #   --send "reboot"      write a line first
 #   --match "login:"     flag matching lines
+#   --force              first stop a stale TurboSSH reader holding the port
 ```
+
+A port that another program, or a TurboSSH session in the GUI, holds is never
+taken from it. The command says it cannot open the port.
 
 ---
 
@@ -374,8 +401,14 @@ for cam in ssh.list_cameras(ffmpeg=r"C:\ffmpeg\ffmpeg.exe"):
 chan = ssh.webcam_channel("Integrated Camera", ffmpeg=r"C:\ffmpeg\ffmpeg.exe",
                           width=640, height=480, fps=15)
 # chan.recv() yields MJPEG (concatenated JPEG frames); chan.close() to stop
-ssh.webcam_release()
+ssh.webcam_release()            # stops this handler's camera streams
 ```
+
+`webcam_release()` stops the streams this handler started, so another script or
+the GUI can keep using the same machine's camera. With none of its own, it
+returns exit status 1 and says so. `webcam_release(force=True)`
+stops every TurboSSH camera stream there, for example one a crashed run left
+behind. `webcam_channel(..., force=True)` stops whoever holds that camera first.
 
 **From the CLI.** List cameras and grab a snapshot or a short clip — locally, or
 on a remote machine with `--host`:
