@@ -2,7 +2,10 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
-## Unreleased
+## 2.2.0 — 2026-11-15
+
+Folder transfers with symbolic links: the same result whatever order a server
+lists in, and an upload that no longer fails on a link loop.
 
 ### Fixed — folders with symbolic links
 - **A folder download comes out the same whatever order the server lists in.**
