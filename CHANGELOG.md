@@ -2,6 +2,24 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## Unreleased
+
+### Fixed — folders with symbolic links
+- **A folder download comes out the same whatever order the server lists in.**
+  A folder that could also be reached through a symlinked folder was copied
+  once, under whichever of its names came first in a listing. On Linux that
+  order differs from machine to machine, and the folder's own name could be the
+  one left out. `pull()`, `walk()` and the File browser's download now take the
+  tree as it is first and the symlinked folders after, each round in name
+  order. So a folder in the tree always arrives under its own name, and a link
+  to it, or back up the tree, is skipped. Each folder is still copied once, so
+  folders that link to each other (as in `/sys`) cost no more than before.
+- **A folder upload with a link back up the tree works.** `push()` followed the
+  loop until the path was too long, and the upload failed. It now skips a link
+  back into a folder being uploaded, and stops at 8 nested symlinked folders,
+  as downloads do. Any other symlinked folder is still copied in full, as
+  `scp -r` does.
+
 ## 2.1.1 — 2026-11-15
 
 The terminal: the cursor is drawn where it is, any font keeps to the grid,

@@ -604,7 +604,7 @@ class _TransferThread(QThread):
             raise IOError(f"cannot read {remote}: {exc}") from None
         ftype = _attr_type(attr)
         if ftype == stat.S_IFDIR:
-            return self._get_dir(sftp, remote, local, set(), 0)
+            return self._get_dir(sftp, remote, local)
         problem = kind_problem(ftype)
         if problem:
             raise IOError(f"{remote} {problem}, not a file that can be copied")
@@ -615,21 +615,43 @@ class _TransferThread(QThread):
         self._on_file(remote)
         return get_atomic(sftp, remote, local, self._on_bytes)
 
-    def _get_dir(self, sftp, remote_dir, local_dir, seen, hops):
+    def _get_dir(self, sftp, remote_dir, local_dir):
+        """Each real folder is copied once (a link loop, or a second way to a
+        folder, is not followed again), in rounds as SSHHandler.walk goes: the
+        tree without following a link first, then the symlinked folders found
+        in it, and so on, each round in name order. A folder in the tree is so
+        saved under its own name whatever order the server lists in."""
+        todo, seen, total, count = [(remote_dir, local_dir)], set(), 0, 0
+        for _ in range(_MAX_LINK_HOPS + 1):
+            links = []
+            for rdir, ldir in todo:
+                size, files = self._get_tree(sftp, rdir, ldir, seen, links)
+                total += size
+                count += files
+            if not links:
+                return total, count
+            todo = links
+        self.notes.extend(f"skipped {rpath}: too many nested symlinked folders "
+                          f"(a link loop?)" for rpath, _ in links)
+        return total, count
+
+    def _get_tree(self, sftp, remote_dir, local_dir, seen, links):
+        """One round of :meth:`_get_dir` below *remote_dir*."""
+        self._check()                    # a round can be thousands of links
         try:
             real = sftp.normalize(remote_dir)
         except socket.timeout:
             raise
         except IOError:
             real = remote_dir
-        if real in seen:                 # a symlink loop: already copied
+        if real in seen:                 # a link loop, or copied already
             return 0, 0
         seen.add(real)
         os.makedirs(local_dir, exist_ok=True)
-        attrs = sftp.listdir_attr(remote_dir)
-        links = [a.filename for a in attrs if _attr_type(a) == stat.S_IFLNK]
-        targets = dict(zip(links, _stat_many(
-            sftp, [posixpath.join(remote_dir, n) for n in links])))
+        attrs = sorted(sftp.listdir_attr(remote_dir), key=lambda a: a.filename)
+        links_here = [a.filename for a in attrs if _attr_type(a) == stat.S_IFLNK]
+        targets = dict(zip(links_here, _stat_many(
+            sftp, [posixpath.join(remote_dir, n) for n in links_here])))
         names = _local_names([a.filename for a in attrs])
         total = count = 0
         for attr in attrs:
@@ -648,13 +670,11 @@ class _TransferThread(QThread):
                 self.notes.append(f"skipped the broken link {rpath}")
                 continue
             ftype = _attr_type(target)
+            if ftype == stat.S_IFDIR and is_link:
+                links.append((rpath, lpath))     # the next round
+                continue
             if ftype == stat.S_IFDIR:
-                deeper = hops + (1 if is_link else 0)
-                if deeper > _MAX_LINK_HOPS:
-                    self.notes.append(f"skipped {rpath}: too many nested symlinked "
-                                      f"folders (a link loop?)")
-                    continue
-                size, files = self._get_dir(sftp, rpath, lpath, seen, deeper)
+                size, files = self._get_tree(sftp, rpath, lpath, seen, links)
             elif kind_problem(ftype):
                 self.notes.append(f"skipped {rpath}: it {kind_problem(ftype)}")
                 continue

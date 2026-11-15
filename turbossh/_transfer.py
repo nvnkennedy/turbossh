@@ -98,6 +98,22 @@ def file_type(mode) -> int:
         return 0
 
 
+def local_link(path: str) -> bool:
+    """A local symbolic link, or a Windows junction (what os.path.isjunction
+    tells from Python 3.12, read off the reparse tag before that): a folder
+    upload counts these against its cap on nested links."""
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return isjunction(path)
+    try:
+        tag = getattr(os.lstat(path), "st_reparse_tag", 0)    # Windows only
+    except OSError:
+        return False
+    return bool(tag) and tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None)
+
+
 def _perm(mode) -> Optional[int]:
     try:
         return None if mode is None else int(mode) & 0o7777

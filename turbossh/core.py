@@ -2884,33 +2884,55 @@ class SSHHandler:
             return len(data)
         return self._guard("write_text", _do, safe=safe)
 
-    def walk(self, remote_path: str, _seen: Optional[set] = None, _links: int = 0):
-        """Generator like os.walk over a remote tree (dirpath, dirs, files).
-        Symlinked directories are followed once (a link loop is not re-entered);
-        dangling links are skipped."""
+    # A recursive walk takes each real folder once: a link loop, or a second way
+    # to a folder, is not followed again. Which way that is must not hang on
+    # the order a server lists a folder in (on Linux, the file system's hash
+    # order, different from machine to machine), so a walk goes in rounds: the
+    # tree as it is, without following a link, then the symlinked folders found
+    # in it, then the ones found in those, and so on — each round in name
+    # order. A folder that is in the tree is so taken under its own name, and a
+    # link to it is skipped.
+    def walk(self, remote_path: str):
+        """Generator like os.walk over a remote tree (dirpath, dirs, files),
+        top-down; *dirs* may be pruned in place. Symlinked directories are
+        followed, each real folder once (see above), and dangling links are
+        skipped."""
         sftp = self.sftp()
-        remote_path = self._rnorm(remote_path)
-        seen = set() if _seen is None else _seen
-        real = self._real_dir(sftp, remote_path)
+        todo, seen = [self._rnorm(remote_path)], set()
+        for hops in range(self._MAX_LINK_HOPS + 1):
+            links = []
+            for top in todo:
+                yield from self._walk_tree(sftp, top, seen, links,
+                                           hops < self._MAX_LINK_HOPS)
+            if not links:
+                return
+            todo = links
+
+    def _walk_tree(self, sftp, top, seen, links, follow_links):
+        """One round of :meth:`walk` below *top*: symlinked folders go to
+        *links* for the next round (or, past the cap, are left out)."""
+        real = self._real_dir(sftp, top)
         if real in seen:
             return
         seen.add(real)
         dirs, files, linked = [], [], set()
-        for entry in sftp.listdir_attr(remote_path):
-            kind, is_link = self._entry_kind(
-                sftp, entry, posixpath.join(remote_path, entry.filename))
+        for entry in sorted(sftp.listdir_attr(top), key=lambda e: e.filename):
+            kind, is_link = self._entry_kind(sftp, entry, posixpath.join(top, entry.filename))
             if kind == "dir":
-                if is_link and _links >= self._MAX_LINK_HOPS:
+                if is_link and not follow_links:
                     continue                # a link loop the server didn't resolve
                 dirs.append(entry.filename)
                 if is_link:
                     linked.add(entry.filename)
             elif kind == "file":
                 files.append(entry.filename)
-        yield remote_path, dirs, files
-        for d in dirs:
-            yield from self.walk(posixpath.join(remote_path, d), seen,
-                                 _links + (1 if d in linked else 0))
+        yield top, dirs, files
+        for d in dirs:                      # as the caller left them
+            path = posixpath.join(top, d)
+            if d in linked:
+                links.append(path)
+            else:
+                yield from self._walk_tree(sftp, path, seen, links, follow_links)
 
     # ------------------------------------------------------------------ #
     # Push / Pull (SFTP) with TransferResult
@@ -2995,9 +3017,15 @@ class SSHHandler:
         except IOError:
             return None
 
-    def _push_dir(self, sftp, local_dir, remote_dir, callback, there=_transfer.UNKNOWN):
+    def _push_dir(self, sftp, local_dir, remote_dir, callback, there=_transfer.UNKNOWN,
+                  _inside=None, _links=0):
         """Upload a folder. *there* is the listing of *remote_dir* ({} for a
-        folder made by this push), looked up when not known."""
+        folder made by this push), looked up when not known. A symlinked folder
+        is copied, as ``scp -r`` does, but not a link back into a folder being
+        uploaded (a loop: it recursed until the path was too long), nor past
+        ``_MAX_LINK_HOPS`` of them nested. (*_inside*: the real paths of the
+        folders being uploaded.)"""
+        inside = {os.path.realpath(local_dir)} if _inside is None else _inside
         if there is _transfer.UNKNOWN:
             there = {} if self._mkdir_p(sftp, remote_dir) else \
                 self._remote_listing(sftp, remote_dir)
@@ -3007,6 +3035,16 @@ class SSHHandler:
             rpath = posixpath.join(remote_dir, entry)
             known = there.get(entry) if there is not None else _transfer.UNKNOWN
             if os.path.isdir(lpath):
+                real = os.path.realpath(lpath)
+                if real in inside:                   # before the remote folder is made
+                    self._emit(logging.WARNING, f"Skipping {lpath}: a link back into a "
+                                                f"folder being uploaded (a loop)")
+                    continue
+                hops = _links + (1 if _transfer.local_link(lpath) else 0)
+                if hops > self._MAX_LINK_HOPS:
+                    self._emit(logging.WARNING, f"Skipping {lpath}: too many nested "
+                                                f"symlinked folders")
+                    continue
                 sub = _transfer.UNKNOWN
                 if known is None:                    # not there yet: make it
                     try:
@@ -3019,7 +3057,11 @@ class SSHHandler:
                 elif (known is not _transfer.UNKNOWN
                       and _file_type(known.st_mode) == _S_IFDIR):
                     sub = self._remote_listing(sftp, rpath)
-                s, c = self._push_dir(sftp, lpath, rpath, callback, sub)
+                inside.add(real)
+                try:
+                    s, c = self._push_dir(sftp, lpath, rpath, callback, sub, inside, hops)
+                finally:
+                    inside.discard(real)
                 total += s
                 count += c
             else:
@@ -3123,17 +3165,33 @@ class SSHHandler:
             out[e.filename] = name
         return out
 
-    def _pull_dir(self, sftp, remote_dir, local_dir, callback, _seen=None,
-                  _links=0, _root=None):
-        seen = set() if _seen is None else _seen
-        root = _root or os.path.abspath(local_dir)
+    def _pull_dir(self, sftp, remote_dir, local_dir, callback):
+        """Download a folder: each real folder once, in rounds (see walk)."""
+        root = os.path.abspath(local_dir)
+        todo, seen, total, count = [(remote_dir, local_dir)], set(), 0, 0
+        for _ in range(self._MAX_LINK_HOPS + 1):
+            links = []
+            for rdir, ldir in todo:
+                s, c = self._pull_tree(sftp, rdir, ldir, callback, seen, root, links)
+                total += s
+                count += c
+            if not links:
+                return total, count
+            todo = links
+        for rpath, _ in links:
+            self._emit(logging.WARNING, f"Skipping {rpath}: too many nested symlinked "
+                                        f"folders (a link loop?)")
+        return total, count
+
+    def _pull_tree(self, sftp, remote_dir, local_dir, callback, seen, root, links):
+        """One round of :meth:`_pull_dir` below *remote_dir*."""
         real = self._real_dir(sftp, remote_dir)
-        if real in seen:                    # a symlink loop: already copied
+        if real in seen:                    # a link loop, or copied already
             return 0, 0
         seen.add(real)
         os.makedirs(local_dir, exist_ok=True)
         total, count = 0, 0
-        entries = sftp.listdir_attr(remote_dir)
+        entries = sorted(sftp.listdir_attr(remote_dir), key=lambda e: e.filename)
         names = self._local_names(entries, remote_dir)
         for entry in entries:
             rpath = posixpath.join(remote_dir, entry.filename)
@@ -3145,14 +3203,10 @@ class SSHHandler:
             kind, is_link = self._entry_kind(sftp, entry, rpath)
             if kind is None:
                 self._emit(logging.WARNING, f"Skipping dangling link {rpath}")
+            elif kind == "dir" and is_link:
+                links.append((rpath, lpath))      # the next round
             elif kind == "dir":
-                hops = _links + (1 if is_link else 0)
-                if hops > self._MAX_LINK_HOPS:
-                    self._emit(logging.WARNING,
-                               f"Skipping {rpath}: too many nested symlinked "
-                               f"folders (a link loop?)")
-                    continue
-                s, c = self._pull_dir(sftp, rpath, lpath, callback, seen, hops, root)
+                s, c = self._pull_tree(sftp, rpath, lpath, callback, seen, root, links)
                 total += s
                 count += c
             else:

@@ -72,7 +72,11 @@ class StubSFTP(paramiko.SFTPServerInterface):
         real = self._real(path)
         try:
             out = []
-            for name in os.listdir(real):
+            names = os.listdir(real)
+            order = self._srv.listing_order
+            if order:
+                names = sorted(names, reverse=(order == "reverse"))
+            for name in names:
                 attr = paramiko.SFTPAttributes.from_stat(
                     os.lstat(os.path.join(real, name)))
                 attr.filename = name
@@ -175,6 +179,11 @@ class Server(paramiko.ServerInterface):
         self.sudo_password = "good"
         self.posix_rename_supported = True
         self.resolve_links = True
+        # The order folder listings come in: None is the file system's (sorted
+        # on Windows and macOS, hash order on Linux's ext4, so it differs from
+        # runner to runner); "sorted" / "reverse" pin it, so a test can show
+        # that a result does not depend on it.
+        self.listing_order = None
         # chmod requests are accepted and ignored unless this is set (POSIX
         # only: on Windows a mode without owner write makes the file read-only,
         # which other tests' later writes would trip over)

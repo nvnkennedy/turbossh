@@ -276,13 +276,8 @@ def test_sftp_client_is_reopened_after_its_channel_dies(ssh, ssh_server):
     assert ssh.sftp() is not first
 
 
-@pytest.mark.parametrize("server_resolves_links", [True, False])
-def test_symlinked_folder_is_followed_and_loops_are_not(ssh, ssh_server, tmp_path,
-                                                        server_resolves_links):
-    """A link loop ends the walk either because the server's realpath shows we
-    have been there (OpenSSH), or — on a server that doesn't resolve links — by
-    the cap on nested symlinked folders."""
-    ssh_server.server.resolve_links = server_resolves_links
+def _linked_tree(ssh_server):
+    """/data/real/f.txt, /data/link -> /data/real, /data/real/loop -> /data."""
     real = ssh_server.root / "data" / "real"
     real.mkdir(parents=True)
     (real / "f.txt").write_text("inside")
@@ -293,9 +288,131 @@ def test_symlinked_folder_is_followed_and_loops_are_not(ssh, ssh_server, tmp_pat
                    target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("creating symlinks needs a privilege this account lacks")
+
+
+@pytest.mark.parametrize("order", ["sorted", "reverse"])
+@pytest.mark.parametrize("server_resolves_links", [True, False])
+def test_symlinked_folder_is_followed_and_loops_are_not(ssh, ssh_server, tmp_path,
+                                                        server_resolves_links, order):
+    """Each real folder is copied once, and always under the same name: its
+    own, with the link to it skipped. Which of the two was copied hung on the
+    order the server listed them in — on Linux, the file system's hash order,
+    so it changed from one machine to the next. A loop ends the walk: at once
+    where the server's realpath shows the folder was copied (OpenSSH), else at
+    the cap on nested symlinked folders."""
+    ssh_server.server.resolve_links = server_resolves_links
+    ssh_server.server.listing_order = order
+    _linked_tree(ssh_server)
     down = ssh.pull("/data", str(tmp_path / "data"), recursive=True)
-    assert (tmp_path / "data" / "link" / "f.txt").read_text() == "inside"
-    assert down.files >= 1          # and it terminated despite the loop
+    assert (tmp_path / "data" / "real" / "f.txt").read_text() == "inside"
+    if server_resolves_links:
+        assert down.files == 1
+        assert not (tmp_path / "data" / "link").exists()
+        assert not (tmp_path / "data" / "real" / "loop").exists()
+    else:                               # no way to tell: the link is copied too
+        assert (tmp_path / "data" / "link" / "f.txt").read_text() == "inside"
+        assert down.files >= 2          # and it terminated despite the loop
+
+
+def _cross_linked(top, n=4):
+    """n folders, each with a file and a link to every other one."""
+    names = [chr(ord("a") + i) for i in range(n)]
+    for name in names:
+        (top / name).mkdir(parents=True)
+        (top / name / "f.txt").write_text(name)
+    try:
+        for name in names:
+            for other in names:
+                if other != name:
+                    os.symlink(str(top / other), str(top / name / f"to_{other}"),
+                               target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("creating symlinks needs a privilege this account lacks")
+
+
+@pytest.mark.parametrize("order", ["sorted", "reverse"])
+def test_cross_linked_folders_are_downloaded_once_each(ssh, ssh_server, tmp_path, order):
+    """As /sys does: folders linking to each other. Following every way to a
+    folder copies n·e·(n-1)! of them (64 here, 110 000 for 8)."""
+    ssh_server.server.listing_order = order
+    _cross_linked(ssh_server.root / "data")
+    assert ssh.pull("/data", str(tmp_path / "data"), recursive=True).files == 4
+    assert sorted(os.listdir(tmp_path / "data")) == ["a", "b", "c", "d"]
+    assert os.listdir(tmp_path / "data" / "a") == ["f.txt"]
+
+
+def test_an_upload_of_cross_linked_folders_ends(ssh, ssh_server, tmp_path):
+    """An upload copies a symlinked folder, as scp -r does (and as it always
+    did); it went round the links until the path was too long."""
+    _cross_linked(tmp_path / "local", n=3)
+    up = ssh.push(str(tmp_path / "local"), "/up", recursive=True)
+    assert up.files == 15           # a, a/to_b, a/to_b/to_c, a/to_c, a/to_c/to_b ...
+    assert (ssh_server.root / "up" / "a" / "to_b" / "to_c" / "f.txt").read_text() == "c"
+    assert not (ssh_server.root / "up" / "a" / "to_b" / "to_a").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are Windows's")
+def test_a_junction_counts_as_a_link(tmp_path):
+    """Python 3.12 tells a junction from a folder; before, the reparse tag does."""
+    import _winapi
+    from turbossh import _transfer
+    (tmp_path / "real").mkdir()
+    _winapi.CreateJunction(str(tmp_path / "real"), str(tmp_path / "j"))
+    assert _transfer.local_link(str(tmp_path / "j"))
+    assert not _transfer.local_link(str(tmp_path / "real"))
+    assert not _transfer.local_link(str(tmp_path / "missing"))
+
+
+def test_push_copies_a_linked_folder_and_ends_a_loop(ssh, ssh_server, tmp_path):
+    """A local link back up the tree was followed for ever (until the path got
+    too long): an upload had no loop check at all. A link to a folder in the
+    tree is still copied in full (site/current -> releases/2 must arrive)."""
+    src = tmp_path / "src"
+    (src / "real").mkdir(parents=True)
+    (src / "real" / "f.txt").write_text("inside")
+    try:
+        os.symlink(str(src / "real"), str(src / "link"), target_is_directory=True)
+        os.symlink(str(src), str(src / "real" / "loop"), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("creating symlinks needs a privilege this account lacks")
+    up = ssh.push(str(src), "/up", recursive=True)
+    for name in ("real", "link"):
+        assert (ssh_server.root / "up" / name / "f.txt").read_text() == "inside", name
+    assert up.files == 2
+    assert not (ssh_server.root / "up" / "real" / "loop").exists()  # no empty folder
+    assert not (ssh_server.root / "up" / "link" / "loop").exists()
+
+
+@pytest.mark.parametrize("order", ["sorted", "reverse"])
+def test_walk_takes_each_folder_once_under_its_own_name(ssh, ssh_server, order):
+    ssh_server.server.listing_order = order
+    _linked_tree(ssh_server)
+    assert list(ssh.walk("/data")) == [("/data", ["link", "real"], []),
+                                       ("/data/real", ["loop"], ["f.txt"])]
+
+
+def test_walk_takes_a_folder_inside_the_tree_under_its_own_name(ssh, ssh_server):
+    """/a/to_b -> /b: "a" comes first, but b is not walked as /a/to_b."""
+    _cross_linked(ssh_server.root, n=2)
+    assert [top for top, _, _ in ssh.walk("/")] == ["/", "/a", "/b"]
+
+
+def test_walk_can_be_pruned_and_follows_links_outside_the_tree(ssh, ssh_server):
+    root = ssh_server.root
+    for name in ("tree/keep", "tree/drop", "outside"):
+        (root / name).mkdir(parents=True)
+    (root / "outside" / "o.txt").write_text("o")
+    try:
+        os.symlink(str(root / "outside"), str(root / "tree" / "keep" / "ext"),
+                   target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("creating symlinks needs a privilege this account lacks")
+    seen = []
+    for top, dirs, files in ssh.walk("/tree"):
+        seen.append((top, files))
+        if "drop" in dirs:
+            dirs.remove("drop")
+    assert seen == [("/tree", []), ("/tree/keep", []), ("/tree/keep/ext", ["o.txt"])]
 
 
 def test_stream_creates_the_save_folder(ssh, tmp_path):

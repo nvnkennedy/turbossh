@@ -311,6 +311,34 @@ def test_browser_upload_through_a_link_in_a_linked_folder(ssh, ssh_server, sftp,
     assert os.path.islink(str(root / "a" / "b" / "f")), "the link became a file"
 
 
+def _linked_folders(top):
+    """top/real/f.txt, top/link -> top/real, top/real/loop -> top."""
+    (top / "real").mkdir(parents=True)
+    (top / "real" / "f.txt").write_text("inside")
+    try:
+        os.symlink(str(top / "real"), str(top / "link"), target_is_directory=True)
+        os.symlink(str(top), str(top / "real" / "loop"), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("creating symlinks needs a privilege this account lacks")
+
+
+@pytest.mark.parametrize("order", ["sorted", "reverse"])
+def test_browser_download_saves_a_folder_under_its_own_name_whatever_the_order(
+        qapp, ssh_server, sftp, tmp_path, order):
+    """A folder is copied once; which of its names it was saved under (the
+    folder's, or a link's to it) hung on the order the server listed them in."""
+    pytest.importorskip("PyQt5")
+    from turbossh.gui import sftp_browser as sb
+    ssh_server.server.listing_order = order
+    _linked_folders(ssh_server.root / "data")
+    dest = tmp_path / "data"
+    thread = sb._TransferThread(None, sb._Job("download", "/data", str(dest), True, 0))
+    _, files = thread._download(sftp, "/data", str(dest))
+    assert (dest / "real" / "f.txt").read_text() == "inside"
+    assert files == 1 and not (dest / "link").exists()
+    assert not (dest / "real" / "loop").exists()                    # the loop: no
+
+
 # ------------------------------------------------- temporary names
 def _age(path, seconds=3600):
     when = time.time() - seconds
