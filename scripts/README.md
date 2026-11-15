@@ -165,7 +165,9 @@ No Windows Update / internet needed. After this, connect to that machine over SS
 ## Releasing (maintainers)
 
 ```bash
-python scripts/release.py patch            # bump -> test -> build -> upload
-python scripts/release.py 1.6.1 --dry-run  # build + check only
+python scripts/release.py 2.1.2 --dry-run --wait-ci  # CI passed? checks, tests, build
+python scripts/release.py 2.1.2 --skip-tests         # the same checks, then upload
 ```
-Token is read from `TWINE_PASSWORD` (never hard-coded).
+It publishes only the tip of `main`, and only once CI has passed on it; the
+steps are in CONTRIBUTING.md. twine asks for the PyPI token (or reads
+`TWINE_PASSWORD`); it is never hard-coded.

@@ -59,20 +59,29 @@ GUI tests on Windows, the suite from source on 3.8, and a build + `twine check`.
 ## Releasing (maintainers)
 
 The version lives in **one place**: `turbossh/__init__.py` (`__version__`);
-`pyproject.toml` reads it dynamically. Releases are published manually:
+`pyproject.toml` reads it dynamically. A release is the tip of `main` exactly as
+CI tested it — PyPI never takes a version twice, so nothing is published before
+CI has passed on the commit:
 
-```bash
-# 1. add a "## X.Y.Z — YYYY-MM-DD" section to CHANGELOG.md
-# 2. build the GUI exe and put it where the wheel picks it up
-python scripts/build_exe.py --onefile
-copy dist\turbossh-gui.exe turbossh\bin\
-# 3. test, bump, build, check, upload
-python scripts/release.py X.Y.Z --dry-run      # everything except the upload
-python scripts/release.py X.Y.Z
-git commit -am "Release X.Y.Z" && git tag vX.Y.Z && git push --tags
-```
+1. **One commit:** set `__version__ = "X.Y.Z"` and add a
+   `## X.Y.Z — YYYY-MM-DD` section to CHANGELOG.md.
+2. **The GUI exe, built from that commit**, where the wheel picks it up:
+   `python scripts/build_exe.py --onefile`, then copy `dist\turbossh-gui.exe`
+   to `turbossh\bin\`.
+3. **Push `main`** and let CI run.
+4. **`python scripts/release.py X.Y.Z --dry-run --wait-ci`** waits for CI on
+   that commit and stops if any job failed; checks that this is `main`, clean
+   and pushed, that the version is not on PyPI yet and a `vX.Y.Z` tag (if any)
+   is on this commit, and that the exe is newer than the last change to the
+   package; then runs the tests, builds, and checks the wheel and sdist. If
+   anything fails, nothing is published: fix it in a new commit and go back
+   to 3.
+5. **`python scripts/release.py X.Y.Z --skip-tests`** makes the same checks and
+   uploads. twine asks for the PyPI token (or reads `TWINE_PASSWORD`).
+6. **Tag and GitHub release:** the script prints the `git tag` / `git push`
+   commands for that commit and a link to a new GitHub release for the tag;
+   the notes are in `build/release-notes-X.Y.Z.md`, and the exe is attached.
 
-`release.py` refuses to continue when CHANGELOG.md has no section for the
-version or the built wheel lacks `turbossh/bin/turbossh-gui.exe` (`--no-exe` /
-`--skip-changelog` override those), and it puts the old version string back if
-any step fails.
+Push the one tag, not `--tags`. GitHub's API allows 60 anonymous requests an
+hour; `GITHUB_TOKEN` raises that. `--no-ci-check`, `--no-exe`,
+`--skip-changelog` and `--skip-tests` override a check, for when you know why.

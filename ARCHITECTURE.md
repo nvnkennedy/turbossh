@@ -327,9 +327,13 @@ can't be installed.
 ```
 python scripts/build_exe.py --onefile   # build dist/turbossh-gui.exe
 # copy it to turbossh/bin/turbossh-gui.exe
-python -m build --wheel                  # build the wheel (bundles the exe)
-python -m twine upload dist/*.whl        # publish
+python scripts/release.py X.Y.Z --dry-run --wait-ci
+python scripts/release.py X.Y.Z --skip-tests
 ```
 
-`scripts/release.py` automates the version bump + build + check for the
-ordinary case.
+A release is the tip of `main` exactly as CI tested it. `scripts/release.py`
+publishes nothing unless every job of `.github/workflows/ci.yml` passed on that
+very commit (it asks GitHub, and waits with `--wait-ci`), the tree is clean and
+pushed, the version is committed with a changelog section and is not on PyPI
+yet, and the exe is newer than the last change to the package. The steps are in
+CONTRIBUTING.md.
