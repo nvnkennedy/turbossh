@@ -701,7 +701,8 @@ def test_a_write_while_the_console_closes_is_not_an_error(tmp_path):
 
 @needs_console
 @pytest.mark.parametrize("label", ["PowerShell", "Command Prompt"])
-def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c):
+def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c,
+                                                    monkeypatch):
     """Clear blanked only the widget: the console, which draws with absolute
     positions, put the next lines in the wrong places. Now the console clears
     too — and nothing is typed into a command that reads its input (an
@@ -729,6 +730,16 @@ def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c)
             QTest.qWait(30)
         return predicate()
 
+    # The tab starts in the home folder, which the suite points into TEMP: on a
+    # CI runner long enough for PowerShell's prompt to fill most of a row, so
+    # the command wrapped (and a longer one would wrap the prompt, where Clear
+    # only shows a hint). Started in the drive's root, the shell has the same
+    # short prompt anywhere; its home (PowerShell keeps its history there)
+    # stays the suite's.
+    from turbossh.gui import local_terminal, localshell
+    root = os.environ.get("SystemDrive", "C:") + "\\"
+    monkeypatch.setattr(local_terminal, "LocalShell",
+                        lambda label=None: localshell.LocalShell(label, cwd=root))
     logs = []
     widget = LocalTerminalWidget()
     widget.log.connect(logs.append)
@@ -754,10 +765,26 @@ def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c)
         QTest.qWait(500)                                      # a person's pause
         widget._on_keys(b"echo after-clear\r")
 
+        command = ("> " if label == "PowerShell" else ">") + "echo after-clear"
+
         def answer_below_command():
-            shown = [r for r in rows() if r]
-            return any(shown[i + 1] == "after-clear" and shown[i].endswith("after-clear")
-                       for i in range(len(shown) - 1))
+            # the rows straight above the answer, joined as they are (each is
+            # the console's width, so a line that wrapped joins up exactly),
+            # end with the prompt and the command: no row between them
+            s = widget.term.screen
+            top = len(s.history.top)
+            raw = [s.row_text(top + y) for y in range(s.lines)]
+            for i in range(1, len(raw)):
+                if raw[i].rstrip() == "after-clear":
+                    end = i
+                    if i >= 2 and not raw[i - 1].strip() and raw[i - 2][-1:].strip():
+                        end -= 1     # below a line as wide as it, the console
+                    k = end          # itself leaves one blank row
+                    while k > 0 and raw[k - 1].strip():
+                        k -= 1
+                    if "".join(raw[k:end]).rstrip().endswith(command):
+                        return True
+            return False
         assert wait_until(answer_below_command, 15), rows()
         # a command of the shell's own reading its input: Clear types nothing
         if label == "PowerShell":
@@ -765,7 +792,8 @@ def test_clear_and_restart_keep_the_console_in_step(qapp, label, console_ctrl_c)
         else:
             ask, show = b"set /p x=name: \r", b"echo [%x%]\r"
         widget._on_keys(ask)
-        assert wait_until(lambda: any("name:" in r for r in rows()), 15), rows()
+        # the question itself, not the command line that asks it
+        assert wait_until(lambda: any(r.startswith("name:") for r in rows()), 15), rows()
         QTest.qWait(500)
         widget._clear()
         QTest.qWait(1500)
