@@ -1,34 +1,56 @@
 """Dual-pane file browser: this PC on the left, the remote host on the right, and
-the transfer history underneath.
+the transfer history underneath — laid out as TurboADB's Files tab is.
 
-Move files with the two arrow buttons, by dragging between the panes (or in from
-Explorer), or from the context menus. The remote pane is :class:`SftpBrowser`,
-which owns the transfer queue; this module adds the local pane and ties the two
-together. Nothing here blocks the GUI thread: the local listing is Qt's own
-asynchronous file-system model, a saved start folder (maybe on a share that is
-gone) is checked on a worker, deleting runs on a worker, and everything remote
-runs on the remote pane's worker threads.
+Quick links to folders on both sides run along the top; each pane has its
+heading (the drive, the path, Up, Refresh), a listing with Name, Size, Date
+Modified, Permissions and Owner (folders say ``<DIR>``, ".." leads up), and
+its file operations underneath. Push and Pull between the panes move the
+selection one way or the other; so does dragging between the panes (or in
+from Explorer), and so do the context menus. The remote pane is
+:class:`SftpBrowser`, which owns the transfer queue; this module adds the
+local pane and ties the two together.
+
+Nothing here blocks the GUI thread: the local listing is read on a worker (a
+folder on a share that is gone must not freeze the window), as are a saved
+start folder and deletes; everything remote runs on the remote pane's worker
+threads.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
+import stat
+import string
+import time
 
-from PyQt5.QtCore import QDir, QFile, QStandardPaths, Qt, QUrl, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QKeySequence
-from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFileSystemModel,
-                             QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+from PyQt5.QtCore import (QDir, QDirIterator, QFile, QFileInfo, QFileSystemWatcher,
+                          QItemSelectionModel, QMimeData, QStandardPaths, Qt, QTimer,
+                          QUrl, pyqtSignal)
+from PyQt5.QtGui import QDesktopServices, QGuiApplication, QKeySequence
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
+                             QFileIconProvider, QHBoxLayout, QInputDialog, QLabel,
                              QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut,
-                             QSplitter, QTreeView, QVBoxLayout, QWidget)
+                             QSplitter, QStyle, QVBoxLayout, QWidget)
 
+from . import glyphs
 from .qtutil import close_jobs, run_job
-from .sftp_browser import REMOTE_MIME, REMOTE_SOURCE_MIME, SftpBrowser
+from .sftp_browser import (_FILL_CHUNK, PARENT_KEYS, REMOTE_MIME, REMOTE_SOURCE_MIME,
+                           ListTree, SftpBrowser, _Entry, _row_specs, _sorted_rows,
+                           _Spec, listing_summary, make_row, parent_icon,
+                           reorder_rows, select_rows)
 from .transfer_log import TransferLog
 from .transfer_panel import TransferPanel
+from .widgets import flat_button, ops_row, pane_title
 
 _HAS_TRASH = hasattr(QFile, "moveToTrash")       # Qt 5.15+
+_WINDOWS = os.name == "nt"
+_SETTLE_MS = 300         # a folder that changes is listed again this long after
+                         # the last change (a download writes and renames)...
+_SETTLE_MAX = 2.0        # ...or this many seconds after the first, if it keeps
+                         # changing (a log being written)
 
 
 @contextlib.contextmanager
@@ -98,24 +120,295 @@ def _names(paths, limit=5) -> str:
     return ", ".join(os.path.basename(p) for p in paths[:limit]) + more
 
 
-class _LocalView(QTreeView):
+# --------------------------------------------------------------------------- #
+# Reading a local folder (worker thread)
+# --------------------------------------------------------------------------- #
+def drives() -> list:
+    """This PC's drives, ``["C:\\\\", "D:\\\\", …]``, from one bitmask: no drive
+    is touched, so an empty card reader or a dead network mapping cannot
+    stall it. ``["/"]`` where there are no drive letters."""
+    if not _WINDOWS:
+        return ["/"]
+    mask = 0
+    try:
+        import ctypes
+        mask = int(ctypes.windll.kernel32.GetLogicalDrives())
+    except Exception:
+        mask = 0
+    return [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase)
+            if mask & (1 << i)] or ["C:\\"]
+
+
+def drive_of(path) -> str:
+    """The drive *path* is on ("C:\\\\"; "" for a share or the drive list)."""
+    if not _WINDOWS:
+        return "/" if path else ""
+    drive = os.path.splitdrive(path or "")[0]
+    return drive + "\\" if len(drive) == 2 else ""
+
+
+# GetDriveType: removable, fixed, CD-ROM, RAM disk are this PC's own disks;
+# remote (4) is a mapped share. Fixed and RAM disks always answer at once.
+_DISKS = (2, 3, 5, 6)
+_ALWAYS_THERE = (3, 6)
+_REMOTE_DRIVE = 4
+
+
+def drive_type(root) -> int:
+    """Windows' GetDriveType of a drive root (0 where unknown). It reads the
+    drive table; it does not wait on the drive."""
+    try:
+        import ctypes
+        return int(ctypes.windll.kernel32.GetDriveTypeW(root))
+    except Exception:
+        return 0
+
+
+# file systems on another machine (or behind a user-space driver, fuse.*)
+_REMOTE_FS = frozenset(("nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "9p", "afs",
+                        "ceph", "glusterfs", "lustre", "gpfs", "davfs", "sshfs"))
+
+
+def mount_type(path, mounts="/proc/self/mounts") -> str:
+    """The type of the file system *path* (a real path) is on, from the mount
+    table ("" where there is none to read)."""
+    best, kind = "", ""
+    try:
+        with open(mounts, encoding="utf-8", errors="replace") as table:
+            for line in table:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)),
+                               fields[1])        # "\040" is a space
+                inside = path == point or path.startswith(point.rstrip("/") + "/")
+                if inside and len(point) >= len(best):
+                    best, kind = point, fields[2]
+    except OSError:
+        return ""
+    return kind
+
+
+def on_local_disk(path) -> bool:
+    """Is *path* (a real path) on one of this PC's own disks — not a share
+    (mapped to a letter, named by UNC, or mounted)? Asked on a worker."""
+    if not _WINDOWS:
+        kind = mount_type(path)
+        return not (kind in _REMOTE_FS or kind.startswith("fuse."))
+    root = drive_of(path)
+    return bool(root) and drive_type(root) in _DISKS
+
+
+def _natural_key(name) -> tuple:
+    """Sorts "file2" before "file10", ignoring case, as Qt's file model did.
+    Text and numbers alternate, so two keys compare part by part."""
+    return tuple(int(part) if i % 2 else part.lower()
+                 for i, part in enumerate(re.split(r"(\d+)", name or "")))
+
+
+_OWNERS: dict = {}
+
+
+def _owner_name(uid) -> str:
+    """The user name of *uid* ("" on Windows, where a file's owner takes a
+    security lookup per file)."""
+    if uid is None or _WINDOWS:
+        return ""
+    name = _OWNERS.get(uid)
+    if name is None:
+        try:
+            import pwd
+            name = pwd.getpwuid(uid).pw_name
+        except Exception:
+            name = str(uid)
+        _OWNERS[uid] = name
+    return name
+
+
+def _local_perms(mode) -> str:
+    """The permission bits in octal, as TurboADB's PC pane shows them ("755";
+    on Windows that says read-only, "555", or not, "777")."""
+    try:
+        return format(int(mode) & 0o777, "03o") if mode is not None else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _hidden(entry, lst) -> bool:
+    """Hidden as Qt's file model hid it: the hidden attribute on Windows, a
+    leading dot elsewhere."""
+    if _WINDOWS:
+        return bool(getattr(lst, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_HIDDEN)
+    return entry.name.startswith(".")
+
+
+def scan_folder(path) -> list:
+    """The entries of the local folder *path* (``_Entry`` rows; "" = the drives):
+    its folders and files, hidden ones left out. A link shows what it points
+    at. Raises OSError if the folder cannot be read."""
+    if not path:
+        return [_Entry(d, True, False, None, None, None, stat.S_IFDIR) for d in drives()]
+    entries = []
+    # Only folders and files, as Qt's file model showed them: a FIFO or a
+    # device read for an upload never ends, and a broken link is nothing.
+    with os.scandir(path) as listing:
+        for item in listing:
+            try:
+                lst = item.stat(follow_symlinks=False)
+            except OSError:
+                continue                 # gone meanwhile
+            if _hidden(item, lst):
+                continue
+            is_link = stat.S_ISLNK(lst.st_mode)
+            st = lst
+            if is_link:
+                try:
+                    st = item.stat()
+                except OSError:
+                    st = lst             # dangling: the link itself
+            ftype = stat.S_IFMT(st.st_mode)      # a junction is a folder
+            if ftype not in (stat.S_IFDIR, stat.S_IFREG):
+                continue
+            is_dir = ftype == stat.S_IFDIR
+            entries.append(_Entry(item.name, is_dir, is_link,
+                                  None if is_dir else st.st_size, st.st_mtime,
+                                  st.st_mode, ftype,
+                                  _owner_name(getattr(st, "st_uid", None))))
+    return entries
+
+
+class _Listing:
+    """A local folder as read by a worker (see :func:`_local_listing`)."""
+
+    def __init__(self, path, entries, specs, order, infos, kinds, watch):
+        self.path, self.entries, self.specs, self.order = path, entries, specs, order
+        self.infos = infos       # name -> QFileInfo already read: for system icons
+        self.kinds = kinds       # drive -> GetDriveType (the drive list)
+        self.watch = watch       # watch the folder for changes
+
+
+def _local_listing(path, order, native=False) -> _Listing:
+    """Worker: read a local folder ("" = the drives) and prepare its rows. With
+    *native* (system icons), a QFileInfo of each row on a disk of this PC is
+    read here: the shell's icon asks for the file's type when it is painted,
+    and a fresh QFileInfo would read the disk on the GUI thread then — for a
+    network drive that went away, for the network's timeout. Rows on a share
+    get the style's icons instead."""
+    entries = scan_folder(path)
+    kinds, shown = {}, []
+    if path:
+        specs = _row_specs(entries, order, _local_perms, _natural_key)
+        # where it really is: a folder reached through a link may be a share
+        local = on_local_disk(os.path.realpath(path))
+        if local:
+            shown = [e.name for e in entries if not e.is_link
+                     or on_local_disk(os.path.realpath(os.path.join(path, e.name)))]
+    else:                                # the drives: in drive order, nothing else
+        specs = [_Spec(1, (e.name.lower(), 0, 0, "", ""), e.name, True, False,
+                       ("", "", "", "")) for e in entries]
+        if _WINDOWS:
+            kinds = {e.name: drive_type(e.name) for e in entries}
+            shown = [name for name, kind in kinds.items() if kind in _ALWAYS_THERE]
+        local = False
+    infos = {}
+    if native and shown and path:
+        # read with the folder, in one scan: a QFileInfo made per file asked
+        # the disk once per query (20,000 files took nine seconds)
+        wanted = set(shown)
+        found = QDirIterator(path, QDir.AllEntries | QDir.NoDotAndDotDot
+                             | QDir.Hidden | QDir.System)
+        while found.hasNext():
+            found.next()
+            info = found.fileInfo()
+            if info.fileName() in wanted:
+                infos[info.fileName()] = info
+    elif native:                         # the fixed drives
+        for name in shown:
+            info = QFileInfo(name)
+            info.isFile(), info.isDir()  # read here, not when painted
+            infos[name] = info
+    return _Listing(path, entries, specs, order, infos, kinds, local)
+
+
+class _LocalIcons:
+    """Row icons. On Windows the system's own, as Qt's file model showed them
+    (Desktop and Downloads have their own, programs and shortcuts theirs) for
+    rows on this PC's disks, from a QFileInfo the listing worker already read;
+    the style's folder, file and drive icons for the rest, and everywhere on
+    other systems and on Qt's headless platform."""
+
+    def __init__(self, style):
+        self.native = _WINDOWS and (QGuiApplication.platformName() or "") == "windows"
+        self._provider = QFileIconProvider() if self.native else None
+        self._style = {(True, False): style.standardIcon(QStyle.SP_DirIcon),
+                       (True, True): style.standardIcon(QStyle.SP_DirLinkIcon),
+                       (False, False): style.standardIcon(QStyle.SP_FileIcon),
+                       (False, True): style.standardIcon(QStyle.SP_FileLinkIcon)}
+        self._drive = style.standardIcon(QStyle.SP_DriveHDIcon)
+        self._network = style.standardIcon(QStyle.SP_DriveNetIcon)
+
+    def get(self, is_dir, is_link, info=None, drive_kind=None):
+        """The icon of a row; *drive_kind*: GetDriveType of a drive's row."""
+        if info is not None and self._provider is not None:
+            return self._provider.icon(info)
+        if drive_kind is not None:
+            return self._network if drive_kind == _REMOTE_DRIVE else self._drive
+        return self._style[is_dir, is_link]
+
+
+# --------------------------------------------------------------------------- #
+# The local pane
+# --------------------------------------------------------------------------- #
+class _LocalView(ListTree):
     """The local listing. Rows can be dragged out (onto the remote pane, or into
-    Explorer); what it accepts is ONLY a drag from its own remote pane, which
-    means "download here". Local-to-local drops are refused, so files are never
-    moved around on disk by a slip of the mouse — and so are rows dragged from
-    another session's remote pane: their names would be looked up in THIS
-    pane's remote folder, and a different file downloaded."""
+    Explorer — always as a copy); what it accepts is ONLY a drag from its own
+    remote pane, which means "download here". Local-to-local drops are refused,
+    so files are never moved around on disk by a slip of the mouse — and so are
+    rows dragged from another session's remote pane: their names would be
+    looked up in THIS pane's remote folder, and a different file downloaded."""
     remote_dropped = pyqtSignal(list)    # names of remote entries dropped here
     refused = pyqtSignal(str)            # why a drag from elsewhere is not taken
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.accepts = None              # callable -> the REMOTE_SOURCE_MIME we take
+        self.folder = ""                 # the folder the rows are in
+        self.dragging = False
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
 
+    # ---- dragging rows out ----
+    def path_of(self, item) -> str:
+        """The local path of a row ("" for ".." and for a drive)."""
+        name = item.data(0, Qt.UserRole)
+        if not name or name == ".." or not self.folder:
+            return ""
+        return os.path.join(self.folder, name)
+
+    def supportedDropActions(self):  # noqa: N802 - Qt API
+        # a drag out is a copy: offered a move, Explorer moves the user's file
+        return Qt.CopyAction
+
+    def mimeTypes(self):  # noqa: N802 - Qt API
+        return ["text/uri-list"]
+
+    def mimeData(self, items):  # noqa: N802 - Qt API
+        data = QMimeData()
+        paths = [p for p in (self.path_of(it) for it in items) if p]
+        if paths:
+            data.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        return data
+
+    def startDrag(self, actions):  # noqa: N802 - Qt API
+        self.dragging = True
+        try:
+            super().startDrag(Qt.CopyAction)
+        finally:
+            self.dragging = False
+
+    # ---- drops ----
     def remote_names(self, mime):
         """``(names, refused)`` of a drag: the remote names it carries if it
         comes from this pane's own remote pane (and folder), else ``[]`` — with
@@ -137,23 +430,41 @@ class _LocalView(QTreeView):
             event.ignore()
         return names
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event):  # noqa: N802 - Qt API
         if self.remote_names(event.mimeData())[1]:
             self.refused.emit("Those remote files belong to another session's file "
                               "browser — drop them on the local pane next to it.")
         self._take(event)
 
-    def dragMoveEvent(self, event):
+    def dragMoveEvent(self, event):  # noqa: N802 - Qt API
         self._take(event)
 
-    def dropEvent(self, event):
+    def dropEvent(self, event):  # noqa: N802 - Qt API
         names = self._take(event)
         if names:
             self.remote_dropped.emit(names)
 
 
+class _DriveCombo(QComboBox):
+    """The drives; read again each time the list opens (a USB stick)."""
+
+    def reload(self, current=""):
+        self.blockSignals(True)
+        try:
+            self.clear()
+            self.addItems(drives())
+            self.setCurrentIndex(self.findText(current))     # -1: a share, the list
+        finally:
+            self.blockSignals(False)
+
+    def showPopup(self):  # noqa: N802 - Qt API
+        self.reload(self.currentText())
+        super().showPopup()
+
+
 class LocalPane(QWidget):
-    """This PC. ``cwd`` is the folder shown ("" = the list of drives)."""
+    """This PC. ``cwd`` is the folder shown ("" = the list of drives); it
+    changes at once, its listing follows from a worker."""
     upload_requested = pyqtSignal(list)  # local paths to send to the remote pane
     message = pyqtSignal(str)
     deleted = pyqtSignal(int)            # a delete finished: how many items went
@@ -161,57 +472,88 @@ class LocalPane(QWidget):
     def __init__(self, start_dir: str = "", parent=None):
         super().__init__(parent)
         self.cwd = ""
-        self._jobs = set()               # start-folder check, deletes
+        self._jobs = set()               # listings, start-folder check, deletes
         self._moved = False              # navigated since the pane opened
         self._deleting = False
-        self.model = QFileSystemModel(self)
-        # read-only: the model then refuses drops and in-place edits; renames and
-        # deletes go through the explicit actions below, with confirmation
-        self.model.setReadOnly(True)
-        self.model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
+        self._closing = False
+        self._gen = 0                    # the listing the pane waits for
+        self._entries = {}               # name -> _Entry: the listing on screen
+        self._message = ""               # last error / result, until the next action
+        self._summary = ""
+        self._loading = False
+        self._keep = False               # the listing coming keeps the selection
+        self._after = None               # (selected, current, scroll) to set after it
+        self._fill = None                # [gen, listing, next spec, rows]: building
+        self._watched = ""               # the folder watched for changes
+        self._first_change = 0.0
+        self._go_gen = 0                 # the folder check the pane waits for
+        self._after_base = None
+        self._stale = False              # changed on disk while hidden
+        self._icons = _LocalIcons(self.style())
+        self._fill_timer = QTimer(self)
+        self._fill_timer.setSingleShot(True)
+        self._fill_timer.setInterval(0)
+        self._fill_timer.timeout.connect(self._fill_more)
+        # the folder on screen is watched: what lands in it (a download, a file
+        # saved from another program) shows up by itself
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.directoryChanged.connect(self._changed)
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(_SETTLE_MS)
+        self._settle.timeout.connect(self._settled_change)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        top = QHBoxLayout()
+        lay.setSpacing(6)
+        self.head = QWidget()
+        top = QHBoxLayout(self.head)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+        self.title = pane_title("This PC", "monitor", "blue")
+        self.drive = _DriveCombo()
+        self.drive.setToolTip("Drive")
+        self.drive.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.drive.activated.connect(lambda i: self._drive_picked(self.drive.itemText(i)))
+        self.drive.setVisible(_WINDOWS)
         self.path = QLineEdit(); self.path.returnPressed.connect(self._go)
-        top.addWidget(QLabel("Local:")); top.addWidget(self.path, 1)
-        for label, tip, slot in (
-                ("Up", "Parent folder", self.up),
-                ("Home", "Your user folder", lambda: self.navigate(os.path.expanduser("~"))),
-                ("Desktop", "Desktop", lambda: self._standard(QStandardPaths.DesktopLocation)),
-                ("Downloads", "Downloads", lambda: self._standard(QStandardPaths.DownloadLocation)),
-                ("Drives", "All drives", lambda: self.navigate(""))):
-            button = QPushButton(label); button.setProperty("role", "ghost")
-            button.setToolTip(tip); button.clicked.connect(slot)
-            top.addWidget(button)
-        lay.addLayout(top)
+        self.path.setToolTip("Folder on this PC — type a path and press Enter")
+        up = flat_button("Up", "arrow-up", "accent", "Parent folder (Backspace)")
+        up.clicked.connect(self.up)
+        ref = flat_button("Refresh", "refresh", "green", "List this folder again (F5)")
+        ref.clicked.connect(self.refresh)
+        top.addWidget(self.title); top.addWidget(self.drive)
+        top.addWidget(self.path, 1); top.addWidget(up); top.addWidget(ref)
+        lay.addWidget(self.head)
 
         self.view = _LocalView()
-        self.view.setModel(self.model)
-        self.view.setRootIsDecorated(False)          # a flat list, like the remote pane
-        self.view.setItemsExpandable(False)
-        self.view.setUniformRowHeights(True)
-        self.view.setAllColumnsShowFocus(True)
-        self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.view.setSortingEnabled(True)
-        self.view.sortByColumn(0, Qt.AscendingOrder)
-        header = self.view.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in (1, 2, 3):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        self.view.activated.connect(self._open_index)        # double-click / Enter
+        self.view.header().sortIndicatorChanged.connect(self._resort)
+        self.view.itemActivated.connect(self._open_item)        # double-click / Enter
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._context_menu)
         lay.addWidget(self.view, 1)
 
         self.status = QLabel()
+        self.status.setObjectName("mutedHint")
         self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(self.status)
+        ops, _buttons = ops_row((
+            ("New folder", self.new_folder, "Create a folder here"),
+            ("Open", self.open_selected, "Open the selected item with its program"),
+            ("Rename", self.rename_selected, "Rename the selected item (F2)"),
+        ), self.delete_selected, "Delete the selection (to the recycle bin where "
+                                 "there is one) (Del)")
+        lay.addLayout(ops)
 
-        for keys, slot in (("F5", self.refresh), ("Backspace", self.up),
-                           ("Delete", self.delete_selected), ("F2", self.rename_selected)):
-            QShortcut(QKeySequence(keys), self.view, activated=slot,
+        # one owner per key: two shortcuts on one key that both apply cancel
+        # out (neither fires). Backspace and Delete belong to the list alone,
+        # so the path box keeps them.
+        for keys, owner, slot in (("F5", self, self.refresh), ("Alt+Up", self, self.up),
+                                  ("Backspace", self.view, self.up),
+                                  ("Delete", self.view, self.delete_selected),
+                                  ("F2", self.view, self.rename_selected)):
+            QShortcut(QKeySequence(keys), owner, activated=slot,
                       context=Qt.WidgetWithChildrenShortcut)
         # Start at home. The folder saved last time may be on a share that is
         # gone, and asking Windows about it here hung the window for the SMB
@@ -229,11 +571,17 @@ class LocalPane(QWidget):
 
     def close_pane(self):
         """Drop the workers' results (the owner deletes the pane next)."""
+        self._closing = True
+        self._fill_timer.stop()
+        self._settle.stop()
+        self._watch("")
         close_jobs(self._jobs)
 
     # ---- navigation ----
     def navigate(self, path: str, checked: bool = False) -> bool:
-        """Show *path* ("" = the drives). *checked*: it is known to be a folder."""
+        """Show *path* ("" = the drives). *checked*: it is known to be a folder
+        (else it is looked at here, on the GUI thread: the user's own clicks
+        go through :meth:`go`, or know it is a folder)."""
         path = (path or "").strip()
         if path:
             path = os.path.abspath(os.path.expanduser(path))
@@ -242,65 +590,327 @@ class LocalPane(QWidget):
                 self.path.setText(self.cwd)
                 return False
         self._moved = True
+        self._go_gen += 1                # a folder check still out is too late
         self.cwd = path
-        self.view.setRootIndex(self.model.setRootPath(path))
         self.path.setText(path)
-        self._say("")
+        self.drive.reload(drive_of(path))
+        self._message = ""
+        self._list(keep=False)
         return True
 
+    def go(self, path):
+        """Go to a folder the user named (the path box, a quick link). It is
+        looked at on a worker first: asking about a share that is gone held the
+        window for the network's timeout."""
+        path = (path or "").strip()
+        if not path:
+            self.navigate("")
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        self._moved = True               # the saved start folder is not wanted now
+        self._go_gen += 1
+        gen = self._go_gen
+        self._say(f"Opening {path}…")
+        run_job(self._jobs, lambda: os.path.isdir(path),
+                lambda ok: self._gone_to(gen, path, ok))
+
+    def _gone_to(self, gen, path, ok):
+        if self._closing or gen != self._go_gen:
+            return                       # the user went elsewhere meanwhile
+        if ok:
+            self.navigate(path, checked=True)
+            return
+        self._say(f"Not a folder: {path}")
+        typed = self.path.text().strip()
+        if not typed or os.path.abspath(os.path.expanduser(typed)) == path:
+            self.path.setText(self.cwd)      # (not what was typed since)
+
     def _go(self):
-        self.navigate(self.path.text())
+        self.go(self.path.text())
+
+    def _drive_picked(self, drive):
+        if drive:                        # unread drives fail in the listing
+            self.navigate(drive, checked=True)
+            self.view.setFocus(Qt.OtherFocusReason)
 
     def _standard(self, location):
-        self.navigate(QStandardPaths.writableLocation(location))
+        self.go(QStandardPaths.writableLocation(location))
+
+    def go_home(self):
+        self.go(os.path.expanduser("~"))
+
+    def go_desktop(self):
+        self._standard(QStandardPaths.DesktopLocation)
+
+    def go_downloads(self):
+        self._standard(QStandardPaths.DownloadLocation)
 
     def up(self):
         if not self.cwd:
             return
-        parent = os.path.dirname(self.cwd.rstrip("\\/"))
+        here = self.cwd.rstrip("\\/") or self.cwd
+        parent = os.path.dirname(here)
         # above a drive root ("C:\\") is the list of drives; above "/" is "/"
-        if not parent or os.path.normcase(parent) == os.path.normcase(self.cwd.rstrip("\\/")) \
+        if not parent or os.path.normcase(parent) == os.path.normcase(here) \
                 or parent == self.cwd:
-            parent = "" if os.name == "nt" else "/"
-        self.navigate(parent)
+            parent = "" if _WINDOWS else "/"
+        if parent == self.cwd:
+            return
+        left = os.path.basename(here) if parent else drive_of(self.cwd)
+        self.navigate(parent, checked=True)
+        self._after = (set(), left, None)        # on the folder it came from
 
     def refresh(self):
-        self.navigate(self.cwd)
+        """List the folder again, keeping the selection and the scroll."""
+        self._message = ""
+        self._list(keep=True)
 
-    def _open_index(self, index):
-        path = self.model.filePath(index)
-        if self.model.isDir(index):
-            self.navigate(path)
+    # ---- listing ----
+    def _list(self, keep=False, after=None):
+        """List the folder on a worker. *keep*: the rows on screen stay until the
+        new ones are complete, and their selection and scroll carry over;
+        *after*: ``(selected, current, scroll)`` to set instead."""
+        if self._closing:
+            return
+        self._gen += 1
+        gen, path, order = self._gen, self.cwd, self.view.order
+        native = self._icons.native
+        self._fill = None
+        self._fill_timer.stop()
+        self._loading = True
+        self._keep, self._after = keep, after
+        # the selection when a "select the new name" was queued: if the user
+        # changes it meanwhile, theirs is kept
+        self._after_base = self._selected_names() if after is not None else None
+        if not keep:
+            self.view.clear()
+            self._entries = {}
+            self.view.folder = path
+        self._show()
+        run_job(self._jobs, lambda: _local_listing(path, order, native),
+                lambda result: self._listed(gen, result),
+                lambda msg: self._list_failed(gen, path, msg))
+
+    def _selected_names(self) -> set:
+        return {it.data(0, Qt.UserRole) for it in self.view.selectedItems()}
+
+    def _view_state(self):
+        """(selected names, current name, scroll position) of the list."""
+        current = self.view.currentItem()
+        return ({it.data(0, Qt.UserRole) for it in self.view.selectedItems()},
+                current.data(0, Qt.UserRole) if current is not None else None,
+                self.view.verticalScrollBar().value())
+
+    def _listed(self, gen, listing):
+        if self._closing or gen != self._gen:
+            return                       # an older listing: a newer one is coming
+        self._fill = [gen, listing, 0, []]
+        self._fill_more()
+
+    def _fill_more(self):
+        """Make the rows, a chunk per turn of the event loop (the remote pane
+        does the same: 20,000 rows at once froze the window), then put them in
+        all at once. Until then the list on screen stays as it is — and what
+        the user selects there meanwhile is what stays selected."""
+        if self._closing or self._fill is None:
+            return
+        gen, listing, start, rows = self._fill
+        if gen != self._gen:
+            self._fill = None
+            return
+        specs, path, infos, kinds = listing.specs, listing.path, listing.infos, listing.kinds
+        end = min(len(specs), start + _FILL_CHUNK)
+        icons = self._icons
+        for spec in specs[start:end]:
+            icon = icons.get(spec.is_dir, spec.is_link, infos.get(spec.name),
+                             None if path else kinds.get(spec.name, 0))
+            rows.append(make_row(spec.name, icon, spec.rank, spec.keys, *spec.texts))
+        if end < len(specs):
+            self._fill[2] = end
+            self._fill_timer.start()
+            return
+        self._fill = None
+        if listing.order != self.view.order:     # a column was clicked meanwhile
+            rows = _sorted_rows(rows, *self.view.order)
+        if self._after is not None and not (
+                self._keep and self._selected_names() != self._after_base):
+            state = self._after
+        else:
+            state = self._view_state() if self._keep else None
+        self._entries = {e.name: e for e in listing.entries}
+        self._summary = (listing_summary(listing.entries) if path
+                         else f"{len(listing.entries)} drives")
+        self.view.clear()
+        self.view.folder = path
+        if path:
+            self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS))
+        self.view.addTopLevelItems(rows)
+        self._loading = False
+        self._keep, self._after = False, None
+        self._restore(state)
+        self._show()
+        self._watch(path if listing.watch else "")
+
+    def _restore(self, state):
+        """Select and scroll back to where the list was (a refresh), or put the
+        keyboard on the entry just made or left (Up), else the top."""
+        chosen, current, scroll = state or (set(), None, None)
+        first, picked = None, []
+        for i in range(self.view.topLevelItemCount()):
+            it = self.view.topLevelItem(i)
+            name = it.data(0, Qt.UserRole)
+            if name in chosen:
+                picked.append(i)
+            if name == current:
+                first = it
+        select_rows(self.view, picked)
+        if first is None and self.view.topLevelItemCount():
+            first = self.view.topLevelItem(0)
+        if first is not None:
+            self.view.setCurrentItem(first, 0, QItemSelectionModel.NoUpdate)
+        if scroll is not None:
+            self.view.doItemsLayout()    # the scroll range of the new rows
+            self.view.verticalScrollBar().setValue(scroll)
+        elif first is not None:
+            self.view.scrollToItem(first)
+
+    def _list_failed(self, gen, path, msg):
+        if self._closing or gen != self._gen:
+            return
+        self._loading = False
+        self._keep, self._after = False, None
+        self._entries = {}
+        self.view.clear()
+        self.view.folder = path
+        if path:                         # ".." to get away from here
+            self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS))
+        self._summary = ""
+        self._watch("")
+        self._say(f"Cannot list {path or 'the drives'}: {msg}")
+
+    def _resort(self, column, order):
+        """A column was clicked: re-order the rows (rows still being made are
+        put in order when they come)."""
+        self.view.order = (column, order == Qt.AscendingOrder)
+        reorder_rows(self.view)
+
+    # ---- the folder changing on disk ----
+    def _watch(self, path):
+        """Watch *path* alone ("" = nothing), if it is not watched already. The
+        listing says whether to: a folder on a share is not watched (a watch
+        there can wait on the network); a transfer's end lists it again."""
+        if path == self._watched and (not path or path in self._watcher.directories()):
+            return                       # (Qt drops a folder that was deleted)
+        old = self._watcher.directories()
+        if old:
+            self._watcher.removePaths(old)
+        self._watched = path
+        if path:
+            self._watcher.addPath(path)
+
+    def _changed(self, _path=""):
+        """List again once the folder has settled — or, if it keeps changing,
+        _SETTLE_MAX seconds after the first change."""
+        if self._closing:
+            return
+        now = time.monotonic()
+        if not self._settle.isActive():
+            self._first_change = now
+            self._settle.start()
+        elif now - self._first_change < _SETTLE_MAX:
+            self._settle.start()         # wait for it to settle
+
+    def changed_soon(self):
+        """Something may have changed in the folder (a transfer ended): list it
+        again shortly, keeping the selection."""
+        self._changed()
+
+    def _settled_change(self):
+        if self._closing:
+            return
+        if self.view.dragging or self._loading or self._deleting:
+            self._settle.start()         # not under the user's hands: later
+            return
+        if not self.isVisible():         # another tab is up: when it shows
+            self._stale = True
+            return
+        self._list(keep=True)            # (a message on screen stays)
+
+    def showEvent(self, event):  # noqa: N802 - Qt API
+        super().showEvent(event)
+        if self._stale and not self._closing:
+            self._stale = False
+            self._list(keep=True)
 
     # ---- selection ----
     def selection_paths(self) -> list:
-        rows = self.view.selectionModel().selectedRows(0)
-        return [os.path.normpath(self.model.filePath(i)) for i in rows]
+        """The selected entries' paths (".." never; the drives themselves in
+        the list of drives)."""
+        names = [it.data(0, Qt.UserRole) for it in self.view.selectedItems()]
+        names = [n for n in names if n and n != ".."]
+        if not self.cwd:
+            return names
+        return [os.path.normpath(os.path.join(self.cwd, n)) for n in names]
 
     def _say(self, text):
-        self.status.setText(text)
-        self.status.setVisible(bool(text))
+        self._message = text
+        self._show()
         if text:
             self.message.emit(text)
 
+    def _show(self):
+        if self._message:
+            text = self._message
+        elif self._loading:
+            text = f"Loading {self.cwd or 'the drives'}…"
+        else:
+            text = self._summary
+        self.status.setText(text)
+
     # ---- actions ----
+    def _open_item(self, item, _column=0):
+        name = item.data(0, Qt.UserRole)
+        if name == "..":
+            self.up()
+            return
+        if not self.cwd:                 # a drive
+            self.navigate(name, checked=True)
+            return
+        entry = self._entries.get(name)
+        path = os.path.join(self.cwd, name)
+        if entry is not None and entry.is_dir:
+            self.navigate(path, checked=True)    # a vanished one fails to list
+        elif entry is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_selected(self):
+        paths = self.selection_paths()
+        if len(paths) == 1:
+            entry = self._entries.get(os.path.basename(paths[0]))
+            if not self.cwd or (entry is not None and entry.is_dir):
+                self.navigate(paths[0], checked=True)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(paths[0]))
+        elif not paths:
+            self._say("Select a file or folder to open first.")
+
     def _context_menu(self, pos):
         paths = self.selection_paths()
         menu = QMenu(self)
         if paths and self.cwd:
             menu.addAction("Upload to the remote pane", lambda: self.upload_requested.emit(paths))
         if len(paths) == 1:
-            menu.addAction("Open", lambda: QDesktopServices.openUrl(
-                QUrl.fromLocalFile(paths[0])))
+            menu.addAction("Open", self.open_selected)
         if self.cwd:
             menu.addAction("Show this folder in the file manager",
                            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.cwd)))
             menu.addSeparator()
             menu.addAction("New folder", self.new_folder)
-        if len(paths) == 1:
+        if len(paths) == 1 and self.cwd:
             menu.addAction("Rename (F2)", self.rename_selected)
-        if paths:
+        if paths and self.cwd:
             menu.addAction("Delete", self.delete_selected)
+        if paths:
             menu.addAction("Copy path", lambda: QApplication.clipboard().setText(
                 "\n".join(paths)))
         menu.addSeparator()
@@ -318,9 +928,14 @@ class LocalPane(QWidget):
         except OSError as exc:
             self._say(f"Could not create {name}: {exc}")
             return False
+        self._message = ""
+        self._list(keep=True, after=({name}, name, None))      # on it, alone
         return True
 
     def new_folder(self):
+        if not self.cwd:
+            self._say("New folder: open a folder first (not the drive list).")
+            return
         name, ok = QInputDialog.getText(self, "New folder", "Name:")
         if ok and name.strip():
             self.do_new_folder(name)
@@ -339,11 +954,13 @@ class LocalPane(QWidget):
         except OSError as exc:
             self._say(f"Could not rename: {exc}")
             return False
+        self._message = ""
+        self._list(keep=True, after=({new_name}, new_name, None))
         return True
 
     def rename_selected(self):
         paths = self.selection_paths()
-        if len(paths) != 1:
+        if len(paths) != 1 or not self.cwd:
             return
         old = os.path.basename(paths[0])
         new, ok = QInputDialog.getText(self, "Rename", "New name:", text=old)
@@ -382,6 +999,8 @@ class LocalPane(QWidget):
             f"{_names(paths)}\n\nThey are {left[0][1]}.\n\nDelete them permanently "
             f"instead? This cannot be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if self._closing:                # closed while it asked
+            return
         if answer != QMessageBox.Yes:
             self._delete_done(moved, f"Not deleted (still there): {_names(paths)}")
             return
@@ -398,12 +1017,15 @@ class LocalPane(QWidget):
 
     def _delete_done(self, count, problem):
         self._deleting = False
+        if self._closing:
+            return
+        self._list(keep=True)
         self._say(problem)
         self.deleted.emit(count)
 
     def delete_selected(self):
         paths = self.selection_paths()
-        if not paths:
+        if not paths or not self.cwd:
             return
         where = "moved to the recycle bin" if _HAS_TRASH else "deleted permanently"
         answer = QMessageBox.question(
@@ -413,37 +1035,90 @@ class LocalPane(QWidget):
             self.do_delete(paths)
 
 
+# --------------------------------------------------------------------------- #
+# The page
+# --------------------------------------------------------------------------- #
+# the remote quick links: (label, glyph, folder, tip)
+REMOTE_LINKS = (("Home", "house", ".", "Your login folder on the remote host"),
+                ("/", "folder", "/", "The top of the remote file system"),
+                ("/tmp", "folder", "/tmp", "Temporary files on the remote host"))
+
+
+def _transfer_button(text, glyph, tone, tip) -> QPushButton:
+    """Push or Pull: both the same size, in the colour of the side the files
+    come from (this PC blue, the remote host green)."""
+    button = QPushButton(text)
+    button.setProperty("tone", tone)
+    button.setIcon(glyphs.icon(glyph, tone))
+    button.setToolTip(tip)
+    button.setFixedSize(96, 34)
+    # placed by the button itself: the room a style keeps beside a button is
+    # mirrored for Push (right to left, for its icon), which set the two apart
+    button.setAttribute(Qt.WA_LayoutUsesWidgetRect, True)
+    button.setFocusPolicy(Qt.TabFocus)   # a click keeps the pane's focus
+    return button
+
+
 class FileBrowser(QWidget):
-    """Local pane | transfer buttons | remote pane, over the Transfers panel."""
+    """Quick links | local pane, Push / Pull, remote pane | the Transfers panel."""
     log = pyqtSignal(str)
     notify = pyqtSignal(str, str)        # text, kind — the main window's toasts
+    # (remote folder, local folder): open another Files tab there
+    new_tab_requested = pyqtSignal(str, str)
 
-    def __init__(self, handler, parent=None):
+    def __init__(self, handler, parent=None, *, local_start=None, remote_start=".",
+                 save_start=True):
+        """*local_start* / *remote_start*: the folders to open (default: the
+        local one saved last time, the remote login folder). *save_start*: on
+        close, save the local folder as the next start (not for the extra
+        browsers New tab opens)."""
         super().__init__(parent)
         from . import settings
+        self._save_start = save_start
         self.transfers = TransferLog()
-        self.local = LocalPane(settings.get("local_browser_dir") or "")
-        self.remote = SftpBrowser(handler, transfer_log=self.transfers)
+        if local_start is None:
+            local_start = settings.get("local_browser_dir") or ""
+        self.local = LocalPane(local_start)
+        self.remote = SftpBrowser(handler, transfer_log=self.transfers, start=remote_start)
         self.remote.local_target = lambda: self.local.cwd or None
         self.remote.show_inline_progress = False     # the panel below shows it
         self.remote.log.connect(self.log)
         self.remote.notify.connect(self.notify)
+        # a download into the local folder ended: list it again (a share is
+        # not watched)
+        self.remote.transfer_ended.connect(self._transfer_ended)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._quick_links())
+
+        body = QVBoxLayout()
+        body.setContentsMargins(8, 8, 8, 6)
+        body.setSpacing(6)
+        lay.addLayout(body, 1)
 
         middle = QWidget()
         column = QVBoxLayout(middle)
-        column.setContentsMargins(2, 0, 2, 0)
-        self.upload_btn = QPushButton("Upload  →"); self.upload_btn.setProperty("role", "ok")
-        self.upload_btn.setToolTip("Send the selected local items to the remote folder")
-        self.upload_btn.clicked.connect(lambda: self.upload())
-        self.download_btn = QPushButton("←  Download"); self.download_btn.setProperty("role", "ok")
-        self.download_btn.setToolTip("Fetch the selected remote items into the local folder")
-        self.download_btn.clicked.connect(self.download)
+        column.setContentsMargins(4, 0, 4, 0)
+        column.setSpacing(10)
+        self.push_btn = _transfer_button(
+            "Push", "arrow-right", "blue",
+            "Push: upload the selected local items into the remote folder")
+        self.push_btn.setLayoutDirection(Qt.RightToLeft)   # reads "Push →"
+        self.push_btn.clicked.connect(lambda: self.upload())
+        self.pull_btn = _transfer_button(
+            "Pull", "arrow-left", "green",
+            "Pull: download the selected remote items into the local folder")
+        self.pull_btn.clicked.connect(self.download)
         column.addStretch(1)
-        column.addWidget(self.upload_btn); column.addWidget(self.download_btn)
+        column.addWidget(self.push_btn, 0, Qt.AlignHCenter)
+        column.addWidget(self.pull_btn, 0, Qt.AlignHCenter)
         column.addStretch(1)
 
         panes = QSplitter(Qt.Horizontal)
         panes.setChildrenCollapsible(False)
+        panes.setHandleWidth(4)
         panes.addWidget(self.local); panes.addWidget(middle); panes.addWidget(self.remote)
         panes.setStretchFactor(0, 1); panes.setStretchFactor(1, 0); panes.setStretchFactor(2, 1)
 
@@ -455,9 +1130,15 @@ class FileBrowser(QWidget):
         split.setChildrenCollapsible(False)
         split.addWidget(panes); split.addWidget(self.panel)
         split.setStretchFactor(0, 4); split.setStretchFactor(1, 1)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.addWidget(split)
+        body.addWidget(split, 1)
+
+        delete = "Del Recycle Bin" if _HAS_TRASH else "Del Delete"
+        self.hint = QLabel("Drag files between the panes or in from Explorer   ·   "
+                           "Enter Open   ·   F2 Rename   ·   F5 Refresh   ·   "
+                           f"Backspace Up   ·   {delete}")
+        self.hint.setObjectName("mutedHint")
+        self.hint.setWordWrap(True)
+        body.addWidget(self.hint)
 
         self.local.upload_requested.connect(self.upload)
         self.local.view.remote_dropped.connect(self._download_names)
@@ -465,13 +1146,64 @@ class FileBrowser(QWidget):
         self.local.view.accepts = lambda: self.remote.tree.source
         self.local.view.refused.connect(self.local._say)
 
+    def _quick_links(self) -> QWidget:
+        """The row on top: folders on this PC (blue) on the left, on the remote
+        host (green) and New tab on the right."""
+        bar = QWidget()
+        bar.setObjectName("pageToolbar")
+        bar.setAttribute(Qt.WA_StyledBackground, True)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 4, 10, 4)
+        row.setSpacing(2)
+        label = QLabel("PC folders")
+        label.setObjectName("mutedHint")
+        row.addWidget(label)
+        row.addSpacing(4)
+        for text, glyph, slot in (("Home", "house", self.local.go_home),
+                                  ("Desktop", "monitor", self.local.go_desktop),
+                                  ("Downloads", "download", self.local.go_downloads)):
+            button = flat_button(text, glyph, "blue", f"Open your {text} folder")
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        row.addStretch(1)
+        label = QLabel("Remote folders")
+        label.setObjectName("mutedHint")
+        row.addWidget(label)
+        row.addSpacing(4)
+        self.remote_links = []
+        for text, glyph, folder, tip in REMOTE_LINKS:
+            button = flat_button(text, glyph, "green", tip)
+            button.clicked.connect(lambda _=False, f=folder: self.remote.navigate(f))
+            row.addWidget(button)
+            self.remote_links.append(button)
+        self.remote.add_controls(*self.remote_links)      # locked while it lists
+        self.new_tab_btn = flat_button(
+            "New tab", "plus", "blue",
+            "Open another file browser on this connection, starting in these folders")
+        self.new_tab_btn.clicked.connect(self._request_new_tab)
+        self.new_tab_btn.hide()          # shown where something opens it (showEvent)
+        row.addWidget(self.new_tab_btn)
+        return bar
+
+    def _transfer_ended(self, kind, local):
+        if kind == "download" and self.local.cwd and local and os.path.normcase(
+                os.path.dirname(os.path.abspath(local))) == os.path.normcase(self.local.cwd):
+            self.local.changed_soon()
+
+    def showEvent(self, event):  # noqa: N802 - Qt API
+        super().showEvent(event)
+        self.new_tab_btn.setVisible(self.receivers(self.new_tab_requested) > 0)
+
+    def _request_new_tab(self):
+        self.new_tab_requested.emit(self.remote.cwd, self.local.cwd)
+
     # ---- the two directions ----
     def upload(self, paths=None) -> int:
         """Queue local *paths* (default: the local selection) for upload into the
         remote pane's folder."""
         paths = list(paths) if paths else self.local.selection_paths()
         if not paths:
-            self.local._say("Select the local files or folders to upload first.")
+            self.local._say("Select the local files or folders to push first.")
             return 0
         return self.remote.upload_paths(paths)
 
@@ -479,6 +1211,9 @@ class FileBrowser(QWidget):
         """Queue the remote selection for download into the local pane's folder."""
         if not self.local.cwd:
             self.local._say("Open a local folder to download into first.")
+            return 0
+        if not self.remote._selection():
+            self.remote.hint("Select the remote files or folders to pull first.")
             return 0
         return self.remote.download_to_local_pane()
 
@@ -493,6 +1228,10 @@ class FileBrowser(QWidget):
     def busy(self) -> bool:
         return self.remote.busy
 
+    @property
+    def transferring(self) -> bool:
+        return self.remote.transferring
+
     def rebind(self, handler) -> None:
         """The session reconnected with a new *handler*: carry on over it instead
         of being rebuilt. The transfer queue and history, the open editors (with
@@ -505,7 +1244,8 @@ class FileBrowser(QWidget):
         """Stop everything (the owner deletes the widget next). Safe to call twice."""
         try:
             from . import settings
-            if self.local.cwd and self.local.cwd != settings.get("local_browser_dir"):
+            if self._save_start and self.local.cwd \
+                    and self.local.cwd != settings.get("local_browser_dir"):
                 settings.save({"local_browser_dir": self.local.cwd})
         except Exception:
             pass

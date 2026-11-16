@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QComboBox
+from PyQt5.QtWidgets import QComboBox, QHBoxLayout, QPushButton, QToolButton
 
 
 class HostCombo(QComboBox):
@@ -94,3 +94,67 @@ class HostCombo(QComboBox):
         le = self.lineEdit()
         if le is not None:
             le.setPlaceholderText(value or "")
+
+
+# --------------------------------------------------------------------------- #
+# The file browser's buttons and headings (themed in theme.py)
+# --------------------------------------------------------------------------- #
+def flat_button(text, glyph=None, tone="dim", tip="", name="quickLink") -> QPushButton:
+    """A compact flat button with a glyph (see glyphs.py). A click never takes
+    the keyboard focus to it, so the list's shortcuts keep working after it."""
+    from . import glyphs
+    button = QPushButton(text)
+    button.setObjectName(name)
+    if glyph:
+        button.setIcon(glyphs.icon(glyph, tone))
+    if tip:
+        button.setToolTip(tip)
+    button.setFocusPolicy(Qt.TabFocus)
+    return button
+
+
+def pane_title(text, glyph, tone) -> QToolButton:
+    """A pane heading with its glyph: "This PC", or the remote host. A tool
+    button so the glyph follows theme switches like every other icon; it takes
+    no clicks."""
+    from . import glyphs
+    title = QToolButton()
+    title.setObjectName("paneTitle")
+    title.setText(text)
+    title.setIcon(glyphs.icon(glyph, tone))
+    title.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+    title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    title.setFocusPolicy(Qt.NoFocus)
+    return title
+
+
+def ops_row(actions, delete_slot=None, delete_tip=""):
+    """A pane's row of file operations: *actions* ``(text, slot, tip)`` on the
+    left, a red Delete on the right. Returns ``(layout, buttons)``; the
+    buttons are in order, Delete last."""
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(4)
+    buttons = []
+    for text, slot, tip in actions:
+        button = QPushButton(text)
+        button.setObjectName("paneOp")
+        button.setProperty("role", "ghost")
+        button.setFocusPolicy(Qt.TabFocus)
+        if tip:
+            button.setToolTip(tip)
+        button.clicked.connect(slot)
+        row.addWidget(button)
+        buttons.append(button)
+    row.addStretch(1)
+    if delete_slot is not None:
+        delete = QPushButton("Delete")
+        delete.setObjectName("paneOp")
+        delete.setProperty("role", "danger")
+        delete.setFocusPolicy(Qt.TabFocus)
+        if delete_tip:
+            delete.setToolTip(delete_tip)
+        delete.clicked.connect(delete_slot)
+        row.addWidget(delete)
+        buttons.append(delete)
+    return row, buttons

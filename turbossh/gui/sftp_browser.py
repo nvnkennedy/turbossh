@@ -26,8 +26,8 @@ from collections import deque, namedtuple
 
 import paramiko
 from paramiko.ssh_exception import SSHException
-from PyQt5.QtCore import (QItemSelectionModel, QMimeData, QThread, QTimer,
-                          pyqtSignal, Qt)
+from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QSize,
+                          QThread, QTimer, pyqtSignal, Qt)
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTreeWidget, QTreeWidgetItem, QFileDialog,
@@ -45,7 +45,9 @@ try:
 except ImportError:                      # PyQt5 < 5.11 ships it on its own
     import sip
 
-_COLUMNS = ("Name", "Size", "Modified", "Permissions")
+# the columns of both panes of the Files tab (the local one too)
+_COLUMNS = ("Name", "Size", "Date Modified", "Permissions", "Owner")
+DIR_SIZE = "<DIR>"       # what a folder shows in the Size column
 # what a drag out of the remote list carries: the names of the dragged entries,
 # one per line (the local pane turns a drop of this into downloads)...
 REMOTE_MIME = "application/x-turbossh-remote"
@@ -109,9 +111,25 @@ def kind_problem(ftype, unknown_ok=True) -> str:
     return "is " + _KINDS.get(ftype, "not a regular file")
 
 
-# is_dir / ftype describe the entry AFTER following a symlink; mode stays the
-# entry's own, so the Permissions column still shows a link as one ("lrwxrwxrwx")
-_Entry = namedtuple("_Entry", "name is_dir is_link size mtime mode ftype")
+# is_dir / ftype describe the entry AFTER following a symlink; mode and owner
+# stay the entry's own, so the Permissions column still shows a link as one
+# ("lrwxrwxrwx")
+_Entry = namedtuple("_Entry", "name is_dir is_link size mtime mode ftype owner",
+                    defaults=("",))
+
+
+def _owner(attr) -> str:
+    """Who owns a listed entry: the name from the server's ``ls -l`` style
+    line (SFTP v3 sends one with every entry), else the numeric uid, else ""."""
+    long = getattr(attr, "longname", None) or ""
+    if isinstance(long, bytes):
+        long = long.decode("utf-8", "replace")
+    parts = long.split(None, 4)
+    if (len(parts) >= 4 and len(parts[0]) >= 10 and parts[0][0] in "-dlcbps"
+            and parts[1].isdigit()):
+        return parts[2]
+    uid = getattr(attr, "st_uid", None)
+    return "" if uid is None else str(uid)
 
 
 class _Replies:
@@ -187,7 +205,7 @@ def _list_dir(sftp, path):
                               attr.filename in targets,
                               getattr(target, "st_size", None),
                               getattr(target, "st_mtime", None),
-                              getattr(attr, "st_mode", None), ftype))
+                              getattr(attr, "st_mode", None), ftype, _owner(attr)))
     entries.sort(key=lambda e: (not e.is_dir, (e.name or "").lower()))
     return path, entries
 
@@ -221,6 +239,20 @@ def _perms(mode) -> str:
 
 def _plural(n, word="item") -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def listing_summary(entries) -> str:
+    """"3 folders, 12 files" of a listing's entries."""
+    if not entries:
+        return "Empty folder"
+    folders = sum(1 for e in entries if e.is_dir)
+    files = len(entries) - folders
+    parts = []
+    if folders:
+        parts.append(_plural(folders, "folder"))
+    if files or not folders:
+        parts.append(_plural(files, "file"))
+    return ", ".join(parts)
 
 
 def _some(names, limit=5) -> str:
@@ -413,7 +445,13 @@ def _open_sftp(handler):
     transport = handler.client.get_transport()
     if transport is None or not transport.is_active():
         raise IOError("the SSH connection is closed")
-    chan = transport.open_session(timeout=_SFTP_TIMEOUT)
+    try:
+        chan = transport.open_session(timeout=_SFTP_TIMEOUT)
+    except paramiko.ChannelException as exc:
+        # each file browser uses two channels; a server may allow only a few
+        raise IOError(f"the server refused another channel on this connection "
+                      f"({exc}) — it may allow only a few at a time: close a file "
+                      f"browser tab") from None
     try:
         chan.settimeout(_SFTP_TIMEOUT)
         chan.invoke_subsystem("sftp")
@@ -690,6 +728,8 @@ class _TransferThread(QThread):
             raise IOError(f"Local path does not exist: {local}")
         if os.path.isdir(local):
             return self._put_dir(sftp, local, remote, set())
+        if not os.path.isfile(local):    # a FIFO or a device: a read never ends
+            raise IOError(f"{local} is not a file or a folder")
         _mkdir_p(sftp, posixpath.dirname(remote))
         return self._put_file(sftp, local, remote), 1
 
@@ -773,6 +813,16 @@ class _TransferThread(QThread):
 # --------------------------------------------------------------------------- #
 # Widgets
 # --------------------------------------------------------------------------- #
+def _host_title(handler) -> str:
+    """"user@host" of the connection, for the pane's heading."""
+    config = getattr(handler, "config", None)
+    host = getattr(config, "host", None) or ""
+    user = getattr(config, "username", None) or ""
+    if not host:
+        return "Remote"
+    return f"{user}@{host}" if user else host
+
+
 class _Row(QTreeWidgetItem):
     """A listing row: *rank* keeps ".." on top and folders before files whichever
     way a column is sorted, *keys* are its sort key per column, worked out once.
@@ -815,17 +865,28 @@ def _sorted_rows(rows, column, ascending) -> list:
 _Spec = namedtuple("_Spec", "rank keys name is_dir is_link texts")
 
 
-def _row_specs(entries, order) -> list:
+# the sort keys of the ".." row (one per column)
+PARENT_KEYS = ("", -1, 0, "", "")
+
+
+def _row_specs(entries, order, perms=None, name_key=None) -> list:
     """The rows of a listing, formatted and in display order — on the worker
     thread: formatting the dates of 20,000 entries on the GUI thread was a good
-    part of the time the window froze."""
+    part of the time the window froze. *perms*: mode -> Permissions text
+    (default: ``drwxr-xr-x``); *name_key*: name -> its sort key (default: the
+    name ignoring case)."""
+    perms = perms or _perms
+    name_key = name_key or (lambda name: (name or "").lower())
     specs = []
     for e in entries:
-        perms = _perms(e.mode)
+        mode = perms(e.mode)
+        owner = e.owner or ""
         specs.append(_Spec(1 if e.is_dir else 2,
-                           ((e.name or "").lower(), e.size or 0, e.mtime or 0, perms),
+                           (name_key(e.name), e.size or 0, e.mtime or 0, mode,
+                            owner.lower()),
                            e.name, e.is_dir, e.is_link,
-                           ("" if e.is_dir else _human(e.size), _when(e.mtime), perms)))
+                           (DIR_SIZE if e.is_dir else _human(e.size), _when(e.mtime),
+                            mode, owner)))
     return _sorted_rows(specs, *order)
 
 
@@ -835,7 +896,101 @@ def _listing(link, path, order):
     return path, entries, _row_specs(entries, order), order
 
 
-class _FileTree(QTreeWidget):
+class ListTree(QTreeWidget):
+    """A pane's listing: Name, Size, Date Modified, Permissions, Owner; compact,
+    alternately shaded rows (styled as ``#fileList`` in theme.py); a click on
+    a column sorts by it — in Python, by the pane (:func:`_sorted_rows`), with
+    ".." on top and folders first."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.order = (0, True)           # sort column, ascending
+        self.setObjectName("fileList")
+        self.setHeaderLabels(list(_COLUMNS))
+        self.headerItem().setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+        self.setRootIsDecorated(False)           # a flat list with columns
+        self.setItemsExpandable(False)
+        self.setUniformRowHeights(True)          # big folders lay out fast
+        self.setAllColumnsShowFocus(True)
+        self.setAlternatingRowColors(True)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setIconSize(QSize(16, 16))
+        self.setTextElideMode(Qt.ElideMiddle)    # "firmware…v2.bin" keeps its end
+        head = self.header()
+        head.setStretchLastSection(False)
+        head.setMinimumSectionSize(40)
+        head.setSectionResizeMode(0, QHeaderView.Stretch)
+        # the rest at a width that fits a full date, size and mode; the user
+        # can drag them wider (measuring every row cost time on big folders)
+        self.ensurePolished()
+        metrics = self.fontMetrics()
+        for column, sample in ((1, "999.9 MB"), (2, "2026-09-01 10:00"),
+                               (3, "drwxrwxrwx"), (4, "username")):
+            head.setSectionResizeMode(column, QHeaderView.Interactive)
+            self.setColumnWidth(column, metrics.horizontalAdvance(sample) + 22)
+        head.setSectionsClickable(True)
+        head.setSortIndicatorShown(True)
+        head.setSortIndicator(0, Qt.AscendingOrder)
+
+    def sortByColumn(self, column, order=Qt.AscendingOrder):  # noqa: N802 - Qt API
+        """Through the header's sort indicator, which the pane follows by
+        re-ordering the rows itself — never Qt's per-comparison sort."""
+        self.header().setSortIndicator(column, order)
+
+
+def reorder_rows(tree) -> None:
+    """Put *tree*'s rows in its ``order``, keeping the selection and the
+    current row (they are matched by name)."""
+    root = tree.invisibleRootItem()
+    if not root.childCount():
+        return
+    current = tree.currentItem()
+    current = current.data(0, Qt.UserRole) if current is not None else None
+    chosen = {it.data(0, Qt.UserRole) for it in tree.selectedItems()}
+    rows = _sorted_rows(root.takeChildren(), *tree.order)
+    root.addChildren(rows)
+    select_rows(tree, [i for i, it in enumerate(rows) if it.name in chosen])
+    for it in rows:
+        if it.name == current:
+            tree.setCurrentItem(it, 0, QItemSelectionModel.NoUpdate)
+            break
+
+
+def select_rows(tree, indexes) -> None:
+    """Select the top-level rows at *indexes*, in one go: an item selected at a
+    time is merged against every range selected before it, and thousands
+    took seconds."""
+    model, last = tree.model(), tree.columnCount() - 1
+    selection = QItemSelection()
+    start = previous = None
+    for row in sorted(indexes) + [None]:
+        if row is not None and previous is not None and row == previous + 1:
+            previous = row
+            continue
+        if start is not None:            # a run of rows ends
+            selection.select(model.index(start, 0), model.index(previous, last))
+        start = previous = row
+    if not selection.isEmpty():
+        tree.selectionModel().select(selection, QItemSelectionModel.Select
+                                     | QItemSelectionModel.Rows)
+
+
+def parent_icon():
+    """The ".." row's icon: an arrow up."""
+    from . import glyphs
+    return glyphs.icon("arrow-up", "dim")
+
+
+def make_row(name, icon, rank, keys, *columns):
+    """A listing row; the entry's name is its ``Qt.UserRole``."""
+    it = _Row([name, *columns], rank, keys)
+    it.setIcon(0, icon)
+    it.setData(0, Qt.UserRole, name)
+    it.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+    return it
+
+
+class _FileTree(ListTree):
     """The listing — which also takes local files and folders dragged in from
     Explorer (or from the local pane), and lets its own rows be dragged out. The
     item view's own drag handlers refuse anything that is not its model's data,
@@ -844,16 +999,10 @@ class _FileTree(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.order = (0, True)           # sort column, ascending
         self.source = ""                 # REMOTE_SOURCE_MIME of the rows shown
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
-
-    def sortByColumn(self, column, order=Qt.AscendingOrder):  # noqa: N802 - Qt API
-        """Through the header's sort indicator, which the browser follows by
-        re-ordering the rows itself — never Qt's per-comparison sort."""
-        self.header().setSortIndicator(column, order)
 
     def mimeTypes(self):
         return [REMOTE_MIME]
@@ -907,8 +1056,9 @@ class SftpBrowser(QWidget):
     the Transfers panel and exchanges drags with the local pane."""
     log = pyqtSignal(str)
     notify = pyqtSignal(str, str)        # text, kind (ok / warn / error): toasts
+    transfer_ended = pyqtSignal(str, str)    # kind, local path: done, failed or not
 
-    def __init__(self, handler, parent=None, transfer_log=None):
+    def __init__(self, handler, parent=None, transfer_log=None, start="."):
         super().__init__(parent)
         self.handler = handler
         self.transfers = transfer_log if transfer_log is not None else tl.TransferLog()
@@ -943,41 +1093,33 @@ class SftpBrowser(QWidget):
         self._stop_timer = QTimer(self)  # looks at a cancelled transfer until it stops
         self._stop_timer.timeout.connect(self._abort_stuck)
         self._build_ui()
-        self._list(".")
+        self._list((start or "").strip() or ".")
 
     def _build_ui(self):
+        from .widgets import flat_button, ops_row, pane_title
         lay = QVBoxLayout(self)
-        top = QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        # heading: who, where, Up, Refresh
+        self.head = QWidget()
+        top = QHBoxLayout(self.head)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+        self.title = pane_title(_host_title(self.handler), "server", "green")
+        self.title.setToolTip("The remote host's files, over SFTP")
         self.path = QLineEdit(); self.path.returnPressed.connect(self._go)
-        up = QPushButton("Up"); up.setProperty("role", "ghost"); up.clicked.connect(self._up)
-        home = QPushButton("Home"); home.setProperty("role", "ghost")
-        home.setToolTip("The login folder")
-        home.clicked.connect(lambda: self.navigate("."))
-        root = QPushButton("/"); root.setProperty("role", "ghost")
-        root.setToolTip("The top of the file system")
-        root.clicked.connect(lambda: self.navigate("/"))
-        ref = QPushButton("Refresh"); ref.setProperty("role", "ghost")
+        self.path.setToolTip("Remote folder — type a path and press Enter")
+        up = flat_button("Up", "arrow-up", "accent", "Parent folder (Backspace)")
+        up.clicked.connect(self._up)
+        ref = flat_button("Refresh", "refresh", "green", "List this folder again (F5)")
         ref.clicked.connect(self.refresh)
-        top.addWidget(QLabel("Remote:")); top.addWidget(self.path, 1)
-        top.addWidget(up); top.addWidget(home); top.addWidget(root); top.addWidget(ref)
+        top.addWidget(self.title); top.addWidget(self.path, 1)
+        top.addWidget(up); top.addWidget(ref)
 
         self.tree = _FileTree()
-        self.tree.setHeaderLabels(list(_COLUMNS))
-        self.tree.setRootIsDecorated(False)          # a flat list with columns
-        self.tree.setUniformRowHeights(True)         # big folders lay out fast
-        self.tree.setAllColumnsShowFocus(True)
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         head = self.tree.header()
-        head.setStretchLastSection(False)
-        head.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in (1, 2, 3):
-            head.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        head.setResizeContentsPrecision(200)         # rows measured per column
         # click a column to sort by it (folders stay first, ".." stays on top).
         # The tree's own sorting stays off: the rows are ordered in Python.
-        head.setSectionsClickable(True)
-        head.setSortIndicatorShown(True)
-        head.setSortIndicator(0, Qt.AscendingOrder)
         head.sortIndicatorChanged.connect(self._resort)
         self.tree.itemActivated.connect(self._open_item)     # double-click / Enter
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -996,7 +1138,9 @@ class SftpBrowser(QWidget):
         # Backspace belong to the list alone, so the path box keeps them too.
         for keys, owner, slot in (("F5", self, self.refresh),
                                   ("Delete", self.tree, self._delete),
-                                  ("Backspace", self.tree, self._up)):
+                                  ("Backspace", self.tree, self._up),
+                                  ("Alt+Up", self, self._up),
+                                  ("F2", self.tree, self._rename_selected)):
             QShortcut(QKeySequence(keys), owner, activated=slot,
                       context=Qt.WidgetWithChildrenShortcut)
 
@@ -1015,33 +1159,45 @@ class SftpBrowser(QWidget):
 
         # errors land here as well as in the log dock, which may be hidden
         self.status = QLabel()
+        self.status.setObjectName("mutedHint")
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        ops = QHBoxLayout()
-        self._controls = [self.path, up, home, root, ref, self.tree]  # locked while busy
-        for label, slot, role in (("Download", self._download, "ok"),
-                                   ("Upload", self._upload, None),
-                                   ("Mkdir", self._mkdir, "ghost"),
-                                   ("Rename", self._rename_selected, "ghost"),
-                                   ("Delete", self._delete, "danger")):
-            b = QPushButton(label)
-            if role:
-                b.setProperty("role", role)
-            b.clicked.connect(slot)
-            ops.addWidget(b)
-            self._controls.append(b)
-        self._controls[7].setToolTip("Upload files — for a folder, right-click "
-                                     "or drag it onto the list")
+        ops, buttons = ops_row((
+            ("New folder", self._mkdir, "Create a folder here"),
+            ("Edit", self.edit_selected, "View / edit the selected text file"),
+            ("Rename", self._rename_selected, "Rename the selected item (F2)"),
+            ("Download…", self._download, "Save the selection somewhere on this PC"),
+            ("Upload…", self._upload, "Upload files — for a folder, right-click or "
+                                      "drag it onto the list"),
+        ), self._delete, "Delete the selection on the remote host (Del)")
+        # locked while the list is busy
+        self._controls = [self.path, up, ref, self.tree, *buttons]
 
-        lay.addLayout(top); lay.addWidget(self.tree, 1); lay.addWidget(self.xfer_row)
+        lay.addWidget(self.head); lay.addWidget(self.tree, 1); lay.addWidget(self.xfer_row)
         lay.addWidget(self.status); lay.addLayout(ops)
+
+    def add_controls(self, *widgets):
+        """Lock *widgets* too while the list is busy (the quick links of the
+        dual-pane browser, which navigate this pane)."""
+        self._controls.extend(widgets)
+        for w in widgets:
+            w.setEnabled(not self._busy)
+
+    def go_home(self) -> bool:
+        """List the login folder."""
+        return self.navigate(".")
 
     # --- state ---
     @property
     def busy(self) -> bool:
         """True while a listing, an operation or a transfer is in flight."""
         return bool(self._busy or self._transfer is not None or self._queue)
+
+    @property
+    def transferring(self) -> bool:
+        """True while a transfer is moving or waiting its turn."""
+        return self._transfer is not None or bool(self._queue)
 
     def _show(self):
         self.status.setText(self._busy or self._message or self._summary)
@@ -1055,7 +1211,8 @@ class SftpBrowser(QWidget):
             # session's terminal, which would then get the user's keystrokes.
             # Hold it on the browser itself and give it back afterwards.
             focus = QApplication.focusWidget()
-            if focus is not None and self.isAncestorOf(focus):
+            # (a quick link above the pane is one of the controls too)
+            if focus is not None and (self.isAncestorOf(focus) or focus in self._controls):
                 self._focus_back = focus
                 self.setFocus()
         self._busy = text
@@ -1070,6 +1227,11 @@ class SftpBrowser(QWidget):
     def _error(self, text):
         self._message = f"Error: {text}"
         self.log.emit(f"[ERROR] {text}")
+        self._show()
+
+    def hint(self, text):
+        """Show *text* in the status line until the next action (not logged)."""
+        self._message = text
         self._show()
 
     def _notice(self, text, tag="[OK] "):
@@ -1118,13 +1280,13 @@ class SftpBrowser(QWidget):
             return
         self.cwd, entries, specs, order = result
         self._entries = {e.name: e for e in entries}
-        self._summary = _plural(len(entries))
+        self._summary = listing_summary(entries)
         self.path.setText(self.cwd)
         self.tree.source = f"{self.drag_token}\n{self.cwd}"
         if order != self.tree.order:     # the order was changed meanwhile
             specs = _sorted_rows(specs, *self.tree.order)
         self.tree.clear()
-        top = self._item("..", self._icons[True, False], 0, ("", -1, 0, ""))
+        top = make_row("..", parent_icon(), 0, PARENT_KEYS)
         self.tree.addTopLevelItem(top)
         self._fill = [self._list_gen, specs, 0, top]
         self._fill_more()
@@ -1140,10 +1302,9 @@ class SftpBrowser(QWidget):
             self._fill = None
             return
         end = min(len(specs), start + _FILL_CHUNK)
-        icons, item, select, rows = self._icons, self._item, self._select, []
+        icons, select, rows = self._icons, self._select, []
         for s in specs[start:end]:
-            it = item(s.name, icons[s.is_dir, s.is_link], s.rank, s.keys, *s.texts)
-            it.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            it = make_row(s.name, icons[s.is_dir, s.is_link], s.rank, s.keys, *s.texts)
             if s.name == select:
                 current = it
             rows.append(it)
@@ -1157,8 +1318,12 @@ class SftpBrowser(QWidget):
             self._sort_pending = False
             self._reorder()
         # keep the keyboard's place: the entry that was current (refresh), just
-        # made (mkdir / rename) or just left (Up) — else the top of the list
-        self.tree.setCurrentItem(current)
+        # made (mkdir / rename) or just left (Up), selected — else the top of
+        # the list, where ".." is only current (a selected ".." is no choice)
+        if current.data(0, Qt.UserRole) == "..":
+            self.tree.setCurrentItem(current, 0, QItemSelectionModel.NoUpdate)
+        else:
+            self.tree.setCurrentItem(current)
         self.tree.scrollToItem(current)
         self._settled()
 
@@ -1172,18 +1337,7 @@ class SftpBrowser(QWidget):
         self._reorder()
 
     def _reorder(self):
-        root = self.tree.invisibleRootItem()
-        if not root.childCount():
-            return
-        current = self._current_name()
-        chosen = {it.data(0, Qt.UserRole) for it in self.tree.selectedItems()}
-        rows = _sorted_rows(root.takeChildren(), *self.tree.order)
-        root.addChildren(rows)
-        for it in rows:
-            if it.name in chosen:
-                it.setSelected(True)
-            if it.name == current:
-                self.tree.setCurrentItem(it, 0, QItemSelectionModel.NoUpdate)
+        reorder_rows(self.tree)
 
     def _on_list_fail(self, msg):
         if self._closing:
@@ -1199,13 +1353,6 @@ class SftpBrowser(QWidget):
         if self._again:
             self._again = False
             self._relist()
-
-    @staticmethod
-    def _item(name, icon, rank, keys, *columns):
-        it = _Row([name, *columns], rank, keys)
-        it.setIcon(0, icon)
-        it.setData(0, Qt.UserRole, name)
-        return it
 
     def _ctx_menu(self, pos):
         entries = self._selection()
@@ -1565,7 +1712,10 @@ class SftpBrowser(QWidget):
     def _on_transfer_finished(self):
         if self._closing:
             return
+        job = self._transfer.job if self._transfer is not None else None
         self._transfer = None
+        if job is not None:
+            self.transfer_ended.emit(job.kind, job.local)
         self._pump()
 
     def _keep_or_replace(self, names, exists, where) -> list:
@@ -1676,6 +1826,7 @@ class SftpBrowser(QWidget):
         if self._closing or handler is None:
             return
         self.handler = handler
+        self.title.setText(_host_title(handler))
         old = (self._remote, self._xfer)
         self._remote, self._xfer = _OwnSftp(handler), _OwnSftp(handler)
         for link in old:

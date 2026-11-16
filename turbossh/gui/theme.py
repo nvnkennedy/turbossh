@@ -226,10 +226,200 @@ def _arrow_image(name: str) -> str:
         return ""
 
 
+ON_ACCENT = "#042830"     # text / marks drawn on the accent colour
+
+# image files written during this run, by file name (see _png)
+_PNGS_WRITTEN: set = set()
+
+
+def _mix(a: str, b: str, amount: float) -> str:
+    """Colour *a* moved *amount* (0..1) of the way to colour *b*."""
+    from PyQt5.QtGui import QColor
+    ca, cb = QColor(a), QColor(b)
+    return QColor(round(ca.red() + (cb.red() - ca.red()) * amount),
+                  round(ca.green() + (cb.green() - ca.green()) * amount),
+                  round(ca.blue() + (cb.blue() - ca.blue()) * amount)).name()
+
+
+def _png(file_name: str, draw) -> str:
+    """Write ``file_name`` (16 px) and its ``@2x`` twin (32 px) to the cache
+    folder, drawn by ``draw(painter, side)``, and return the stylesheet url
+    path ("" if they cannot be written — the rule then goes without its
+    image). Drawn once per run."""
+    import os
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QImage, QPainter
+    try:
+        from .. import paths
+        cache = paths.state_path("cache")
+        path = os.path.join(cache, file_name)
+        if file_name in _PNGS_WRITTEN and os.path.exists(path):
+            return path.replace("\\", "/")
+        os.makedirs(cache, exist_ok=True)
+        stem, ext = os.path.splitext(path)
+        for side, target in ((16, path), (32, f"{stem}@2x{ext}")):
+            img = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
+            img.fill(Qt.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            draw(p, side)
+            p.end()
+            if not img.save(target, "PNG"):
+                return ""
+        _PNGS_WRITTEN.add(file_name)
+        return path.replace("\\", "/")
+    except Exception:
+        return ""
+
+
+def _native_close_glyph(side: int):
+    """The current style's own close glyph (its title-bar ×) at *side* px, as
+    a QImage — None without a QApplication or when the style has none."""
+    from PyQt5.QtWidgets import QApplication, QStyle
+    if QApplication.instance() is None:
+        return None
+    try:
+        pm = QApplication.style().standardIcon(QStyle.SP_TitleBarCloseButton).pixmap(side, side)
+    except Exception:
+        return None
+    if pm.isNull():
+        return None
+    img = pm.toImage()
+    if img.width() > side or img.height() > side:     # a high-DPI pixmap: 2x
+        from PyQt5.QtCore import Qt
+        img = img.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    img.setDevicePixelRatio(1.0)
+    # no visible pixel: nothing to recolour
+    if not any(img.pixelColor(x, y).alpha() > 40
+               for y in range(img.height()) for x in range(img.width())):
+        return None
+    return img
+
+
+def close_glyph(side: int, color: str):
+    """A *side* px QImage of the close glyph: the style's own (its title-bar
+    ×) recoloured to *color* — Qt draws it dark grey, which vanished on the
+    dark themes — or, if the style has none, a plain ×."""
+    from PyQt5.QtCore import QPointF, QRect, Qt
+    from PyQt5.QtGui import QColor, QImage, QPainter, QPen
+    img = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    glyph = _native_close_glyph(side)
+    if glyph is not None:
+        # at its own size, centred
+        p.drawImage(QRect((side - glyph.width()) // 2, (side - glyph.height()) // 2,
+                          glyph.width(), glyph.height()), glyph)
+        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        p.fillRect(0, 0, side, side, QColor(color))
+    else:
+        pen = QPen(QColor(color))
+        pen.setWidthF(side / 9.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        lo, hi = side * 0.3, side * 0.7
+        p.drawLine(QPointF(lo, lo), QPointF(hi, hi))
+        p.drawLine(QPointF(hi, lo), QPointF(lo, hi))
+    p.end()
+    return img
+
+
+def close_color(name: str = None, hover: bool = False) -> str:
+    """The colour of the close glyph on a tab of theme *name*: near the text
+    colour, so it is plain to see; white on the red of a hovered button."""
+    if hover:
+        return "#ffffff"
+    c = THEMES.get(name or current_name(), _DARK)
+    return _mix(c["text"], c["tab"], 0.15)
+
+
+def _close_image(color: str, tag: str) -> str:
+    """The tab close button's image (:func:`close_glyph`) in *color*."""
+    def draw(p, side):
+        p.drawImage(0, 0, close_glyph(side, color))
+    return _png(f"close-{tag}-{color.lstrip('#')}.png", draw)
+
+
+def _check_image(color: str) -> str:
+    """The tick of a checked checkbox (a stylesheet cannot draw one)."""
+    from PyQt5.QtCore import QPointF, Qt
+    from PyQt5.QtGui import QColor, QPen
+
+    def draw(p, side):
+        pen = QPen(QColor(color))
+        pen.setWidthF(side / 7.0)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        s = side / 16.0
+        p.drawPolyline(QPointF(3.5 * s, 8.5 * s), QPointF(6.5 * s, 11.5 * s),
+                       QPointF(12.5 * s, 4.5 * s))
+    return _png(f"check-{color.lstrip('#')}.png", draw)
+
+
+def _dot_image(color: str) -> str:
+    """The dot of a checked radio button."""
+    from PyQt5.QtCore import QPointF, Qt
+    from PyQt5.QtGui import QColor
+
+    def draw(p, side):
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawEllipse(QPointF(side / 2.0, side / 2.0), side * 0.22, side * 0.22)
+    return _png(f"dot-{color.lstrip('#')}.png", draw)
+
+
+def _css_url(path: str) -> str:
+    """``url('path')`` — in double quotes if the path has an apostrophe (a
+    home folder like C:/Users/O'Brien)."""
+    quote = '"' if "'" in path else "'"
+    return f"url({quote}{path}{quote})"
+
+
+def _image_rule(url: str) -> str:
+    """``image: url(...)`` — or nothing if the image could not be made (an
+    empty url() is invalid, and Qt then paints its own fallback on top)."""
+    return f"image: {_css_url(url)};" if url else ""
+
+
+def _tone_rules(c: dict, name: str) -> str:
+    """Push / Pull and the other buttons tinted with a tone (``setProperty
+    ("tone", "blue")``): a wash of the tone, readable text, a firmer edge."""
+    from .glyphs import tone_color
+    light = is_light(name)
+    rules = []
+    for tone in ("blue", "green"):
+        hue = tone_color(tone, name)
+        wash = _mix(c["panel"], hue, 0.22 if light else 0.30)
+        edge = _mix(c["panel"], hue, 0.55)
+        hover = _mix(c["panel"], hue, 0.32 if light else 0.42)
+        rules.append(
+            f'QPushButton[tone="{tone}"] {{ background: {wash}; color: {c["text"]};'
+            f' border: 1px solid {edge}; border-radius: 7px; font-weight: 700; }}\n'
+            f'    QPushButton[tone="{tone}"]:hover {{ background: {hover}; border-color: {hue}; }}\n'
+            f'    QPushButton[tone="{tone}"]:pressed {{ background: {edge}; }}\n'
+            f'    QPushButton[tone="{tone}"]:disabled {{ background: {c["panel"]};'
+            f' color: {c["dim"]}; border-color: {c["border"]}; }}')
+    return "\n    ".join(rules)
+
+
 def stylesheet(name: str = "dark") -> str:
     c = THEMES.get(name, _DARK)
     atext = accent_text(name)        # accent that's readable as text on this bg
     arrow = _arrow_image(name)
+    light = is_light(name)
+    close = _image_rule(_close_image(close_color(name), "normal"))
+    close_hover = _image_rule(_close_image(close_color(name, hover=True), "hover"))
+    check = _image_rule(_check_image(ON_ACCENT))
+    dot = _image_rule(_dot_image(ON_ACCENT))
+    # ticked but disabled: a muted accent, the mark in the text colour
+    muted = _mix(ACCENT, c['panel'], 0.5)
+    check_off = _image_rule(_check_image(c['text']))
+    dot_off = _image_rule(_dot_image(c['text']))
+    # an unticked box: an edge that stands out from the field it sits on
+    box_edge = _mix(c["input"], c["text"], 0.62 if light else 0.58)
+    tones = _tone_rules(c, name)
     return f"""
     QWidget {{ background: {c['win']}; color: {c['text']}; font-size: 9.5pt; }}
     QMainWindow::separator {{ background: {c['border']}; width: 1px; height: 1px; }}
@@ -292,7 +482,7 @@ def stylesheet(name: str = "dark") -> str:
         width: 24px; border-left: 1px solid {c['border']};
         border-top-right-radius: 7px; border-bottom-right-radius: 7px; }}
     QComboBox::drop-down:hover {{ background: {c['raised']}; }}
-    QComboBox::down-arrow {{ image: url('{arrow}'); width: 13px; height: 13px; }}
+    QComboBox::down-arrow {{ image: {_css_url(arrow)}; width: 13px; height: 13px; }}
     QComboBox QAbstractItemView, QListView {{
         background: {c['raised']}; color: {c['text']}; border: 1px solid {c['border']};
         selection-background-color: {ACCENT}; selection-color: #042830; outline: 0;
@@ -326,7 +516,13 @@ def stylesheet(name: str = "dark") -> str:
     }}
     QTabBar::tab:selected {{ background: {c['panel']}; color: {atext}; font-weight: 700; }}
     QTabBar::tab:hover {{ color: {c['text']}; }}
-    QTabBar::close-button {{ subcontrol-position: right; }}
+    QTabBar::close-button {{ {close} subcontrol-position: right; border-radius: 4px;
+        margin: 1px; padding: 1px; }}
+    QTabBar::close-button:hover {{ {close_hover} background: {DANGER}; }}
+    QTabBar::close-button:pressed {{ {close_hover} background: {_mix(DANGER, '#000000', 0.25)}; }}
+    QToolButton#innerTabClose {{ background: transparent; border: none; border-radius: 4px;
+        padding: 1px; margin: 0; }}
+    QToolButton#innerTabClose:hover {{ background: {DANGER}; border: none; }}
     QTabBar::scroller {{ width: 28px; }}
     QSplitter::handle {{ background: {c['border']}; }}
     QSplitter::handle:hover {{ background: {ACCENT}; }}
@@ -334,15 +530,21 @@ def stylesheet(name: str = "dark") -> str:
     QSplitter::handle:vertical {{ height: 6px; }}
     QCheckBox, QRadioButton {{ background: transparent; color: {c['text']}; spacing: 7px; }}
     QRadioButton {{ padding-right: 14px; }}
-    QCheckBox::indicator, QRadioButton::indicator {{ width: 17px; height: 17px;
-        border: 2px solid {c['dim']}; background: {c['input']}; }}
+    QCheckBox::indicator, QRadioButton::indicator {{ width: 16px; height: 16px;
+        border: 2px solid {box_edge}; background: {c['input']}; }}
     QCheckBox::indicator {{ border-radius: 4px; }}
-    QRadioButton::indicator {{ border-radius: 9px; }}
+    QRadioButton::indicator {{ border-radius: 10px; }}
     QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border-color: {ACCENT}; }}
-    QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT};
-        image: none; }}
-    QRadioButton::indicator:checked {{ background: {ACCENT}; border: 4px solid {c['input']};
-        outline: 2px solid {ACCENT}; }}
+    QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; {check} }}
+    QCheckBox::indicator:checked:hover {{ background: {ACCENT_2}; border-color: {ACCENT_2}; }}
+    QRadioButton::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; {dot} }}
+    QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+        border-color: {c['border']}; background: {c['panel']}; }}
+    QCheckBox::indicator:checked:disabled {{ background: {muted}; border-color: {muted};
+        {check_off} }}
+    QRadioButton::indicator:checked:disabled {{ background: {muted}; border-color: {muted};
+        {dot_off} }}
+    QCheckBox:disabled, QRadioButton:disabled {{ color: {c['dim']}; }}
     QStatusBar {{ background: {c['ribbon']}; color: {c['dim']}; border-top: 1px solid {c['border']}; }}
     QProgressBar {{ border: 1px solid {c['border']}; border-radius: 6px; background: {c['input']};
         text-align: center; color: {c['text']}; height: 14px; }}
@@ -364,6 +566,29 @@ def stylesheet(name: str = "dark") -> str:
     QToolTip {{ background: {c['raised']}; color: {c['text']}; border: 1px solid {ACCENT};
         padding: 4px 7px; }}
     QDialog {{ background: {c['win']}; }}
+
+    /* ---- the Files tab (file_browser.py / sftp_browser.py) ---- */
+    QWidget#pageToolbar {{ background: {c['ribbon']}; border-bottom: 1px solid {c['border']}; }}
+    QLabel#mutedHint {{ color: {c['dim']}; font-size: 8.5pt; }}
+    QPushButton#quickLink {{ background: transparent; color: {c['text']};
+        border: 1px solid transparent; border-radius: 6px; padding: 3px 8px; font-weight: 600; }}
+    QPushButton#quickLink:hover {{ background: {c['raised']}; border-color: {c['border']}; }}
+    QPushButton#quickLink:pressed {{ background: {c['sel']}; }}
+    QPushButton#quickLink:disabled {{ background: transparent; color: {c['dim']}; }}
+    QPushButton#paneOp {{ padding: 4px 9px; }}
+    QToolButton#paneTitle {{ background: transparent; border: none; color: {c['text']};
+        padding: 2px 4px 2px 0; font-weight: 700; }}
+    QTreeWidget#fileList {{ background: {c['panel']}; alternate-background-color: {c['raised']};
+        color: {c['text']}; border: 1px solid {c['border']}; border-radius: 6px;
+        selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
+    QTreeWidget#fileList::item {{ padding: 1px 2px; border: none; }}
+    QTreeWidget#fileList::item:hover {{ background: {c['sel']}; }}
+    QTreeWidget#fileList::item:selected {{ background: {ACCENT}; color: {ON_ACCENT}; }}
+    QTreeWidget#fileList QHeaderView::section {{ background: {c['panel']}; color: {c['dim']};
+        padding: 4px 6px; border: none; border-bottom: 1px solid {c['border']};
+        font-weight: 600; font-size: 8.5pt; }}
+    QTreeWidget#fileList QHeaderView::section:hover {{ color: {c['text']}; }}
+    {tones}
     """
 
 

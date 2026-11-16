@@ -71,6 +71,7 @@ turbossh/
     ├── toast.py           corner notifications
     ├── logs_tab.py        the live-log viewer (level colours, find)
     ├── theme.py           dark/light stylesheet
+    ├── glyphs.py          the file browser's small vector icons (theme-following)
     └── updater.py         in-app "check for updates"
 ```
 

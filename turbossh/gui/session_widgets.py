@@ -9,15 +9,15 @@ from __future__ import annotations
 import socket
 import time
 
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLabel, QTabWidget)
+                             QLabel, QTabWidget, QTabBar, QToolButton, QMessageBox)
 
 from ..config import SSHConfig
 from ..core import SSHHandler
 from ..serial_handler import SerialHandler
 from ..results import OperationResult
-from . import qtutil
+from . import glyphs, qtutil
 from .terminal import ReaderThread, Writer
 from .vt100 import Vt100Terminal
 from .file_browser import FileBrowser
@@ -211,6 +211,9 @@ class SshSessionWidget(QWidget):
         self.inner.addTab(term_page, "Terminal")
 
         # --- SFTP tab (filled after connect) ---
+        # more file browsers on the connection, opened by "New tab" (closable)
+        self._more_files = []
+        self._files_opened = 1
         self.sftp_page = QWidget()
         QVBoxLayout(self.sftp_page).addWidget(QLabel("Connecting…"))
         self.inner.addTab(self.sftp_page, "SFTP")
@@ -312,17 +315,19 @@ class SshSessionWidget(QWidget):
         # populate the SFTP tab — never let an SFTP error break the session
         rebind = getattr(self.sftp_page, "rebind", None)
         if callable(rebind):
-            # a reconnect: the browser keeps its queue, transfer history and
-            # open editors, and just carries on over the new connection
-            try:
-                rebind(handler)
-            except Exception as exc:
-                self.log.emit(f"[ERROR] SFTP browser: {exc}")
+            # a reconnect: the browsers keep their queues, transfer history and
+            # open editors, and just carry on over the new connection
+            for page in [self.sftp_page, *self._more_files]:
+                try:
+                    page.rebind(handler)
+                except Exception as exc:
+                    self.log.emit(f"[ERROR] SFTP browser: {exc}")
             return
         try:
             browser = FileBrowser(handler)        # local | remote + transfers
             browser.log.connect(self.log)
             browser.notify.connect(self.notify)
+            browser.new_tab_requested.connect(self.add_files_tab)
             idx = self.inner.indexOf(self.sftp_page)
             self.inner.removeTab(idx)
             self._discard_sftp_page()
@@ -330,6 +335,62 @@ class SshSessionWidget(QWidget):
             self.inner.insertTab(idx, browser, "SFTP")
         except Exception as exc:
             self.log.emit(f"[ERROR] SFTP browser unavailable: {exc}")
+
+    def add_files_tab(self, remote_dir=".", local_dir=None):
+        """Another file browser on this connection (its New tab button), in
+        *remote_dir* and *local_dir*, as a tab of its own with a close button.
+        Returns it (None if there is no connection)."""
+        if self._closed or self.handler is None:
+            return None
+        try:
+            browser = FileBrowser(self.handler, local_start=local_dir or "",
+                                  remote_start=remote_dir or ".", save_start=False)
+        except Exception as exc:
+            self.log.emit(f"[ERROR] SFTP browser unavailable: {exc}")
+            return None
+        browser.log.connect(self.log)
+        browser.notify.connect(self.notify)
+        browser.new_tab_requested.connect(self.add_files_tab)
+        self._more_files.append(browser)
+        self._files_opened += 1
+        at = self.inner.indexOf(self.logs_tab)
+        index = self.inner.insertTab(at if at >= 0 else self.inner.count(), browser,
+                                     f"SFTP {self._files_opened}")
+        close = QToolButton()
+        close.setObjectName("innerTabClose")
+        close.setIcon(glyphs.close_icon())
+        close.setAutoRaise(True)
+        close.setFixedSize(18, 18)
+        close.setFocusPolicy(Qt.NoFocus)
+        close.setToolTip("Close this file browser")
+        close.clicked.connect(lambda: self.close_files_tab(browser))
+        self.inner.tabBar().setTabButton(index, QTabBar.RightSide, close)
+        self.inner.setCurrentIndex(index)
+        return browser
+
+    def close_files_tab(self, browser, ask=True) -> bool:
+        """Close a file browser opened by New tab — asking first while it still
+        has transfers to finish (closing cancels them)."""
+        if browser not in self._more_files:
+            return False
+        if ask and browser.transferring and QMessageBox.question(
+                self, "Close file browser",
+                "This file browser is still transferring files.\n\n"
+                "Close it and cancel the transfers?") != QMessageBox.Yes:
+            return False
+        if browser not in self._more_files:      # the session closed meanwhile
+            return False
+        self._more_files.remove(browser)
+        try:
+            browser.close_browser()
+        except Exception:
+            pass
+        index = self.inner.indexOf(browser)
+        if index >= 0:
+            self.inner.removeTab(index)
+        browser.setParent(None)
+        browser.deleteLater()
+        return True
 
     def _discard_sftp_page(self):
         """Close and delete the page that is being replaced (removeTab only
@@ -527,6 +588,12 @@ class SshSessionWidget(QWidget):
                 closer()
             except Exception:
                 pass
+        for page in self._more_files:
+            try:
+                page.close_browser()
+            except Exception:
+                pass
+        self._more_files = []
         try:
             self.term.cleanup()
         except Exception:

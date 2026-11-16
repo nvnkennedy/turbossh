@@ -450,6 +450,63 @@ def test_a_reconnect_rebinds_the_sftp_page_instead_of_rebuilding_it(ssh_tab):
     assert ssh_tab.inner.indexOf(page) >= 0
 
 
+def test_new_tab_adds_a_closable_file_browser_that_follows_reconnects(ssh_tab, monkeypatch,
+                                                                    tmp_path):
+    from PyQt5.QtWidgets import QMessageBox, QTabBar
+    from turbossh.gui.file_browser import FileBrowser
+    rebound, closed, asked = [], [], []
+    monkeypatch.setattr(FileBrowser, "rebind", lambda self, h: rebound.append((self, h)))
+    assert ssh_tab.add_files_tab("/", str(tmp_path)) is None     # not connected yet
+    _, first = ssh_tab.connect_fake()
+    extra = ssh_tab.add_files_tab("/var", str(tmp_path))
+    index = ssh_tab.inner.indexOf(extra)
+    assert ssh_tab.inner.tabText(index) == "SFTP 2"
+    assert ssh_tab.inner.currentWidget() is extra
+    assert ssh_tab.inner.tabBar().tabButton(index, QTabBar.RightSide) is not None
+    assert ssh_tab.inner.indexOf(ssh_tab.logs_tab) == index + 1   # Logs stays last
+    # its own New tab opens a third, numbered on
+    extra.new_tab_requested.emit("/", str(tmp_path))
+    third = ssh_tab._more_files[-1]
+    assert ssh_tab.inner.tabText(ssh_tab.inner.indexOf(third)) == "SFTP 3"
+
+    _, second = ssh_tab.connect_fake()                   # a reconnect
+    assert sorted(id(page) for page, h in rebound if h is second) == \
+        sorted([id(extra), id(third)])
+
+    # closing one that still transfers asks first
+    monkeypatch.setattr(FileBrowser, "transferring", property(lambda self: True))
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: (asked.append(a[2]), QMessageBox.No)[1])
+    assert not ssh_tab.close_files_tab(third)
+    assert asked and ssh_tab.inner.indexOf(third) >= 0
+    real_close = FileBrowser.close_browser
+    monkeypatch.setattr(FileBrowser, "close_browser", lambda self: closed.append(self))
+    try:
+        assert ssh_tab.close_files_tab(third, ask=False)
+        assert ssh_tab.inner.indexOf(third) == -1 and closed == [third]
+        ssh_tab.close_session()                          # takes the rest with it
+        assert closed == [third, extra] and ssh_tab._more_files == []
+    finally:
+        for page in (third, extra):                      # their workers, for real
+            real_close(page)
+
+
+def test_a_session_closed_while_closing_a_file_tab_asks_is_no_error(ssh_tab, monkeypatch,
+                                                                   tmp_path):
+    from PyQt5.QtWidgets import QMessageBox
+    from turbossh.gui.file_browser import FileBrowser
+    ssh_tab.connect_fake()
+    extra = ssh_tab.add_files_tab("/", str(tmp_path))
+    monkeypatch.setattr(FileBrowser, "transferring", property(lambda self: True))
+
+    def session_closes_meanwhile(*args, **kwargs):
+        ssh_tab.close_session()          # e.g. through the control API
+        return QMessageBox.Yes
+    monkeypatch.setattr(QMessageBox, "question", session_closes_meanwhile)
+    assert ssh_tab.close_files_tab(extra) is False
+    assert ssh_tab._more_files == []
+
+
 def test_a_shell_that_exits_is_not_reconnected(ssh_tab):
     """A nologin / ForceCommand account (the shell ends at once) looped connect /
     close with no delay, and a deliberate `exit` reconnected too."""

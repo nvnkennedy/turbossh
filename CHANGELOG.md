@@ -2,6 +2,44 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## Unreleased
+
+The Files tab looks and works like TurboADB's; tab close buttons and check
+boxes are plain to see in every theme.
+
+### Changed — the Files tab
+- **Laid out like TurboADB's Files tab.** Quick links along the top: Home,
+  Desktop and Downloads on this PC, and the remote home, `/` and `/tmp`. Each
+  pane has a heading — "This PC" with a drive box, or `user@host` — with its
+  path, Up and Refresh, and its file operations underneath (New folder, Open
+  or Edit, Rename, Delete).
+- **Both panes list Name, Size, Date Modified, Permissions and Owner**, in
+  compact, alternately shaded rows. Folders show `<DIR>`, and `..` on top leads
+  up, also on this PC. The owner comes from the server's listing.
+- **Push → and ← Pull** between the panes (blue and green, the colour of the
+  side the files come from) replace Upload and Download.
+- **New tab** opens another file browser on the same connection, starting in
+  the same folders. It gets a close button, follows a reconnect, and asks before
+  it is closed with transfers still running.
+- The PC pane is read on a worker thread and follows the folder: a download or
+  a file saved by another program shows up by itself, and the selection stays
+  (what you select while it lists again is what stays selected). A typed path,
+  a quick link or the drive box never makes the window wait on a share that
+  has gone. As before, it shows folders and files only, without hidden ones,
+  in natural order ("file2" before "file10"). Double-click (or Open) opens a
+  file with its program. A drag out to Explorer is always a copy, never a move.
+- A file browser the server refuses a channel to says so ("the server refused
+  another channel… close a file browser tab") instead of a bare
+  ChannelException; each browser uses two.
+- An upload of a FIFO or a device file is refused instead of reading for ever.
+
+### Fixed — themes
+- **Tab close buttons are visible in the dark themes.** They are the style's
+  own close glyph, recoloured to the theme's text colour, and turn red under
+  the mouse.
+- **Check boxes and radio buttons show their state clearly**: a firmer edge
+  when not ticked, and a tick (or dot) on the accent colour when ticked.
+
 ## 2.2.0 — 2026-11-15
 
 Folder transfers with symbolic links: the same result whatever order a server
