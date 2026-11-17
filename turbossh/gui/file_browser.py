@@ -24,12 +24,15 @@ import re
 import shutil
 import stat
 import string
+import struct
 import time
 
+from collections import OrderedDict
+
 from PyQt5.QtCore import (QDir, QDirIterator, QFile, QFileInfo, QFileSystemWatcher,
-                          QItemSelectionModel, QMimeData, QStandardPaths, Qt, QTimer,
-                          QUrl, pyqtSignal)
-from PyQt5.QtGui import QDesktopServices, QGuiApplication, QKeySequence
+                          QItemSelectionModel, QMimeData, QPoint, QStandardPaths, Qt,
+                          QTimer, QUrl, pyqtSignal)
+from PyQt5.QtGui import QDesktopServices, QGuiApplication, QIcon, QKeySequence
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                              QFileIconProvider, QHBoxLayout, QInputDialog, QLabel,
                              QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut,
@@ -152,6 +155,11 @@ def drive_of(path) -> str:
 _DISKS = (2, 3, 5, 6)
 _ALWAYS_THERE = (3, 6)
 _REMOTE_DRIVE = 4
+_MAX_SHORTCUT_ICONS = 64     # shortcuts of one folder that get the system's
+                             # icon (each takes Qt ~5 ms to read on the worker)
+# FILE_ATTRIBUTE_OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS: a placeholder
+# (OneDrive "online only") that reading would download
+_NOT_HERE = 0x1000 | 0x40000 | 0x400000
 
 
 def drive_type(root) -> int:
@@ -242,10 +250,11 @@ def _hidden(entry, lst) -> bool:
     return entry.name.startswith(".")
 
 
-def scan_folder(path) -> list:
+def scan_folder(path, attributes=None) -> list:
     """The entries of the local folder *path* (``_Entry`` rows; "" = the drives):
     its folders and files, hidden ones left out. A link shows what it points
-    at. Raises OSError if the folder cannot be read."""
+    at. *attributes*: a dict to fill with each entry's Windows file attributes.
+    Raises OSError if the folder cannot be read."""
     if not path:
         return [_Entry(d, True, False, None, None, None, stat.S_IFDIR) for d in drives()]
     entries = []
@@ -259,6 +268,8 @@ def scan_folder(path) -> list:
                 continue                 # gone meanwhile
             if _hidden(item, lst):
                 continue
+            if attributes is not None:
+                attributes[item.name] = getattr(lst, "st_file_attributes", 0)
             is_link = stat.S_ISLNK(lst.st_mode)
             st = lst
             if is_link:
@@ -294,15 +305,16 @@ def _local_listing(path, order, native=False) -> _Listing:
     and a fresh QFileInfo would read the disk on the GUI thread then — for a
     network drive that went away, for the network's timeout. Rows on a share
     get the style's icons instead."""
-    entries = scan_folder(path)
+    attributes = {}
+    entries = scan_folder(path, attributes)
     kinds, shown = {}, []
     if path:
         specs = _row_specs(entries, order, _local_perms, _natural_key)
         # where it really is: a folder reached through a link may be a share
-        local = on_local_disk(os.path.realpath(path))
-        if local:
-            shown = [e.name for e in entries if not e.is_link
-                     or on_local_disk(os.path.realpath(os.path.join(path, e.name)))]
+        local = _really_local(path)
+        if local and native:
+            shown = [e.name for e in entries
+                     if not e.is_link or _really_local(os.path.join(path, e.name))]
     else:                                # the drives: in drive order, nothing else
         specs = [_Spec(1, (e.name.lower(), 0, 0, "", ""), e.name, True, False,
                        ("", "", "", "")) for e in entries]
@@ -315,13 +327,33 @@ def _local_listing(path, order, native=False) -> _Listing:
         # read with the folder, in one scan: a QFileInfo made per file asked
         # the disk once per query (20,000 files took nine seconds)
         wanted = set(shown)
+        folders = {e.name for e in entries if e.is_dir}
+        # read-only or system folders: the shell takes their icon from their
+        # desktop.ini; a cloud placeholder ("online only") would be downloaded
+        custom = {e.name for e in entries if e.is_dir and attributes.get(e.name, 0)
+                  & (stat.FILE_ATTRIBUTE_READONLY | stat.FILE_ATTRIBUTE_SYSTEM)}
+        wanted -= {name for name, flags in attributes.items() if flags & _NOT_HERE}
+        shortcuts = 0
         found = QDirIterator(path, QDir.AllEntries | QDir.NoDotAndDotDot
                              | QDir.Hidden | QDir.System)
-        while found.hasNext():
-            found.next()
-            info = found.fileInfo()
-            if info.fileName() in wanted:
-                infos[info.fileName()] = info
+        with _com():                     # Qt reads each shortcut through COM
+            while found.hasNext():
+                found.next()
+                info = found.fileInfo()
+                name = info.fileName()
+                if name not in wanted:
+                    continue
+                full = os.path.join(path, name)
+                if name.lower().endswith(".lnk") and name not in folders:
+                    # each costs a few ms to read: past a handful, the
+                    # style's icon (a folder of hundreds, like Recent)
+                    shortcuts += 1
+                    if shortcuts > _MAX_SHORTCUT_ICONS or not _shortcut_ready(full, info):
+                        continue
+                elif name in custom or name.lower().endswith(_ICON_FILES):
+                    if _icon_on_a_share(full, name in folders):
+                        continue
+                infos[name] = info
     elif native:                         # the fixed drives
         for name in shown:
             info = QFileInfo(name)
@@ -330,12 +362,228 @@ def _local_listing(path, order, native=False) -> _Listing:
     return _Listing(path, entries, specs, order, infos, kinds, local)
 
 
+def _really_local(path) -> bool:
+    """:func:`on_local_disk` of where *path* really is (links followed). A
+    share that drops while the link is followed: not local."""
+    try:
+        return on_local_disk(os.path.realpath(path))
+    except (OSError, ValueError):
+        return False
+
+
+def _on_fixed_disk(path) -> bool:
+    root = drive_of(path)
+    return bool(root) and drive_type(root) in _ALWAYS_THERE
+
+
+def shortcut_drive(path) -> str:
+    """The drive ("C:\\") a Windows shortcut (.lnk) points at, read from the
+    file alone — its LinkInfo, see Microsoft's [MS-SHLLINK] — or "": a target
+    on a share, a shell item with no path, an icon kept on a share, or a file
+    that is not a shortcut. (Asking Qt or the shell for the target looks at
+    the target too, which on a share that does not answer takes 20 s.)"""
+    try:
+        if _NOT_HERE & getattr(os.stat(path, follow_symlinks=False),
+                               "st_file_attributes", 0):
+            return ""                    # in the cloud: reading it downloads it
+        with open(path, "rb") as fh:
+            data = fh.read(1 << 16)
+        if len(data) < 0x4C or struct.unpack_from("<I", data, 0)[0] != 0x4C:
+            return ""
+        flags = struct.unpack_from("<I", data, 20)[0]
+        pos = 0x4C
+        if flags & 0x1:                  # HasLinkTargetIDList: skip it
+            pos += 2 + struct.unpack_from("<H", data, pos)[0]
+        drive = ""
+        if flags & 0x2:                  # HasLinkInfo
+            size, _head, where, _volume, base = struct.unpack_from("<5I", data, pos)
+            if where & 0x2:              # CommonNetworkRelativeLink: a share
+                return ""
+            # VolumeIDAndLocalBasePath — unless ForceNoLinkInfo tells the
+            # shell to ignore it
+            if where & 0x1 and not flags & 0x100:
+                drive = data[pos + base:pos + base + 2].decode("latin-1")
+            pos += size
+        # the strings that follow: name, relative path, working folder,
+        # arguments, icon location — the icon's file is read when painted
+        wide = 2 if flags & 0x80 else 1  # IsUnicode
+        icon = ""
+        for bit in (0x4, 0x8, 0x10, 0x20, 0x40):
+            if not flags & bit:
+                continue
+            count = struct.unpack_from("<H", data, pos)[0]
+            text = data[pos + 2:pos + 2 + count * wide]
+            pos += 2 + count * wide
+            if bit == 0x40:
+                icon = text.decode("utf-16-le" if wide == 2 else "latin-1", "replace")
+        # ExtraData: the target and the icon may be given with environment
+        # variables (Windows' own tools: "%windir%\\system32\\cmd.exe"); the
+        # shell then goes by those
+        found = _shortcut_blocks(data, pos)
+        if flags & 0x200 and found.get(0xA0000001):                  # HasExpString
+            target = os.path.expandvars(found[0xA0000001]).strip().strip('"')
+            if not drive:
+                drive = target[:2]
+            elif not _on_fixed_disk(target):     # a share, or a variable gone
+                return ""
+        if flags & 0x4000 and found.get(0xA0000007):                 # HasExpIcon
+            icon = found[0xA0000007]
+        # a known / special folder the shell re-points the target by when the
+        # link is loaded (Documents redirected to a share since it was made);
+        # a virtual one (the user's files) has no place: the LinkInfo decides.
+        # DisableKnownFolderTracking (0x200000) is about the known folder only.
+        tracked = [found.get(0xA0000005)]
+        if not flags & 0x200000:
+            tracked.append(found.get(0xA000000B))
+        for folder in filter(None, tracked):
+            if not _on_fixed_disk(folder):
+                return ""
+            drive = drive or folder[:2]          # no LinkInfo: rebuilt under it
+        if len(drive) != 2 or drive[1] != ":" or not drive[0].isalpha():
+            return ""
+        icon = os.path.expandvars(icon).strip().strip('"')
+        if icon.startswith(("\\\\", "//")) or (drive_of(icon) and not _on_fixed_disk(icon)):
+            return ""
+        return drive.upper() + "\\"
+    except (OSError, struct.error, ValueError):
+        return ""
+
+
+def _shortcut_blocks(data, pos) -> dict:
+    """signature -> path, of a shortcut's ExtraData blocks that name a place:
+    the environment-variable target (0xA0000001) and icon (0xA0000007) — 788
+    bytes, the path in ANSI at 8 and in UTF-16 at 268 — and the known folder
+    (0xA000000B, a GUID at 8) or special folder (0xA0000005, a CSIDL at 8)
+    the target lies in, as where that folder is now ("" if it cannot be
+    told)."""
+    found = {}
+    while pos + 8 <= len(data):
+        size, signature = struct.unpack_from("<II", data, pos)
+        if size < 8:                     # the terminal block
+            break
+        block = data[pos:pos + size]
+        if signature in (0xA0000001, 0xA0000007) and size >= 788:
+            text = block[268:788].decode("utf-16-le", "replace").split("\0", 1)[0]
+            found[signature] = text or block[8:268].decode(
+                "latin-1").split("\0", 1)[0]
+        elif signature == 0xA000000B and size >= 28:
+            found[signature] = _known_folder(block[8:24])
+        elif signature == 0xA0000005 and size >= 16:
+            found[signature] = _special_folder(struct.unpack_from("<I", block, 8)[0])
+        pos += size
+    return found
+
+
+def _known_folder(guid) -> str:
+    """Where the known folder *guid* (16 bytes, as stored) is now — from the
+    registry, the folder itself is not looked at (KF_FLAG_DONT_VERIFY)."""
+    try:
+        import ctypes
+        buffer = ctypes.create_string_buffer(bytes(guid), 16)
+        path = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(buffer, 0x4000, None,
+                                                      ctypes.byref(path)) != 0:
+            return ""
+        try:
+            return path.value or ""
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(path)
+    except Exception:
+        return ""
+
+
+def _special_folder(csidl) -> str:
+    """Where the special folder *csidl* is now (CSIDL_FLAG_DONT_VERIFY)."""
+    try:
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(520)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, (csidl & 0xFF) | 0x4000, None,
+                                                  0, buffer) != 0:
+            return ""
+        return buffer.value
+    except Exception:
+        return ""
+
+
+_ICON_FILES = (".url", ".website", ".scf")   # name an icon file inside them
+_FOLDER_SHORTCUT = "{0AFACED1-E828-11D1-9187-B532F1E9575D}"
+
+
+def _icon_on_a_share(path, is_dir) -> bool:
+    """Does a row's icon come from a file on a share? An internet shortcut or
+    a command file names it (IconFile=), a folder in its desktop.ini
+    (IconResource= / IconFile=). The shell would read it when the row is
+    painted: on a share that does not answer, 5 s each time (worker thread)."""
+    try:
+        with open(os.path.join(path, "desktop.ini") if is_dir else path, "rb") as fh:
+            raw = fh.read(1 << 15)
+    except OSError:
+        return False                     # none: nothing to fetch
+    text = raw.decode("utf-16", "replace") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") \
+        else raw.decode("latin-1")
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        key = key.strip().lower()
+        if is_dir and key == "clsid2" and value.strip().upper() == _FOLDER_SHORTCUT:
+            # a folder shortcut (a Network Location): drawn as its target.lnk
+            drive = shortcut_drive(os.path.join(path, "target.lnk"))
+            if not drive or drive_type(drive) not in _ALWAYS_THERE:
+                return True
+        elif is_dir and key in ("clsid", "clsid2", "uiclsid"):
+            return True                  # a shell extension draws it: not asked
+        if key in ("iconfile", "iconresource"):
+            where = os.path.expandvars(value.strip().strip('"')).split(",")[0].strip()
+            if where.lower().startswith("file:"):
+                where = QUrl(where).toLocalFile()        # file://server/x: UNC
+            elif re.match(r"[a-z][a-z0-9+.-]+:", where, re.I) and not drive_of(where):
+                return True              # http: and the like: not a local file
+            if where.startswith(("\\\\", "//")) or (drive_of(where)
+                                                    and not _on_fixed_disk(where)):
+                return True
+    return False
+
+
+def _shortcut_ready(path, info) -> bool:
+    """Can the row of the Windows shortcut *path* have its system icon? The
+    icon asks what the shortcut points at when it is painted, and Qt keeps
+    no answer that failed: a target on a share that does not answer would
+    hold the window at every repaint. So only a shortcut to a fixed disk
+    (:func:`shortcut_drive`), its target looked at here, where the answer is
+    kept (worker thread)."""
+    drive = shortcut_drive(path)
+    if not drive or drive_type(drive) not in _ALWAYS_THERE:
+        return False
+    try:
+        return info.exists() and (info.isFile() or info.isDir())
+    except Exception:
+        return False
+
+
+# the system's pictures of files, by (path, modified, side) — a null one where
+# the shell gave none, so it is not asked again (it gives up after 5 s)
+_SHELL_PICTURES: "OrderedDict" = OrderedDict()
+_SHELL_PICTURES_MAX = 2048
+_LATER = Qt.UserRole + 1       # a row's (QFileInfo, modified): its picture to come
+_PICTURE_TURN = 0.02           # s of pictures fetched per turn of the event loop
+_PICTURE_HUNG = 1.0            # s one picture may take before the rest are skipped
+_PICTURE_BUDGET = 1.5          # s of the shell's time for pictures in each...
+_PICTURE_WINDOW = 10.0         # ...window of this many s (a folder relisted every
+                               # 2 s, a download in it, asked again each time)
+
+
 class _LocalIcons:
     """Row icons. On Windows the system's own, as Qt's file model showed them
     (Desktop and Downloads have their own, programs and shortcuts theirs) for
     rows on this PC's disks, from a QFileInfo the listing worker already read;
     the style's folder, file and drive icons for the rest, and everywhere on
-    other systems and on Qt's headless platform."""
+    other systems and on Qt's headless platform.
+
+    A system icon is never left to be drawn by the shell when the row is
+    painted — Qt asks it again at every repaint for programs, shortcuts and
+    icon files (16 ms a row; seconds for an icon on a share), and through
+    Python an icon waits on the GIL. The row shows the style's icon, and its
+    picture is fetched once, when the row is in view (:meth:`picture`), kept,
+    and set as a plain pixmap."""
 
     def __init__(self, style):
         self.native = _WINDOWS and (QGuiApplication.platformName() or "") == "windows"
@@ -347,13 +595,30 @@ class _LocalIcons:
         self._drive = style.standardIcon(QStyle.SP_DriveHDIcon)
         self._network = style.standardIcon(QStyle.SP_DriveNetIcon)
 
-    def get(self, is_dir, is_link, info=None, drive_kind=None):
-        """The icon of a row; *drive_kind*: GetDriveType of a drive's row."""
-        if info is not None and self._provider is not None:
-            return self._provider.icon(info)
+    def get(self, is_dir, is_link, drive_kind=None):
+        """The style's icon of a row; *drive_kind*: GetDriveType of a drive's."""
         if drive_kind is not None:
             return self._network if drive_kind == _REMOTE_DRIVE else self._drive
         return self._style[is_dir, is_link]
+
+    def kept(self, info, stamp, side):
+        """The picture of *info* if it was fetched already (else None)."""
+        key = (info.absoluteFilePath(), stamp, side)
+        picture = _SHELL_PICTURES.get(key)
+        if picture is not None:
+            _SHELL_PICTURES.move_to_end(key)
+        return picture
+
+    def picture(self, info, stamp, side):
+        """The system's picture of *info* (null if the shell gave none), from
+        the shell the first time, then kept."""
+        picture = self.kept(info, stamp, side)
+        if picture is None:
+            picture = self._provider.icon(info).pixmap(side, side)
+            _SHELL_PICTURES[(info.absoluteFilePath(), stamp, side)] = picture
+            while len(_SHELL_PICTURES) > _SHELL_PICTURES_MAX:
+                _SHELL_PICTURES.popitem(last=False)
+        return picture
 
 
 # --------------------------------------------------------------------------- #
@@ -368,6 +633,7 @@ class _LocalView(ListTree):
     looked up in THIS pane's remote folder, and a different file downloaded."""
     remote_dropped = pyqtSignal(list)    # names of remote entries dropped here
     refused = pyqtSignal(str)            # why a drag from elsewhere is not taken
+    shown_more = pyqtSignal()            # resized: other rows may be in view
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -400,6 +666,10 @@ class _LocalView(ListTree):
         if paths:
             data.setUrls([QUrl.fromLocalFile(p) for p in paths])
         return data
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self.shown_more.emit()
 
     def startDrag(self, actions):  # noqa: N802 - Qt API
         self.dragging = True
@@ -487,6 +757,10 @@ class LocalPane(QWidget):
         self._watched = ""               # the folder watched for changes
         self._first_change = 0.0
         self._go_gen = 0                 # the folder check the pane waits for
+        self._no_pictures = -1           # rows whose pictures hung: no more
+        self._shown_gen = 0              # the listing whose rows are on screen
+        self._shell_time = 0.0           # s spent on pictures in this window
+        self._window = 0.0               # when the window began
         self._after_base = None
         self._stale = False              # changed on disk while hidden
         self._icons = _LocalIcons(self.style())
@@ -502,6 +776,10 @@ class LocalPane(QWidget):
         self._settle.setSingleShot(True)
         self._settle.setInterval(_SETTLE_MS)
         self._settle.timeout.connect(self._settled_change)
+        self._pictures = QTimer(self)    # system icons for the rows in view
+        self._pictures.setSingleShot(True)
+        self._pictures.setInterval(0)
+        self._pictures.timeout.connect(self._fetch_pictures)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -528,6 +806,10 @@ class LocalPane(QWidget):
 
         self.view = _LocalView()
         self.view.header().sortIndicatorChanged.connect(self._resort)
+        # scrolling: once it pauses (a drag through a folder of programs
+        # asked the shell at every step)
+        self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._pictures.start(40))
+        self.view.shown_more.connect(lambda: self._pictures.start(40))
         self.view.itemActivated.connect(self._open_item)        # double-click / Enter
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._context_menu)
@@ -574,6 +856,7 @@ class LocalPane(QWidget):
         self._closing = True
         self._fill_timer.stop()
         self._settle.stop()
+        self._pictures.stop()
         self._watch("")
         close_jobs(self._jobs)
 
@@ -678,6 +961,7 @@ class LocalPane(QWidget):
         self._fill = None
         self._fill_timer.stop()
         self._loading = True
+        self._stale = False              # this listing is the fresh one
         self._keep, self._after = keep, after
         # the selection when a "select the new name" was queued: if the user
         # changes it meanwhile, theirs is kept
@@ -686,6 +970,7 @@ class LocalPane(QWidget):
             self.view.clear()
             self._entries = {}
             self.view.folder = path
+            self._rows_are(gen)
         self._show()
         run_job(self._jobs, lambda: _local_listing(path, order, native),
                 lambda result: self._listed(gen, result),
@@ -720,11 +1005,20 @@ class LocalPane(QWidget):
             return
         specs, path, infos, kinds = listing.specs, listing.path, listing.infos, listing.kinds
         end = min(len(specs), start + _FILL_CHUNK)
-        icons = self._icons
+        icons, side = self._icons, self.view.iconSize().width()
         for spec in specs[start:end]:
-            icon = icons.get(spec.is_dir, spec.is_link, infos.get(spec.name),
-                             None if path else kinds.get(spec.name, 0))
-            rows.append(make_row(spec.name, icon, spec.rank, spec.keys, *spec.texts))
+            # a .lnk is a link to the eye even where it gets no system icon
+            link = spec.is_link or spec.name.lower().endswith(".lnk")
+            icon = icons.get(spec.is_dir, link, None if path else kinds.get(spec.name, 0))
+            info = infos.get(spec.name)
+            stamp = spec.keys[2]
+            picture = icons.kept(info, stamp, side) if info is not None else None
+            if picture is not None and not picture.isNull():
+                icon = QIcon(picture)
+            row = make_row(spec.name, icon, spec.rank, spec.keys, *spec.texts)
+            if info is not None and picture is None:
+                row.setData(0, _LATER, (info, stamp))
+            rows.append(row)
         if end < len(specs):
             self._fill[2] = end
             self._fill_timer.start()
@@ -745,11 +1039,58 @@ class LocalPane(QWidget):
         if path:
             self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS))
         self.view.addTopLevelItems(rows)
+        self._rows_are(gen)
         self._loading = False
         self._keep, self._after = False, None
         self._restore(state)
         self._show()
         self._watch(path if listing.watch else "")
+        self._pictures.start(0)          # the system icons of the rows in view
+
+    def _rows_are(self, gen):
+        """The rows on screen are now listing *gen*'s: a stop for the rows
+        before (a picture that hung) does not hold for them."""
+        self._shown_gen = gen
+
+    def _fetch_pictures(self):
+        """Give the rows in view their system icon, a few per turn of the event
+        loop (each is one question to the shell, once per file version). The
+        rows on screen keep the style's icons from the first picture that took
+        the shell over _PICTURE_HUNG (a share that does not answer); and the
+        shell gets _PICTURE_BUDGET of every _PICTURE_WINDOW, the rest waits for
+        the next window (slow disks, big programs, a folder that keeps
+        changing)."""
+        if (self._closing or self._icons._provider is None
+                or not self.view.isVisible() or self._no_pictures == self._shown_gen):
+            return                       # (shown again: showEvent starts it)
+        view, side = self.view, self.view.iconSize().width()
+        started = time.monotonic()
+        item = view.itemAt(QPoint(1, 1))
+        bottom = view.viewport().height()
+        while item is not None and view.visualItemRect(item).top() < bottom:
+            later = item.data(0, _LATER)
+            if later is not None:
+                now = time.monotonic()
+                if now - started > _PICTURE_TURN:
+                    self._pictures.start(0)      # the rest next turn
+                    return
+                if now - self._window > _PICTURE_WINDOW:
+                    self._window, self._shell_time = now, 0.0
+                if self._shell_time > _PICTURE_BUDGET:   # the next window
+                    self._pictures.start(int((self._window + _PICTURE_WINDOW - now)
+                                             * 1000) + 1)
+                    return
+                item.setData(0, _LATER, None)
+                asked = time.monotonic()
+                picture = self._icons.picture(later[0], later[1], side)
+                if not picture.isNull():
+                    item.setIcon(0, QIcon(picture))
+                took = time.monotonic() - asked
+                self._shell_time += took
+                if took > _PICTURE_HUNG:
+                    self._no_pictures = self._shown_gen
+                    return
+            item = view.itemBelow(item)
 
     def _restore(self, state):
         """Select and scroll back to where the list was (a refresh), or put the
@@ -777,6 +1118,7 @@ class LocalPane(QWidget):
     def _list_failed(self, gen, path, msg):
         if self._closing or gen != self._gen:
             return
+        self._rows_are(gen)
         self._loading = False
         self._keep, self._after = False, None
         self._entries = {}
@@ -793,6 +1135,7 @@ class LocalPane(QWidget):
         put in order when they come)."""
         self.view.order = (column, order == Qt.AscendingOrder)
         reorder_rows(self.view)
+        self._pictures.start(0)          # other rows may be in view now
 
     # ---- the folder changing on disk ----
     def _watch(self, path):
@@ -838,9 +1181,10 @@ class LocalPane(QWidget):
 
     def showEvent(self, event):  # noqa: N802 - Qt API
         super().showEvent(event)
-        if self._stale and not self._closing:
+        if self._stale and not self._closing and not self._loading:
             self._stale = False
             self._list(keep=True)
+        self._pictures.start(0)
 
     # ---- selection ----
     def selection_paths(self) -> list:

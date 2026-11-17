@@ -372,15 +372,20 @@ def _dot_image(color: str) -> str:
 
 def _css_url(path: str) -> str:
     """``url('path')`` — in double quotes if the path has an apostrophe (a
-    home folder like C:/Users/O'Brien)."""
+    home folder like C:/Users/O'Brien); "" if it has both kinds of quote
+    (a stylesheet has no way to write that)."""
+    if "'" in path and '"' in path:
+        return ""
     quote = '"' if "'" in path else "'"
     return f"url({quote}{path}{quote})"
 
 
 def _image_rule(url: str) -> str:
-    """``image: url(...)`` — or nothing if the image could not be made (an
-    empty url() is invalid, and Qt then paints its own fallback on top)."""
-    return f"image: {_css_url(url)};" if url else ""
+    """``image: url(...)`` — or nothing if the image could not be made or
+    named (an empty url() is invalid, and Qt then paints its own fallback on
+    top)."""
+    css = _css_url(url) if url else ""
+    return f"image: {css};" if css else ""
 
 
 def _tone_rules(c: dict, name: str) -> str:
@@ -482,7 +487,7 @@ def stylesheet(name: str = "dark") -> str:
         width: 24px; border-left: 1px solid {c['border']};
         border-top-right-radius: 7px; border-bottom-right-radius: 7px; }}
     QComboBox::drop-down:hover {{ background: {c['raised']}; }}
-    QComboBox::down-arrow {{ image: {_css_url(arrow)}; width: 13px; height: 13px; }}
+    QComboBox::down-arrow {{ {_image_rule(arrow)} width: 13px; height: 13px; }}
     QComboBox QAbstractItemView, QListView {{
         background: {c['raised']}; color: {c['text']}; border: 1px solid {c['border']};
         selection-background-color: {ACCENT}; selection-color: #042830; outline: 0;

@@ -213,7 +213,7 @@ def test_a_folder_that_cannot_be_listed_says_so_and_keeps_the_way_up(browser,
     assert pane.navigate(str(browser.local_dir / "folder"))
     assert wait_until(lambda: not pane._loading)
 
-    def denied(path):
+    def denied(path, attributes=None):
         raise PermissionError(13, "Access is denied", path)
     monkeypatch.setattr(file_browser, "scan_folder", denied)
     pane.refresh()
@@ -485,11 +485,11 @@ def test_system_icons_come_from_file_info_read_on_the_worker(qapp, tmp_path):
 
     icons = _LocalIcons(QApplication.style())
     icons._provider = QFileIconProvider()                # as on the real platform
-    assert not icons.get(False, False, listing.infos["a.txt"]).isNull()
-    style = icons.get(True, False)                       # no info: the style's
+    assert not icons.picture(listing.infos["a.txt"], 1, 16).isNull()
+    style = icons.get(True, False)                       # the style's
     assert style.cacheKey() == icons._style[True, False].cacheKey()
-    assert icons.get(True, False, None, 4).cacheKey() == icons._network.cacheKey()
-    assert icons.get(True, False, None, 3).cacheKey() == icons._drive.cacheKey()
+    assert icons.get(True, False, 4).cacheKey() == icons._network.cacheKey()
+    assert icons.get(True, False, 3).cacheKey() == icons._drive.cacheKey()
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs")
@@ -712,3 +712,452 @@ def test_a_refused_sftp_channel_says_why(qapp):
                 return Transport()
     with pytest.raises(IOError, match="refused another channel"):
         sb._open_sftp(Handler())
+
+
+# ------------------------------------------------------------------ fourth review
+def make_shortcut(link, target):
+    """A real Windows shortcut (.lnk) to *target*, made by the shell."""
+    import subprocess
+    script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK); "
+              "$s.TargetPath = $env:TARGET; $s.Save()")
+    env = dict(os.environ, LNK=str(link), TARGET=str(target))
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        script], env=env, check=True, timeout=60, capture_output=True)
+    except (OSError, subprocess.SubprocessError) as exc:   # e.g. a non-ANSI path
+        why = f"the shell made no shortcut: {exc} {getattr(exc, 'stderr', b'') or b''!r}"
+        if os.environ.get("CI"):         # on CI that is a failure, not a skip
+            pytest.fail(why)
+        pytest.skip(why)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows shortcuts")
+def test_shortcuts_get_system_icons_only_when_their_target_is_on_this_pc(qapp, tmp_path):
+    from turbossh.gui import file_browser
+    (tmp_path / "target.txt").write_text("x")
+    make_shortcut(tmp_path / "good.lnk", tmp_path / "target.txt")
+    (tmp_path / "broken.lnk").write_bytes(b"not a shortcut")
+    listing = file_browser._local_listing(str(tmp_path), (0, True), native=True)
+    if file_browser.drive_type(file_browser.drive_of(str(tmp_path))) in \
+            file_browser._ALWAYS_THERE:
+        assert "good.lnk" in listing.infos
+    assert "broken.lnk" not in listing.infos and "target.txt" in listing.infos
+
+
+def env_block(signature, text):
+    """An EnvironmentVariableDataBlock / IconEnvironmentDataBlock (788 bytes)."""
+    import struct
+    ansi = text.encode("latin-1").ljust(260, b"\0")
+    wide = text.encode("utf-16-le").ljust(520, b"\0")
+    return struct.pack("<II", 788, signature) + ansi + wide
+
+
+def lnk_bytes(base="C:\\tools\\app.exe", network=False, icon=None, wide=True,
+              idlist=True, info=True, flags=0, blocks=()):
+    """A minimal shortcut file as [MS-SHLLINK] lays it out."""
+    import struct
+    flags |= ((0x2 if info else 0) | (0x1 if idlist else 0) | (0x80 if wide else 0)
+              | (0x40 if icon else 0))
+    clsid = bytes.fromhex("0114020000000000c000000000000046")
+    data = struct.pack("<I16sI", 0x4C, clsid, flags) + b"\0" * (0x4C - 24)
+    if idlist:
+        data += struct.pack("<H", 2) + b"\0\0"           # an empty ID list
+    if info:
+        path = base.encode("latin-1") + b"\0"
+        where = 0x2 if network else 0x1
+        data += struct.pack("<7I", 28 + len(path), 28, where, 0, 28, 0, 0) + path
+    if icon:
+        text = icon.encode("utf-16-le" if wide else "latin-1")
+        data += struct.pack("<H", len(icon)) + text
+    return data + b"".join(blocks) + b"\0\0\0\0"          # the terminal block
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows shortcuts and drive letters")
+def test_a_shortcut_is_judged_from_its_own_bytes(tmp_path, monkeypatch):
+    """Asking Qt (or the shell) for a shortcut's target looks at the target
+    too: on a share that does not answer, 20 s. The file itself says enough."""
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "drive_type",
+                        lambda root: 3 if root.upper() in ("C:\\", "D:\\") else 4)
+    monkeypatch.setenv("TOOLS", "C:\\tools")
+    monkeypatch.setenv("HOMESHARE", "\\\\fileserver.invalid\\home")
+
+    made = []
+
+    def drive(**kwargs):                 # a file of its own each (antivirus)
+        made.append(1)
+        link = tmp_path / f"x{len(made)}.lnk"
+        link.write_bytes(lnk_bytes(**kwargs))
+        return file_browser.shortcut_drive(str(link))
+    assert drive() == "C:\\"
+    assert drive(base="d:\\x", idlist=False, wide=False) == "D:\\"
+    assert drive(network=True) == ""                     # \\server\share\...
+    assert drive(icon="\\\\fileserver.invalid\\icons\\app.ico") == ""
+    assert drive(icon='"\\\\fileserver.invalid\\icons\\app.ico"') == ""   # quoted
+    assert drive(icon="Z:\\icons\\app.ico") == ""         # a mapped share
+    assert drive(icon="C:\\tools\\app.exe,0", wide=False) == "C:\\"
+    assert drive(icon="%TOOLS%\\app.ico") == "C:\\"
+    # ForceNoLinkInfo: the shell ignores the LinkInfo, so does this
+    assert drive(flags=0x100) == ""
+    # Windows' own tools: no LinkInfo, the target in an environment block
+    assert drive(info=False, flags=0x100 | 0x200,
+                 blocks=[env_block(0xA0000001, "%TOOLS%\\cmd.exe")]) == "C:\\"
+    assert drive(info=False, flags=0x200,
+                 blocks=[env_block(0xA0000001, "%HOMESHARE%\\x.exe")]) == ""
+    # the icon block wins over the icon string when HasExpIcon is set
+    assert drive(icon="C:\\tools\\app.ico", flags=0x4000,
+                 blocks=[env_block(0xA0000007, "%HOMESHARE%\\app.ico")]) == ""
+    assert drive(flags=0x4000, blocks=[env_block(0xA0000007, "%TOOLS%\\a.ico")]) == "C:\\"
+    # a local LinkInfo, but the environment target is a share now
+    assert drive(flags=0x200, blocks=[env_block(0xA0000001, "%HOMESHARE%\\x.exe")]) == ""
+    # the known / special folder the shell re-points the target by
+    monkeypatch.setattr(file_browser, "_known_folder",
+                        lambda guid: "C:\\Windows" if guid[0] == 1 else "\\\\srv\\docs")
+    monkeypatch.setattr(file_browser, "_special_folder", lambda csidl: {
+        0x24: "C:\\Windows", 0x05: "\\\\srv\\home\\Documents"}.get(csidl, ""))
+    import struct
+    here = struct.pack("<II", 28, 0xA000000B) + b"\x01" + b"\0" * 15 + b"\0" * 4
+    there = struct.pack("<II", 28, 0xA000000B) + b"\x02" + b"\0" * 15 + b"\0" * 4
+    assert drive(blocks=[here]) == "C:\\"
+    assert drive(blocks=[there]) == ""                    # redirected to a share
+    assert drive(flags=0x200000, blocks=[there]) == "C:\\"   # tracking disabled
+    assert drive(blocks=[struct.pack("<III", 16, 0xA0000005, 0x24) + b"\0" * 4]) == "C:\\"
+    assert drive(blocks=[struct.pack("<III", 16, 0xA0000005, 0x05) + b"\0" * 4]) == ""
+    # a folder with no place (virtual, or no valid id): the LinkInfo decides
+    assert drive(blocks=[struct.pack("<III", 16, 0xA0000005, 0xFFFFFFFF) + b"\0" * 4]) \
+        == "C:\\"
+    (tmp_path / "junk.lnk").write_bytes(b"not a shortcut at all")
+    assert file_browser.shortcut_drive(str(tmp_path / "junk.lnk")) == ""
+    (tmp_path / "short.lnk").write_bytes(lnk_bytes()[:80])  # cut off
+    assert file_browser.shortcut_drive(str(tmp_path / "short.lnk")) == ""
+
+    class Info:                          # the target is only looked at on a disk
+        asked = 0
+
+        def exists(self):
+            Info.asked += 1
+            return True
+
+        def isFile(self):  # noqa: N802 - Qt API
+            return True
+
+        def isDir(self):  # noqa: N802 - Qt API
+            return False
+    link = tmp_path / "net.lnk"
+    link.write_bytes(lnk_bytes(network=True))
+    assert not file_browser._shortcut_ready(str(link), Info()) and Info.asked == 0
+    link = tmp_path / "local.lnk"
+    link.write_bytes(lnk_bytes())
+    assert file_browser._shortcut_ready(str(link), Info()) and Info.asked == 1
+
+
+def test_links_are_only_followed_for_system_icons(qapp, tmp_path, monkeypatch):
+    from turbossh.gui import file_browser
+    asked = []
+    monkeypatch.setattr(file_browser, "_really_local",
+                        lambda path: (asked.append(path), True)[1])
+    monkeypatch.setattr(file_browser, "scan_folder", lambda path, attributes=None: [
+        sb._Entry(f"l{n}", False, True, 1, 1, 0o100644, stat.S_IFREG) for n in range(5)])
+    file_browser._local_listing(str(tmp_path), (0, True))
+    assert asked == [str(tmp_path)]                       # the folder only
+
+
+def test_a_link_that_cannot_be_followed_is_not_local(monkeypatch):
+    from turbossh.gui import file_browser
+
+    def dropped(path):
+        raise OSError(64, "The specified network name is no longer available")
+    monkeypatch.setattr(file_browser.os.path, "realpath", dropped)
+    assert file_browser._really_local("C:/x") is False
+
+
+def test_a_new_listing_clears_a_pending_refresh(browser):
+    pane = browser.local
+    pane._stale = True
+    pane.refresh()
+    assert not pane._stale
+    assert wait_until(lambda: not pane._loading)
+
+
+def test_an_image_path_with_both_quotes_is_left_out():
+    from turbossh.gui import theme
+    assert theme._css_url("/home/a'b\"c/x.png") == ""
+    assert theme._image_rule("/home/a'b\"c/x.png") == ""
+    assert theme._image_rule("") == ""
+
+
+# ------------------------------------------------------------------ the shortcut review
+def test_a_folder_of_many_shortcuts_reads_only_so_many(qapp, tmp_path, monkeypatch):
+    from turbossh.gui import file_browser
+    read = []
+    monkeypatch.setattr(file_browser, "_MAX_SHORTCUT_ICONS", 3)
+    monkeypatch.setattr(file_browser, "_shortcut_ready",
+                        lambda path, info: (read.append(path), True)[1])
+    for n in range(6):
+        (tmp_path / f"s{n}.lnk").write_bytes(b"x")
+    (tmp_path / "folder.lnk").mkdir()                     # a folder, not a shortcut
+    listing = file_browser._local_listing(str(tmp_path), (0, True), native=True)
+    assert len(read) == 3 and "folder.lnk" in listing.infos
+    assert len([n for n in listing.infos if n.startswith("s")]) == 3
+
+
+class CountingProvider:
+    """Stands in for the system's icon provider: counts the questions."""
+
+    def __init__(self, give=True):
+        self.asked, self.give = [], give
+
+    def icon(self, info):
+        from PyQt5.QtGui import QIcon, QPixmap
+        self.asked.append(info.fileName())
+        if not self.give:                # the shell gave up (its 5 s timeout)
+            return QIcon()
+        pm = QPixmap(16, 16)
+        pm.fill(QColor("#336699"))
+        return QIcon(pm)
+
+
+def test_a_system_picture_is_asked_for_once_per_file_version(qapp, tmp_path, monkeypatch):
+    from PyQt5.QtCore import QFileInfo
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "_SHELL_PICTURES", type(file_browser._SHELL_PICTURES)())
+    icons = file_browser._LocalIcons(QApplication.style())
+    icons._provider = CountingProvider()
+    (tmp_path / "tool.exe").write_text("x")
+    info = QFileInfo(str(tmp_path / "tool.exe"))
+    for _ in range(3):
+        assert icons.picture(info, 100, 16).toImage().pixelColor(8, 8) == QColor("#336699")
+    assert icons._provider.asked == ["tool.exe"]
+    icons.picture(info, 101, 16)                          # changed since: again
+    assert len(icons._provider.asked) == 2
+    icons._provider = CountingProvider(give=False)
+    assert icons.picture(QFileInfo(str(tmp_path / "x.url")), 1, 16).isNull()
+    assert icons.picture(QFileInfo(str(tmp_path / "x.url")), 1, 16).isNull()
+    assert len(icons._provider.asked) == 1, "a failure was asked about again"
+
+
+def test_rows_get_system_pictures_never_shell_icons(browser, monkeypatch):
+    """Qt asks the shell at every repaint for a system icon (programs and
+    shortcuts; icons on a share: 5 s), and a Python icon waits on the GIL: a
+    row shows the style's icon until its picture is fetched — once, while it
+    is in view — and then a plain pixmap."""
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "_SHELL_PICTURES", type(file_browser._SHELL_PICTURES)())
+    pane = browser.local
+    provider = CountingProvider()
+    pane._icons.native, pane._icons._provider = True, provider
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading)
+    assert wait_until(lambda: len(provider.asked) == 3)   # folder, big.bin, note.txt
+    shown = [pane.view.topLevelItem(i) for i in range(1, pane.view.topLevelItemCount())]
+    assert all(it.data(0, file_browser._LATER) is None for it in shown)
+    picture = shown[0].icon(0).pixmap(16, 16).toImage()
+    assert picture.pixelColor(8, 8) == QColor("#336699")
+    pane.refresh()                                        # kept: not asked again
+    assert wait_until(lambda: not pane._loading)
+    QTest.qWait(100)
+    assert len(provider.asked) == 3
+    assert shown and pane.view.topLevelItem(1).icon(0).pixmap(16, 16).toImage() \
+        .pixelColor(8, 8) == QColor("#336699")
+
+
+def test_icons_kept_on_a_share_are_not_fetched(qapp, tmp_path, monkeypatch):
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "drive_type",
+                        lambda root: 3 if root.upper() == "C:\\" else 4)
+    (tmp_path / "intranet.url").write_text(
+        "[InternetShortcut]\nURL=http://wiki.invalid/\n"
+        "IconFile=\\\\fileserver.invalid\\icons\\wiki.ico\nIconIndex=0\n")
+    (tmp_path / "local.url").write_text(
+        "[InternetShortcut]\nURL=http://wiki.invalid/\nIconFile=C:\\icons\\wiki.ico\n")
+    (tmp_path / "plain.url").write_text("[InternetShortcut]\nURL=http://wiki.invalid/\n")
+    (tmp_path / "custom").mkdir()
+    (tmp_path / "custom" / "desktop.ini").write_bytes(
+        "[.ShellClassInfo]\r\nIconResource=Z:\\icons\\team.ico,0\r\n".encode("utf-16"))
+    share = file_browser._icon_on_a_share
+    assert share(str(tmp_path / "intranet.url"), False)
+    assert (not share(str(tmp_path / "local.url"), False)) == (os.name == "nt")
+    assert not share(str(tmp_path / "plain.url"), False)
+    assert share(str(tmp_path / "custom"), True)
+    assert not share(str(tmp_path / "nothing-here"), True)
+
+
+# ------------------------------------------------------------------ pictures, second look
+def native_pane(browser, monkeypatch, provider):
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "_SHELL_PICTURES", type(file_browser._SHELL_PICTURES)())
+    pane = browser.local
+    pane._icons.native, pane._icons._provider = True, provider
+    return pane, file_browser
+
+
+def waiting(pane, lib):
+    """Names of the rows in view still waiting for their picture."""
+    view, out = pane.view, []
+    for i in range(view.topLevelItemCount()):
+        item = view.topLevelItem(i)
+        if item.data(0, lib._LATER) is not None:
+            out.append(item.text(0))
+    return out
+
+
+def test_rows_a_sort_brings_into_view_get_their_pictures(browser, monkeypatch):
+    for n in range(60):
+        (browser.local_dir / f"tool{n:02d}.exe").write_text("x" * n)
+    provider = CountingProvider()
+    pane, lib = native_pane(browser, monkeypatch, provider)
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading and provider.asked)
+    QTest.qWait(200)
+    first = set(provider.asked)
+    assert len(first) < 60, "rows out of view were fetched too"
+    pane.view.sortByColumn(0, Qt.DescendingOrder)          # others come into view
+    assert wait_until(lambda: len(set(provider.asked)) > len(first))
+    top = [pane.view.topLevelItem(i).text(0) for i in range(1, 6)]
+    assert not set(top) & set(waiting(pane, lib))
+
+
+def test_a_hidden_pane_asks_for_no_pictures(browser, monkeypatch):
+    provider = CountingProvider()
+    pane, _lib = native_pane(browser, monkeypatch, provider)
+    browser.hide()
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading)
+    QTest.qWait(200)
+    assert provider.asked == []
+    browser.show()                                        # now it is seen
+    assert wait_until(lambda: len(provider.asked) == 3)
+
+
+def test_a_picture_that_hangs_leaves_the_rest_of_the_listing_alone(browser, monkeypatch):
+    class Hung(CountingProvider):
+        def icon(self, info):
+            from PyQt5.QtGui import QIcon
+            self.asked.append(info.fileName())
+            time.sleep(0.05)
+            return QIcon()
+    provider = Hung()
+    pane, lib = native_pane(browser, monkeypatch, provider)
+    monkeypatch.setattr(lib, "_PICTURE_HUNG", 0.01)       # 50 ms counts as hung
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading and provider.asked)
+    QTest.qWait(300)
+    assert len(provider.asked) == 1 and len(waiting(pane, lib)) == 2
+    pane.refresh()                                        # a new listing tries again
+    assert wait_until(lambda: not pane._loading)
+    assert wait_until(lambda: len(provider.asked) == 2)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows folder attributes")
+def test_system_folders_and_folder_shortcuts_are_judged_first(qapp, tmp_path, monkeypatch):
+    import ctypes
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "drive_type",
+                        lambda root: 3 if root.upper() == "C:\\" else 4)
+    system = tmp_path / "team"                            # +S, not read-only
+    system.mkdir()
+    (system / "desktop.ini").write_text(
+        "[.ShellClassInfo]\nIconResource=\\\\fileserver.invalid\\icons\\team.ico,0\n")
+    assert ctypes.windll.kernel32.SetFileAttributesW(str(system), 0x4)
+    place = tmp_path / "Lab share"                        # a Network Location
+    place.mkdir()
+    (place / "desktop.ini").write_text(
+        "[.ShellClassInfo]\nCLSID2={0AFACED1-E828-11D1-9187-B532F1E9575D}\nFlags=2\n")
+    (place / "target.lnk").write_bytes(lnk_bytes(network=True))
+    assert ctypes.windll.kernel32.SetFileAttributesW(str(place), 0x1)
+    try:
+        listing = file_browser._local_listing(str(tmp_path), (0, True), native=True)
+        assert "team" not in listing.infos and "Lab share" not in listing.infos
+        (place / "target.lnk").write_bytes(lnk_bytes())   # to C: — fine
+        assert not file_browser._icon_on_a_share(str(place), True)
+    finally:
+        for folder in (system, place):
+            ctypes.windll.kernel32.SetFileAttributesW(str(folder), 0x80)
+
+
+def test_cloud_placeholders_get_no_system_icon(qapp, tmp_path, monkeypatch):
+    from turbossh.gui import file_browser
+    for name in ("here.txt", "cloud.exe"):
+        (tmp_path / name).write_text("x")
+    real = file_browser.scan_folder
+
+    def placeholders(path, attributes=None):
+        entries = real(path, attributes)
+        if attributes is not None:
+            attributes["cloud.exe"] = 0x400000           # RECALL_ON_DATA_ACCESS
+        return entries
+    monkeypatch.setattr(file_browser, "scan_folder", placeholders)
+    listing = file_browser._local_listing(str(tmp_path), (0, True), native=True)
+    assert set(listing.infos) == {"here.txt"}
+
+
+# ------------------------------------------------------------------ pictures, third look
+def test_a_stop_holds_for_the_rows_on_screen_until_new_ones_come(browser, monkeypatch):
+    """A refresh in flight left the old rows on screen but cleared the stop:
+    the next fetch asked the shell about them again (one more hang)."""
+    class Hung(CountingProvider):
+        def icon(self, info):
+            from PyQt5.QtGui import QIcon
+            self.asked.append(info.fileName())
+            time.sleep(0.05)
+            return QIcon()
+    provider = Hung()
+    pane, lib = native_pane(browser, monkeypatch, provider)
+    monkeypatch.setattr(lib, "_PICTURE_HUNG", 0.01)
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading and provider.asked)
+    QTest.qWait(200)
+    assert len(provider.asked) == 1
+    pane._list(keep=True)                                 # a refresh starts...
+    pane._fetch_pictures()                                # ...and something fetches
+    assert len(provider.asked) == 1, "the hung rows were asked about again"
+    assert wait_until(lambda: not pane._loading)
+    assert wait_until(lambda: len(provider.asked) == 2)   # the new rows: afresh
+
+
+def test_slow_pictures_stop_after_a_budget(browser, monkeypatch):
+    for n in range(8):
+        (browser.local_dir / f"setup{n}.exe").write_text("x")
+
+    class Slow(CountingProvider):
+        def icon(self, info):
+            time.sleep(0.03)
+            return super().icon(info)
+    provider = Slow()
+    pane, lib = native_pane(browser, monkeypatch, provider)
+    monkeypatch.setattr(lib, "_PICTURE_BUDGET", 0.1)
+    monkeypatch.setattr(lib, "_PICTURE_WINDOW", 60.0)
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading and provider.asked)
+    QTest.qWait(400)
+    asked = len(provider.asked)
+    assert 2 <= asked <= 5 and waiting(pane, lib)
+    pane.refresh()                       # relisted (as the folder watcher does):
+    assert wait_until(lambda: not pane._loading)       # the budget still holds
+    QTest.qWait(300)
+    assert len(provider.asked) == asked
+
+
+def test_icon_urls_and_folder_shortcut_drives_are_judged_too(qapp, tmp_path, monkeypatch):
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "drive_type", lambda root: {
+        "C:\\": 3, "E:\\": 2}.get(root.upper(), 4))
+    share = file_browser._icon_on_a_share
+
+    def url(name, icon):
+        (tmp_path / name).write_text(
+            f"[InternetShortcut]\nURL=http://wiki.invalid/\nIconFile={icon}\n")
+        return share(str(tmp_path / name), False)
+    assert url("a.url", "file://fileserver.invalid/icons/wiki.ico")
+    assert url("b.url", "http://wiki.invalid/favicon.ico")
+    if os.name == "nt":
+        assert not url("c.url", "file:///C:/Windows/System32/imageres.dll")
+    place = tmp_path / "USB stick"                        # a folder shortcut to E:
+    place.mkdir()
+    (place / "desktop.ini").write_text(
+        "[.ShellClassInfo]\nCLSID2={0AFACED1-E828-11D1-9187-B532F1E9575D}\n")
+    (place / "target.lnk").write_bytes(lnk_bytes(base="E:\\backup"))
+    assert share(str(place), True)
+    if os.name == "nt":
+        (place / "target.lnk").write_bytes(lnk_bytes(base="C:\\backup"))
+        assert not share(str(place), True)

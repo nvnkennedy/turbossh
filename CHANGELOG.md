@@ -28,6 +28,11 @@ boxes are plain to see in every theme.
   has gone. As before, it shows folders and files only, without hidden ones,
   in natural order ("file2" before "file10"). Double-click (or Open) opens a
   file with its program. A drag out to Explorer is always a copy, never a move.
+- Rows on this PC show Windows' own icons (programs, shortcuts, Desktop,
+  Downloads…), fetched once per file and kept, never while the list repaints.
+  Anything whose icon would come from a share — a shortcut to one, an icon
+  file on one, a Network Location — gets the plain icon, so a share that does
+  not answer cannot freeze the window.
 - A file browser the server refuses a channel to says so ("the server refused
   another channel… close a file browser tab") instead of a bare
   ChannelException; each browser uses two.
