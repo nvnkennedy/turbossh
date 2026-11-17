@@ -535,6 +535,8 @@ def _icon_on_a_share(path, is_dir) -> bool:
             where = os.path.expandvars(value.strip().strip('"')).split(",")[0].strip()
             if where.lower().startswith("file:"):
                 where = QUrl(where).toLocalFile()        # file://server/x: UNC
+                if not (drive_of(where) and _on_fixed_disk(where)):
+                    return True          # (or a form Qt reads differently)
             elif re.match(r"[a-z][a-z0-9+.-]+:", where, re.I) and not drive_of(where):
                 return True              # http: and the like: not a local file
             if where.startswith(("\\\\", "//")) or (drive_of(where)
@@ -566,9 +568,33 @@ _SHELL_PICTURES_MAX = 2048
 _LATER = Qt.UserRole + 1       # a row's (QFileInfo, modified): its picture to come
 _PICTURE_TURN = 0.02           # s of pictures fetched per turn of the event loop
 _PICTURE_HUNG = 1.0            # s one picture may take before the rest are skipped
-_PICTURE_BUDGET = 1.5          # s of the shell's time for pictures in each...
-_PICTURE_WINDOW = 10.0         # ...window of this many s (a folder relisted every
-                               # 2 s, a download in it, asked again each time)
+_PICTURE_BUDGET = 1.5          # s of the shell's time for pictures in any...
+_PICTURE_WINDOW = 10.0         # ...this many s, as a bucket that refills (a folder
+                               # relisted every 2 s, a download in it: asked again)
+_HUNG_FOR = 600.0              # s a file whose picture hung is not asked about again
+_HUNG: dict = {}               # path -> when its picture hung (perf_counter)
+
+
+def _hung_key(info) -> str:
+    return os.path.normcase(info.absoluteFilePath())
+
+
+def _hung(info) -> bool:
+    """Did the shell hang on this file's picture lately?"""
+    when = _HUNG.get(_hung_key(info))
+    return when is not None and time.perf_counter() - when <= _HUNG_FOR
+
+
+def _note_hung(info) -> None:
+    """Remember that the shell hung on *info*'s picture (the oldest first;
+    expired ones and the oldest past 512 go)."""
+    now, key = time.perf_counter(), _hung_key(info)
+    _HUNG.pop(key, None)
+    _HUNG[key] = now
+    for old in [k for k, when in _HUNG.items() if now - when > _HUNG_FOR]:
+        del _HUNG[old]
+    while len(_HUNG) > 512:
+        del _HUNG[next(iter(_HUNG))]
 
 
 class _LocalIcons:
@@ -759,8 +785,8 @@ class LocalPane(QWidget):
         self._go_gen = 0                 # the folder check the pane waits for
         self._no_pictures = -1           # rows whose pictures hung: no more
         self._shown_gen = 0              # the listing whose rows are on screen
-        self._shell_time = 0.0           # s spent on pictures in this window
-        self._window = 0.0               # when the window began
+        self._shell_time = 0.0           # s of the shell's time owed (the bucket)
+        self._drained = 0.0              # when it was last brought up to date
         self._after_base = None
         self._stale = False              # changed on disk while hidden
         self._icons = _LocalIcons(self.style())
@@ -1016,7 +1042,7 @@ class LocalPane(QWidget):
             if picture is not None and not picture.isNull():
                 icon = QIcon(picture)
             row = make_row(spec.name, icon, spec.rank, spec.keys, *spec.texts)
-            if info is not None and picture is None:
+            if info is not None and picture is None and not _hung(info):
                 row.setData(0, _LATER, (info, stamp))
             rows.append(row)
         if end < len(specs):
@@ -1064,30 +1090,39 @@ class LocalPane(QWidget):
                 or not self.view.isVisible() or self._no_pictures == self._shown_gen):
             return                       # (shown again: showEvent starts it)
         view, side = self.view, self.view.iconSize().width()
-        started = time.monotonic()
+        started = time.perf_counter()    # (monotonic ticks in 15.6 ms on Windows)
         item = view.itemAt(QPoint(1, 1))
         bottom = view.viewport().height()
         while item is not None and view.visualItemRect(item).top() < bottom:
             later = item.data(0, _LATER)
-            if later is not None:
-                now = time.monotonic()
+            if later is not None and _hung(later[0]):
+                item.setData(0, _LATER, None)    # it hung meanwhile: not again
+            elif later is not None:
+                now = time.perf_counter()
                 if now - started > _PICTURE_TURN:
                     self._pictures.start(0)      # the rest next turn
                     return
-                if now - self._window > _PICTURE_WINDOW:
-                    self._window, self._shell_time = now, 0.0
-                if self._shell_time > _PICTURE_BUDGET:   # the next window
-                    self._pictures.start(int((self._window + _PICTURE_WINDOW - now)
-                                             * 1000) + 1)
+                # the time owed drains at _PICTURE_BUDGET per _PICTURE_WINDOW:
+                # a 5 s hang buys half a minute without pictures
+                rate = _PICTURE_BUDGET / _PICTURE_WINDOW
+                self._shell_time = max(0.0, self._shell_time - (now - self._drained) * rate)
+                self._drained = now
+                if self._shell_time > _PICTURE_BUDGET:
+                    self._pictures.start(min(60000, int((self._shell_time - _PICTURE_BUDGET)
+                                                        / rate * 1000) + 1))
                     return
                 item.setData(0, _LATER, None)
-                asked = time.monotonic()
                 picture = self._icons.picture(later[0], later[1], side)
                 if not picture.isNull():
                     item.setIcon(0, QIcon(picture))
-                took = time.monotonic() - asked
-                self._shell_time += took
+                took = time.perf_counter() - now
+                # owed: capped, so one long hang (or a suspend) pauses pictures
+                # for a minute or so, not for hours
+                self._shell_time = min(self._shell_time + took, 2 * _PICTURE_BUDGET)
                 if took > _PICTURE_HUNG:
+                    # not this file again for a while (a file being written
+                    # changes at every listing), nor the rest of these rows
+                    _note_hung(later[0])
                     self._no_pictures = self._shown_gen
                     return
             item = view.itemBelow(item)

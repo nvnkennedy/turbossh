@@ -986,6 +986,7 @@ def test_icons_kept_on_a_share_are_not_fetched(qapp, tmp_path, monkeypatch):
 def native_pane(browser, monkeypatch, provider):
     from turbossh.gui import file_browser
     monkeypatch.setattr(file_browser, "_SHELL_PICTURES", type(file_browser._SHELL_PICTURES)())
+    monkeypatch.setattr(file_browser, "_HUNG", {})
     pane = browser.local
     pane._icons.native, pane._icons._provider = True, provider
     return pane, file_browser
@@ -1121,17 +1122,17 @@ def test_slow_pictures_stop_after_a_budget(browser, monkeypatch):
 
     class Slow(CountingProvider):
         def icon(self, info):
-            time.sleep(0.03)
+            time.sleep(0.05)
             return super().icon(info)
     provider = Slow()
     pane, lib = native_pane(browser, monkeypatch, provider)
-    monkeypatch.setattr(lib, "_PICTURE_BUDGET", 0.1)
-    monkeypatch.setattr(lib, "_PICTURE_WINDOW", 60.0)
+    monkeypatch.setattr(lib, "_PICTURE_BUDGET", 0.25)
+    monkeypatch.setattr(lib, "_PICTURE_WINDOW", 1e5)      # (it does not refill)
     pane.refresh()
     assert wait_until(lambda: not pane._loading and provider.asked)
-    QTest.qWait(400)
+    QTest.qWait(600)
     asked = len(provider.asked)
-    assert 2 <= asked <= 5 and waiting(pane, lib)
+    assert 2 <= asked <= 8 and waiting(pane, lib)
     pane.refresh()                       # relisted (as the folder watcher does):
     assert wait_until(lambda: not pane._loading)       # the budget still holds
     QTest.qWait(300)
@@ -1161,3 +1162,45 @@ def test_icon_urls_and_folder_shortcut_drives_are_judged_too(qapp, tmp_path, mon
     if os.name == "nt":
         (place / "target.lnk").write_bytes(lnk_bytes(base="C:\\backup"))
         assert not share(str(place), True)
+
+
+def test_a_file_whose_picture_hung_is_not_asked_about_when_it_changes(browser,
+                                                                       monkeypatch):
+    """A file being written changes at every listing: its picture's key
+    changed with it, and the shell was asked again — one more hang each time."""
+    class Hung(CountingProvider):
+        def icon(self, info):
+            from PyQt5.QtGui import QIcon
+            self.asked.append(info.fileName())
+            time.sleep(0.05)
+            return QIcon()
+    provider = Hung()
+    pane, lib = native_pane(browser, monkeypatch, provider)
+    monkeypatch.setattr(lib, "_PICTURE_HUNG", 0.01)
+    monkeypatch.setattr(lib, "_PICTURE_BUDGET", 100.0)    # only the hang counts here
+    pane.refresh()
+    assert wait_until(lambda: not pane._loading and provider.asked)
+    first = provider.asked[0]
+    for n in range(3):                                    # it changes, relisted
+        stamp = time.time() + 10 * (n + 1)
+        os.utime(str(browser.local_dir / first), (stamp, stamp))   # (a folder too)
+        pane.refresh()
+        assert wait_until(lambda: not pane._loading)
+        QTest.qWait(150)
+    assert provider.asked.count(first) == 1
+
+
+def test_file_urls_must_be_on_a_fixed_disk(qapp, tmp_path, monkeypatch):
+    from turbossh.gui import file_browser
+    monkeypatch.setattr(file_browser, "drive_type",
+                        lambda root: 3 if root.upper() == "C:\\" else 4)
+
+    def url(n, icon):
+        path = tmp_path / f"u{n}.url"
+        path.write_text(f"[InternetShortcut]\nURL=http://wiki.invalid/\nIconFile={icon}\n")
+        return file_browser._icon_on_a_share(str(path), False)
+    # forms the shell reads as \\server\share that Qt does not
+    assert url(1, "file:///\\\\fileserver.invalid\\icons\\x.ico")
+    assert url(2, "file://\\\\fileserver.invalid\\icons\\x.ico")
+    assert url(3, "file://fileserver.invalid/icons/x.ico")
+    assert url(4, "file:///Z:/icons/x.ico")
