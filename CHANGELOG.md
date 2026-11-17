@@ -2,7 +2,7 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
-## Unreleased
+## 2.3.0 — 2026-11-17
 
 The Files tab looks and works like TurboADB's; tab close buttons and check
 boxes are plain to see in every theme.
