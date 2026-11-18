@@ -579,8 +579,9 @@ def accent_pixels(image, accent="#2a82da") -> int:
                if contrast(image.pixelColor(x, y).name(), accent) < 1.15)
 
 
-def indicator_image(button):
-    """The indicator of a radio button / check box, as drawn (not its text)."""
+def indicator_image(button, within=None):
+    """The indicator of a radio button / check box, as drawn (not its text);
+    *within*: grabbed from that ancestor, with what lies under it."""
     from PyQt5.QtCore import QRect
     from PyQt5.QtWidgets import QStyle, QStyleOptionButton
     option = QStyleOptionButton()
@@ -588,8 +589,11 @@ def indicator_image(button):
     element = (QStyle.SE_RadioButtonIndicator if isinstance(button, _radio())
                else QStyle.SE_CheckBoxIndicator)
     rect = button.style().subElementRect(element, option, button)
-    return button.grab(QRect(rect.x() - 1, rect.y() - 1, rect.width() + 2,
-                             rect.height() + 2)).toImage()
+    area = QRect(rect.x() - 1, rect.y() - 1, rect.width() + 2, rect.height() + 2)
+    if within is not None:
+        area.moveTopLeft(button.mapTo(within, area.topLeft()))
+        return within.grab(area).toImage()
+    return button.grab(area).toImage()
 
 
 def _radio():
@@ -646,12 +650,13 @@ def test_a_host_stylesheet_that_draws_indicators_keeps_its_own(app_look, embed):
     assert magenta >= 20
 
 
-def test_turbossh_keeps_the_palette_and_font_of_the_host_window(host, embed):
+def test_turbossh_keeps_the_palette_and_font_of_the_host_window(app_look, host, embed):
     """A host that sets its colours and font on its window, not on the
     application: TurboSSH's widgets take them (a stylesheet of TurboSSH's on
     its window would cut them off) and its marks follow a switch to light."""
     from PyQt5.QtGui import QColor, QFont, QPalette
     from PyQt5.QtWidgets import QCheckBox, QLineEdit, QRadioButton
+    app_look(palette=QPalette(QApplication.palette()))  # Fusion, the app's colours
     host.setPalette(dark_palette())
     font = QFont(host.font())
     font.setPointSize(15)
@@ -682,8 +687,9 @@ def test_turbossh_keeps_the_palette_and_font_of_the_host_window(host, embed):
     assert visible(indicator_image(radio), "#ffffff") >= 20
 
 
-def test_a_theme_of_its_own_gives_the_marks_back(embed):
+def test_a_theme_of_its_own_gives_the_marks_back(app_look, embed):
     from PyQt5.QtWidgets import QCheckBox
+    app_look()
     turbo = embed(theme="inherit")
     box = QCheckBox("x", turbo.main_window)
     box.show()
@@ -738,15 +744,109 @@ def test_a_host_style_of_its_own_is_left_alone(qapp, app_look, embed):
 def test_the_application_filter_goes_with_the_last_window(embed):
     from turbossh.gui import indicators
     turbo = embed(theme="inherit")
-    assert indicators._filter is not None
+    assert indicators._installed
     turbo.set_theme("nord")                             # a look of its own
-    assert indicators._filter is None
+    assert not indicators._installed
     turbo.set_theme("inherit")
-    assert indicators._filter is not None
+    assert indicators._installed
     turbo.shutdown()
     QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     QApplication.processEvents()
-    assert indicators._filter is None
+    assert not indicators._installed
+    for _ in range(5):                                  # no pile of filters
+        turbo2 = embed(theme="inherit")
+        turbo2.set_theme("nord")
+    from turbossh.gui.indicators import _Polisher
+    assert len([c for c in QApplication.instance().children()
+                if isinstance(c, _Polisher)]) == 1
+
+
+def test_the_style_behind_a_host_stylesheet_decides(qapp, app_look, embed):
+    """Behind an application stylesheet: a host's own style is still left
+    alone, and a palette-drawn one still gets the help."""
+    from PyQt5.QtWidgets import QCheckBox, QProxyStyle, QStyleFactory
+    app_look(stylesheet="")
+
+    class HostStyle(QProxyStyle):
+        pass
+    qapp.setStyle(HostStyle(QStyleFactory.create("Fusion")))
+    qapp.setStyleSheet("QLabel { color: #e0e0e0; }")
+    turbo = embed(theme="inherit")
+    box = QCheckBox("x", turbo.main_window)
+    box.show()
+    QTest.qWait(20)
+    assert not box.property("turbossh_indicator")
+    qapp.setStyleSheet("")
+    qapp.setStyle(QStyleFactory.create("Windows"))
+    qapp.setStyleSheet("QLabel { color: #e0e0e0; }")
+    QTest.qWait(20)
+    other = QCheckBox("y", turbo.main_window)
+    other.show()
+    QTest.qWait(20)
+    assert other.property("turbossh_indicator")
+
+
+@pytest.mark.parametrize("look", ["light-transparent", "dark-tint", "dark-sheet-only",
+                                  "dark-sheet-gradient"])
+def test_an_empty_mark_over_a_see_through_background_is_not_solid(app_look, embed, look):
+    """A host stylesheet's see-through background on check boxes: the empty
+    mark shows the background, not a solid black (or white) disc."""
+    from PyQt5.QtGui import QColor, QPalette
+    from PyQt5.QtWidgets import QRadioButton
+    if look == "light-transparent":
+        light = QPalette(dark_palette())
+        for role, color in ((QPalette.Window, "#f0f0f0"), (QPalette.Base, "#ffffff"),
+                            (QPalette.Text, "#202020"), (QPalette.WindowText, "#202020")):
+            light.setColor(role, QColor(color))
+        page, sheet = "#f0f0f0", ("QWidget { background: #f0f0f0; color: #202020; }\n"
+                                  "QRadioButton, QCheckBox { background: transparent; }")
+        app_look(palette=light, stylesheet=sheet)
+    elif look == "dark-tint":
+        page, sheet = "#1e1e1e", ("QWidget { background: #1e1e1e; color: #e0e0e0; }\n"
+                                  "QRadioButton, QCheckBox "
+                                  "{ background: rgba(255, 255, 255, 12); }")
+        app_look(stylesheet=sheet)
+    else:                    # dark by its stylesheet alone, the app palette light
+        fill = ("transparent" if look == "dark-sheet-only" else
+                "qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #202020, stop:1 #181818)")
+        page = "#1e1e1e"
+        sheet = ("QWidget { background: #1e1e1e; color: #e0e0e0; }\n"
+                 f"QRadioButton, QCheckBox {{ background: {fill}; }}")
+        light = QPalette()                              # Qt's own light colours
+        light.setColor(QPalette.Highlight, QColor("#2a82da"))
+        app_look(palette=light, stylesheet=sheet)
+    turbo = embed(theme="inherit")
+    from PyQt5.QtCore import Qt as _Qt
+    from PyQt5.QtWidgets import QWidget as _Pad
+    pad = _Pad(turbo.main_window)              # a plain patch of the page, nothing else
+    pad.setAttribute(_Qt.WA_StyledBackground, True)
+    pad.setGeometry(300, 300, 200, 60)
+    pad.show()
+    radio = QRadioButton("off", pad)
+    radio.move(10, 10)
+    radio.show()
+    QTest.qWait(30)
+    image = indicator_image(radio)             # (the button alone: no page under it)
+    centre = image.pixelColor(image.width() // 2, image.height() // 2)
+    from turbossh.gui.theme import contrast
+    solid = centre.alpha() >= 128 and contrast(centre.name(), page) >= 1.15
+    assert not solid, f"a solid {centre.name()} disc on {page}"
+    # and a ring that shows on the page, seen with the page under it
+    seen = indicator_image(radio, within=pad)
+    assert seen.pixelColor(0, 0).name() == page         # (the page is under it)
+    assert visible(seen, page) >= 15, "no ring on the page"
+
+
+def test_a_box_polished_before_it_joins_the_window_gets_the_marks(app_look, embed):
+    from PyQt5.QtWidgets import QCheckBox
+    app_look()
+    turbo = embed(theme="inherit")
+    box = QCheckBox("late")
+    box.sizeHint()                                      # polished on its own
+    box.setParent(turbo.main_window)
+    box.show()
+    QTest.qWait(20)
+    assert box.property("turbossh_indicator")
 
 
 def test_the_ring_takes_the_text_colour_when_the_palette_is_flat(qapp):

@@ -16,6 +16,8 @@ and font the host gives its window. Where the host's stylesheet styles
 
 from __future__ import annotations
 
+import weakref
+
 from PyQt5.QtCore import QEvent, QObject, QPointF, QRectF, Qt
 from PyQt5.QtGui import QColor, QPainter, QPalette, QPen
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QProxyStyle, QRadioButton,
@@ -31,19 +33,63 @@ except ImportError:                      # PyQt5 < 5.11 ships it on its own
 _MARK = "turbossh_indicator"   # property set on a widget given the style
 _STYLES = {}                   # base style key -> IndicatorStyle (owned by the app)
 _WINDOWS = {}                  # id -> TurboSSH window that keeps the host's look
-_filter = None                 # the application's event filter, while needed
+_filter = None                 # the application's event filter (one)...
+_installed = False             # ...installed while a window needs it
+_WATCHED = "turbossh_indicator_window"   # property: its destroyed is connected
 # the styles that draw these marks from the palette (dark: no ring); a native
 # style, or the host's own (a proxy, Breeze…), is left as it is
 _PALETTE_STYLES = ("Fusion", "Windows")
 
 
-def indicator_colors(palette) -> dict:
+def _behind(widget=None) -> QColor:
+    """What a see-through background lies on: the first solid background of
+    the widget's parents (a host may be dark by its stylesheet alone, its
+    application palette left light), else the application's window colour."""
+    current = widget.parentWidget() if widget is not None else None
+    while current is not None:
+        brush = current.palette().brush(QPalette.Active, current.backgroundRole())
+        if brush.style() == Qt.SolidPattern and brush.color().alpha() == 255:
+            return QColor(brush.color())
+        if current.isWindow():           # a dialog does not lie on its owner
+            break
+        current = current.parentWidget()
+    app = QApplication.instance()
+    colour = app.palette().color(QPalette.Window) if app is not None else QColor("#808080")
+    colour.setAlpha(255)
+    return colour
+
+
+def _surface(palette, role, group=QPalette.Active, widget=None):
+    """``(opaque name, colour to fill with or None)`` of a background role. A
+    host stylesheet's ``background:`` ends up here: a see-through colour is
+    judged as it looks over the window (and filled as it is, see-through); a
+    gradient or picture is judged as the window colour and not filled over."""
+    brush = palette.brush(group, role)
+    if brush.style() != Qt.SolidPattern:
+        return _behind(widget).name(), None
+    colour = QColor(brush.color())
+    alpha = colour.alphaF()
+    if alpha >= 1.0:
+        return colour.name(), colour
+    under = _behind(widget)
+    seen = QColor(round(colour.red() * alpha + under.red() * (1 - alpha)),
+                  round(colour.green() * alpha + under.green() * (1 - alpha)),
+                  round(colour.blue() * alpha + under.blue() * (1 - alpha)))
+    return seen.name(), colour
+
+
+def indicator_colors(palette, widget=None) -> dict:
     """The colours of the marks, from *palette*: an edge that stands out from
-    both the field and the window (else the text colour), the accent and a
-    readable colour on it, and muted ones for disabled marks."""
+    both the field and the window (else the text colour, else black or
+    white), the accent and a readable colour on it, and muted ones for
+    disabled marks. ``base_fill`` / ``window_fill``: what to fill an empty
+    mark with (None: nothing, the background shows). *widget*: the one
+    painted, whose parents say what a see-through background lies on."""
     def color(role, group=QPalette.Active):
         return palette.color(group, role).name()
-    base, text, window = color(QPalette.Base), color(QPalette.Text), color(QPalette.Window)
+    base, base_fill = _surface(palette, QPalette.Base, widget=widget)
+    window, window_fill = _surface(palette, QPalette.Window, widget=widget)
+    text = color(QPalette.Text)
     accent, on_accent = color(QPalette.Highlight), color(QPalette.HighlightedText)
     def stands_out(colour):
         return min(theme.contrast(colour, window), theme.contrast(colour, base)) >= 3.0
@@ -58,28 +104,30 @@ def indicator_colors(palette) -> dict:
         on_accent = black_or_white(accent)
     muted = theme._mix(accent, window, 0.5)
     return {"base": base, "text": text, "window": window, "edge": edge,
+            "base_fill": base_fill, "window_fill": window_fill,
             "accent": accent, "on_accent": on_accent,
             "dim_edge": theme._mix(base, text, 0.35), "muted": muted,
             "dim_mark": theme._mix(color(QPalette.Text, QPalette.Disabled), muted, 0.3)}
 
 
-def paint_indicator(painter, option, radio: bool) -> None:
+def paint_indicator(painter, option, radio: bool, widget=None) -> None:
     """Draw a radio button's ring (or a check box's box) into option.rect: a
     ring when off, filled with the accent and marked when on."""
-    c = indicator_colors(option.palette)
+    c = indicator_colors(option.palette, widget)
     state = option.state
     enabled = bool(state & QStyle.State_Enabled)
     on = bool(state & QStyle.State_On)
     partial = bool(state & QStyle.State_NoChange) and not radio
     if not enabled:
-        edge, fill, mark = c["dim_edge"], (c["muted"] if on or partial else c["window"]), c["dim_mark"]
+        edge, mark = c["dim_edge"], c["dim_mark"]
+        fill = QColor(c["muted"]) if on or partial else c["window_fill"]
         if on or partial:
             edge = c["muted"]
     elif on or partial:
-        edge, fill, mark = c["accent"], c["accent"], c["on_accent"]
+        edge, fill, mark = c["accent"], QColor(c["accent"]), c["on_accent"]
     else:
         edge = c["accent"] if state & QStyle.State_MouseOver else c["edge"]
-        fill, mark = c["base"], c["on_accent"]
+        fill, mark = c["base_fill"], c["on_accent"]
     rect = QRectF(option.rect)
     side = min(rect.width(), rect.height())
     if side <= 2:
@@ -92,7 +140,7 @@ def paint_indicator(painter, option, radio: bool) -> None:
     pen = QPen(QColor(edge))
     pen.setWidthF(width)
     painter.setPen(pen)
-    painter.setBrush(QColor(fill))
+    painter.setBrush(fill if fill is not None else Qt.NoBrush)
     if radio:
         painter.drawEllipse(box)
         if on:
@@ -122,9 +170,9 @@ class IndicatorStyle(QProxyStyle):
 
     def drawPrimitive(self, element, option, painter, widget=None):  # noqa: N802 - Qt API
         if element == QStyle.PE_IndicatorRadioButton:
-            paint_indicator(painter, option, radio=True)
+            paint_indicator(painter, option, radio=True, widget=widget)
         elif element == QStyle.PE_IndicatorCheckBox:
-            paint_indicator(painter, option, radio=False)
+            paint_indicator(painter, option, radio=False, widget=widget)
         else:
             super().drawPrimitive(element, option, painter, widget)
 
@@ -132,11 +180,15 @@ class IndicatorStyle(QProxyStyle):
 def _base_key() -> str:
     """The key of the style to draw the rest with, or "" to leave the widget
     alone: only a style that draws these marks from the palette needs the
-    help. Behind an application stylesheet the style is hidden; Fusion, which
-    also follows the palette, stands in (the stylesheet draws most anyway)."""
-    name = QApplication.style().metaObject().className()
+    help. Behind an application stylesheet, the style it wraps (its child)
+    decides; Fusion stands in if it cannot be found."""
+    style = QApplication.style()
+    name = style.metaObject().className()
     if name == "QStyleSheetStyle":
-        return "Fusion"
+        inner = next((c for c in style.children() if isinstance(c, QStyle)), None)
+        if inner is None:
+            return "Fusion"
+        name = inner.metaObject().className()
     for key in _PALETTE_STYLES:
         if name.lower() == f"q{key.lower()}style":
             return key
@@ -196,9 +248,10 @@ class _Polisher(QObject):
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt API
         kind = event.type()
-        if (kind == QEvent.Polish and isinstance(obj, (QRadioButton, QCheckBox))
+        if (kind in (QEvent.Polish, QEvent.ParentChange)
+                and isinstance(obj, (QRadioButton, QCheckBox))
                 and not obj.property(_MARK) and _ours(obj)):
-            _give(obj)
+            _give(obj)                   # (ParentChange: polished before it came)
         elif kind == QEvent.StyleChange and id(obj) in _WINDOWS:
             _restyle(obj)
         return False
@@ -206,31 +259,44 @@ class _Polisher(QObject):
 
 def _forget(key) -> None:
     """A window that kept the host's look is gone (or has its own look now):
-    the application's filter goes too once no such window is left."""
-    global _filter
+    the application's filter is taken out once no such window is left (and
+    kept, for the next one)."""
+    global _installed
     _WINDOWS.pop(key, None)
-    if not _WINDOWS and _filter is not None:
+    if not _WINDOWS and _installed:
         app = QApplication.instance()
-        if app is not None and not sip.isdeleted(_filter):
+        if app is not None and _filter is not None and not sip.isdeleted(_filter):
             app.removeEventFilter(_filter)
-        _filter = None
+        _installed = False
+
+
+def _gone(key, ref) -> None:
+    """A watched window was destroyed: forget it — if the entry under its id is
+    still that window (after release() the id may name another one now)."""
+    window = ref()
+    if window is not None and _WINDOWS.get(key) is window:
+        _forget(key)
 
 
 def follow(window) -> None:
     """*window* keeps the host's look: its check boxes and radio buttons, and
     those of its dialogs, get :class:`IndicatorStyle` — the ones there now,
     and the ones to come."""
-    global _filter
+    global _filter, _installed
     app = QApplication.instance()
     if app is None:
         return
-    if _filter is None or sip.isdeleted(_filter):
-        _filter = _Polisher(app)
+    if _filter is None or sip.isdeleted(_filter):        # (or a new application)
+        _filter, _installed = _Polisher(app), False
+    if not _installed:
         app.installEventFilter(_filter)
+        _installed = True
     key = id(window)
-    if key not in _WINDOWS:
-        _WINDOWS[key] = window
-        window.destroyed.connect(lambda _obj=None, k=key: _forget(k))
+    _WINDOWS[key] = window
+    if not window.property(_WATCHED):                     # once per window
+        window.setProperty(_WATCHED, True)
+        ref = weakref.ref(window)
+        window.destroyed.connect(lambda _obj=None, k=key, r=ref: _gone(k, r))
     _restyle(window)
 
 

@@ -2,6 +2,22 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.3.1 — 2026-11-18
+
+Radio buttons and check boxes show in a dark host application.
+
+### Fixed
+- **Radio buttons were invisible when TurboSSH is embedded with the host's
+  look** (`theme="inherit"`) in a dark application using Qt's Fusion style:
+  an unticked radio button had no ring, a ticked one only a small dot (in the
+  New / edit session dialog, for one). TurboSSH still takes the host's look,
+  but draws the boxes of its check boxes and the rings of its radio buttons
+  itself, from the host's colours as they are when painted — a ring when off,
+  filled with the host's accent when on — so a switch between dark and light
+  is followed. Where the host's stylesheet draws these marks itself, the
+  host's rule is kept. No stylesheet is added: TurboSSH's widgets keep the
+  palette and font the host gives its window.
+
 ## 2.3.0 — 2026-11-17
 
 The Files tab looks and works like TurboADB's; tab close buttons and check
