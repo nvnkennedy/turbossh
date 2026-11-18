@@ -2,9 +2,10 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
-## 2.3.1 — 2026-11-18
+## 2.4.0 — 2026-11-18
 
-Radio buttons and check boxes show in a dark host application.
+Radio buttons and check boxes show in a host application's look, dark or
+light, whatever its style or stylesheet.
 
 ### Fixed
 - **Radio buttons were invisible when TurboSSH is embedded with the host's
@@ -17,6 +18,15 @@ Radio buttons and check boxes show in a dark host application.
   is followed. Where the host's stylesheet draws these marks itself, the
   host's rule is kept. No stylesheet is added: TurboSSH's widgets keep the
   palette and font the host gives its window.
+- **A host with its own style keeps its marks**, also behind an application
+  stylesheet: only Fusion and Windows, the styles that draw these marks from
+  the palette, get the help — Windows' native style or a host's own style is
+  left as it is.
+- **A see-through check box background stays see-through**: an empty mark
+  shows the host's background, not a solid black or white disc.
+- Check boxes and radio buttons added to a TurboSSH window after they were
+  first shown get the marks too; switching between a theme and the host's
+  look many times leaves nothing behind.
 
 ## 2.3.0 — 2026-11-17
 
