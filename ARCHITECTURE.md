@@ -72,6 +72,7 @@ turbossh/
     ├── logs_tab.py        the live-log viewer (level colours, find)
     ├── theme.py           dark/light stylesheet
     ├── glyphs.py          the file browser's small vector icons (theme-following)
+    ├── indicators.py      check boxes / radio buttons that show in a host's look
     └── updater.py         in-app "check for updates"
 ```
 

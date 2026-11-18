@@ -444,6 +444,8 @@ class TurboSSHWidget(QWidget):
                 self._win.shut_down()
             except RuntimeError:         # the host already deleted the Qt side
                 pass
+            from . import indicators     # no longer anything to draw for it
+            indicators.release(self._win)
             for session in list(self._sessions.values()):
                 self._on_closed(session.widget)
             # the host's theme is process-wide: drop it only with its last user

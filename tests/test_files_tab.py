@@ -1204,3 +1204,27 @@ def test_file_urls_must_be_on_a_fixed_disk(qapp, tmp_path, monkeypatch):
     assert url(2, "file://\\\\fileserver.invalid\\icons\\x.ico")
     assert url(3, "file://fileserver.invalid/icons/x.ico")
     assert url(4, "file:///Z:/icons/x.ico")
+
+
+@pytest.mark.parametrize("name", ["dark", "light", "midnight", "dracula"])
+def test_radio_buttons_show_a_ring_and_a_filled_choice(qapp, styled, name):
+    from PyQt5.QtCore import QRect
+    from PyQt5.QtWidgets import QRadioButton
+    from turbossh.gui import theme
+    styled(name)
+    holder = QWidget()
+    holder.setStyleSheet(f"QWidget {{ background: {theme.THEMES[name]['panel']}; }}")
+    first, second = QRadioButton("SSH", holder), QRadioButton("Serial", holder)
+    second.move(0, 30)
+    first.setChecked(True)
+    holder.resize(200, 60)
+    holder.show()
+    QTest.qWait(30)
+    panel = theme.THEMES[name]["panel"]
+    off = second.grab(QRect(0, 0, 24, second.height())).toImage()
+    on = first.grab(QRect(0, 0, 24, first.height())).toImage()
+    assert visible_pixels(off, QColor(panel)) >= 25, "no ring on the unchecked one"
+    accent = sum(1 for y in range(on.height()) for x in range(on.width())
+                 if contrast(on.pixelColor(x, y).name(), theme.ACCENT) < 1.2)
+    assert accent >= 40, "the checked one is not filled"
+    holder.deleteLater()

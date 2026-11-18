@@ -388,6 +388,21 @@ def _image_rule(url: str) -> str:
     return f"image: {css};" if css else ""
 
 
+def contrast(a: str, b: str) -> float:
+    """WCAG contrast ratio of two colours (1 = the same, 21 = black on white)."""
+    from PyQt5.QtGui import QColor
+
+    def luminance(color):
+        def channel(v):
+            v /= 255.0
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+        c = QColor(color)
+        return (0.2126 * channel(c.red()) + 0.7152 * channel(c.green())
+                + 0.0722 * channel(c.blue()))
+    high, low = sorted((luminance(a), luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
 def _tone_rules(c: dict, name: str) -> str:
     """Push / Pull and the other buttons tinted with a tone (``setProperty
     ("tone", "blue")``): a wash of the tone, readable text, a firmer edge."""

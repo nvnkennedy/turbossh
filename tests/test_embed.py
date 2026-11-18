@@ -520,6 +520,250 @@ def test_inherit_keeps_the_hosts_styling(embed):
     assert theme.current_name() in ("dark", "light") and settings.get("theme") == "dark"
 
 
+def dark_palette():
+    from PyQt5.QtGui import QColor, QPalette
+    palette = QPalette()
+    for role, color in ((QPalette.Window, "#1e1e1e"), (QPalette.WindowText, "#e0e0e0"),
+                        (QPalette.Base, "#121212"), (QPalette.AlternateBase, "#1a1a1a"),
+                        (QPalette.Text, "#e0e0e0"), (QPalette.Button, "#2a2a2a"),
+                        (QPalette.ButtonText, "#e0e0e0"), (QPalette.Highlight, "#2a82da"),
+                        (QPalette.HighlightedText, "#ffffff")):
+        palette.setColor(role, QColor(color))
+    return palette
+
+
+@pytest.fixture()
+def app_look(qapp):
+    """Set the application's style, palette and stylesheet for one test, as a
+    host does, and put back exactly what was there."""
+    from PyQt5.QtGui import QPalette
+    from PyQt5.QtWidgets import QStyleFactory
+    sheet = qapp.styleSheet()
+    qapp.setStyleSheet("")                       # (the style's own name shows then)
+    before = (qapp.style().objectName(), QPalette(qapp.palette()))
+
+    def apply(style="Fusion", palette=None, stylesheet=""):
+        qapp.setStyle(QStyleFactory.create(style))
+        qapp.setPalette(palette or dark_palette())
+        qapp.setStyleSheet(stylesheet)
+    yield apply
+    qapp.setStyleSheet("")
+    qapp.setPalette(before[1])
+    qapp.setStyle(QStyleFactory.create(before[0]) or QStyleFactory.create("Windows"))
+    qapp.setStyleSheet(sheet)
+
+
+# what a dark host's stylesheet may do: style check boxes, leave radio buttons
+# to the style (Fusion then drew no ring on the dark background)
+HOST_SHEET = ("QWidget { background: #1e1e1e; color: #e0e0e0; }\n"
+              "QCheckBox::indicator { width: 16px; height: 16px; "
+              "border: 2px solid #c0c0c0; border-radius: 4px; }\n"
+              "QCheckBox::indicator:checked { background: #2a82da; border-color: #2a82da; }")
+
+
+def visible(image, background, minimum=2.5) -> int:
+    """Pixels of *image* that stand out from *background*."""
+    from turbossh.gui.theme import contrast
+    count = 0
+    for y in range(image.height()):
+        for x in range(image.width()):
+            c = image.pixelColor(x, y)
+            if c.alpha() > 128 and contrast(c.name(), background) >= minimum:
+                count += 1
+    return count
+
+
+def accent_pixels(image, accent="#2a82da") -> int:
+    from turbossh.gui.theme import contrast
+    return sum(1 for y in range(image.height()) for x in range(image.width())
+               if contrast(image.pixelColor(x, y).name(), accent) < 1.15)
+
+
+def indicator_image(button):
+    """The indicator of a radio button / check box, as drawn (not its text)."""
+    from PyQt5.QtCore import QRect
+    from PyQt5.QtWidgets import QStyle, QStyleOptionButton
+    option = QStyleOptionButton()
+    option.initFrom(button)
+    element = (QStyle.SE_RadioButtonIndicator if isinstance(button, _radio())
+               else QStyle.SE_CheckBoxIndicator)
+    rect = button.style().subElementRect(element, option, button)
+    return button.grab(QRect(rect.x() - 1, rect.y() - 1, rect.width() + 2,
+                             rect.height() + 2)).toImage()
+
+
+def _radio():
+    from PyQt5.QtWidgets import QRadioButton
+    return QRadioButton
+
+
+@pytest.mark.parametrize("stylesheet", [HOST_SHEET, ""], ids=["host-sheet", "no-sheet"])
+def test_radio_rings_and_check_boxes_show_on_a_dark_host(app_look, embed, stylesheet):
+    """The Connect dialog of TurboSSH in a dark Fusion host that keeps its own
+    look: an unticked radio button has a ring, a ticked one is filled, and so
+    are check boxes — with or without a host stylesheet."""
+    from PyQt5.QtWidgets import QCheckBox, QRadioButton
+    from turbossh.gui.session_dialog import SessionDialog
+    app_look(stylesheet=stylesheet)
+    turbo = embed(theme="inherit")
+    dlg = SessionDialog(turbo.main_window)
+    dlg.show()
+    try:
+        QTest.qWait(50)
+        radios = [r for r in dlg.findChildren(QRadioButton) if r.isVisible()]
+        on = [r for r in radios if r.isChecked()]
+        off = [r for r in radios if not r.isChecked()]
+        assert on and off
+        background = "#1e1e1e"
+        for radio in off:                                # a ring, not nothing
+            assert visible(indicator_image(radio), background) >= 20, radio.text()
+        for radio in on:                                 # filled with the accent
+            assert accent_pixels(indicator_image(radio)) >= 30, radio.text()
+        box = [b for b in dlg.findChildren(QCheckBox) if b.isVisible()][0]
+        box.setChecked(False)
+        QTest.qWait(20)
+        assert visible(indicator_image(box), background) >= 20
+        box.setChecked(True)
+        QTest.qWait(20)
+        assert accent_pixels(indicator_image(box)) >= 30
+    finally:
+        dlg.done(0)
+        dlg.deleteLater()
+
+
+def test_a_host_stylesheet_that_draws_indicators_keeps_its_own(app_look, embed):
+    """The host's ::indicator rule still wins: TurboSSH draws only what the
+    host leaves to the style."""
+    from PyQt5.QtWidgets import QCheckBox
+    app_look(stylesheet=HOST_SHEET.replace("#c0c0c0", "#ff00ff"))
+    turbo = embed(theme="inherit")
+    box = QCheckBox("x", turbo.main_window)
+    box.show()
+    QTest.qWait(30)
+    image = indicator_image(box)
+    magenta = sum(1 for y in range(image.height()) for x in range(image.width())
+                  if image.pixelColor(x, y).name() == "#ff00ff")
+    assert magenta >= 20
+
+
+def test_turbossh_keeps_the_palette_and_font_of_the_host_window(host, embed):
+    """A host that sets its colours and font on its window, not on the
+    application: TurboSSH's widgets take them (a stylesheet of TurboSSH's on
+    its window would cut them off) and its marks follow a switch to light."""
+    from PyQt5.QtGui import QColor, QFont, QPalette
+    from PyQt5.QtWidgets import QCheckBox, QLineEdit, QRadioButton
+    host.setPalette(dark_palette())
+    font = QFont(host.font())
+    font.setPointSize(15)
+    host.setFont(font)
+    turbo = embed(theme="inherit")
+    win = turbo.main_window
+    field = QLineEdit(win)
+    radio = QRadioButton("off", win)
+    box = QCheckBox("on", win)
+    box.setChecked(True)
+    for w in (field, radio, box):
+        w.show()
+    radio.move(0, 40)
+    box.move(0, 80)
+    QTest.qWait(30)
+    assert field.palette().color(QPalette.Base).name() == "#121212"
+    assert field.font().pointSize() == 15 and radio.font().pointSize() == 15
+    assert visible(indicator_image(radio), "#121212") >= 20
+    assert accent_pixels(indicator_image(box)) >= 30
+
+    light = QPalette(dark_palette())
+    for role, color in ((QPalette.Window, "#f0f0f0"), (QPalette.Base, "#ffffff"),
+                        (QPalette.Text, "#202020"), (QPalette.WindowText, "#202020")):
+        light.setColor(role, QColor(color))
+    host.setPalette(light)
+    QTest.qWait(30)
+    assert field.palette().color(QPalette.Base).name() == "#ffffff"
+    assert visible(indicator_image(radio), "#ffffff") >= 20
+
+
+def test_a_theme_of_its_own_gives_the_marks_back(embed):
+    from PyQt5.QtWidgets import QCheckBox
+    turbo = embed(theme="inherit")
+    box = QCheckBox("x", turbo.main_window)
+    box.show()
+    QTest.qWait(20)
+    assert box.property("turbossh_indicator")
+    turbo.set_theme("nord")
+    assert not box.property("turbossh_indicator")
+    assert turbo.main_window.styleSheet()
+
+
+def magenta_pixels(image) -> int:
+    return sum(1 for y in range(image.height()) for x in range(image.width())
+               if image.pixelColor(x, y).name() == "#ff00ff")
+
+
+def test_a_host_stylesheet_set_later_still_wins(qapp, app_look, embed):
+    """A host that switches theme by setting its stylesheet after TurboSSH's
+    marks were drawn: the host's rule takes over (Qt leaves a widget with a
+    style of its own out of a new application stylesheet)."""
+    from PyQt5.QtWidgets import QCheckBox
+    app_look(stylesheet="")
+    turbo = embed(theme="inherit")
+    box = QCheckBox("x", turbo.main_window)
+    box.show()
+    QTest.qWait(30)
+    assert box.property("turbossh_indicator")
+    qapp.setStyleSheet(HOST_SHEET.replace("#c0c0c0", "#ff00ff"))
+    QTest.qWait(30)
+    assert magenta_pixels(indicator_image(box)) >= 20
+    qapp.setStyleSheet("")                              # and back: TurboSSH's ring
+    QTest.qWait(30)
+    assert magenta_pixels(indicator_image(box)) == 0
+    assert visible(indicator_image(box), "#121212") >= 20
+
+
+def test_a_host_style_of_its_own_is_left_alone(qapp, app_look, embed):
+    """A host with its own style (a proxy, a desktop theme): TurboSSH's marks
+    are the host's, as before — only palette-drawn styles get the help."""
+    from PyQt5.QtWidgets import QCheckBox, QProxyStyle, QStyleFactory
+    app_look(stylesheet="")
+
+    class HostStyle(QProxyStyle):
+        pass
+    qapp.setStyle(HostStyle(QStyleFactory.create("Fusion")))
+    turbo = embed(theme="inherit")
+    box = QCheckBox("x", turbo.main_window)
+    box.show()
+    QTest.qWait(30)
+    assert not box.property("turbossh_indicator")
+
+
+def test_the_application_filter_goes_with_the_last_window(embed):
+    from turbossh.gui import indicators
+    turbo = embed(theme="inherit")
+    assert indicators._filter is not None
+    turbo.set_theme("nord")                             # a look of its own
+    assert indicators._filter is None
+    turbo.set_theme("inherit")
+    assert indicators._filter is not None
+    turbo.shutdown()
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    QApplication.processEvents()
+    assert indicators._filter is None
+
+
+def test_the_ring_takes_the_text_colour_when_the_palette_is_flat(qapp):
+    from PyQt5.QtGui import QColor, QPalette
+    from turbossh.gui.indicators import indicator_colors
+    flat = dark_palette()
+    flat.setColor(QPalette.Text, QColor("#2c2c2c"))      # text barely off the base
+    flat.setColor(QPalette.HighlightedText, QColor("#2a82da"))   # and on the accent
+    colors = indicator_colors(flat)
+    assert colors["edge"] == "#ffffff"                   # the text would not show
+    assert colors["on_accent"] in ("#ffffff", "#000000")
+    usable = dark_palette()
+    usable.setColor(QPalette.Base, QColor("#1e1e1e"))
+    usable.setColor(QPalette.Text, QColor("#9a9a9a"))
+    assert indicator_colors(usable)["edge"] in ("#9a9a9a", "#5c5c5c")
+
+
 def test_set_theme_is_the_users_choice_when_the_host_set_none(embed):
     from turbossh.gui import settings, theme
     turbo = embed()

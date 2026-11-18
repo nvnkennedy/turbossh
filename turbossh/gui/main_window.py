@@ -238,10 +238,16 @@ class MainWindow(QMainWindow):
     def _apply_stylesheet(self, name):
         """App-wide when this window IS the application. Hosted, only this widget
         tree (dialogs and menus inherit it from their parent), or nothing at all
-        when the host's own styling is to be kept."""
+        when the host's own styling is to be kept — then only the check boxes'
+        boxes and radio buttons' rings are TurboSSH's (see indicators.py): some
+        styles draw them from a dark palette in a colour that does not show."""
+        from . import indicators
         if not self.embedded:
             QApplication.instance().setStyleSheet(theme.stylesheet(name))
-        elif not self._inherit_style:
+        elif self._inherit_style:
+            indicators.follow(self)
+        else:
+            indicators.leave(self)
             self.setStyleSheet(theme.stylesheet(name))
 
     def _scope_menu_shortcuts(self):
