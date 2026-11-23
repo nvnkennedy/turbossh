@@ -26,14 +26,14 @@ from collections import deque, namedtuple
 
 import paramiko
 from paramiko.ssh_exception import SSHException
-from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QSize,
+from PyQt5.QtCore import (QEvent, QItemSelection, QItemSelectionModel, QMimeData, QSize,
                           QThread, QTimer, pyqtSignal, Qt)
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTreeWidget, QTreeWidgetItem, QFileDialog,
                              QInputDialog, QMessageBox, QLabel, QProgressBar,
                              QAbstractItemView, QHeaderView, QShortcut, QMenu,
-                             QStyle, QApplication, QSizePolicy)
+                             QApplication, QSizePolicy)
 
 from .. import _transfer
 from ..results import TransferResult
@@ -326,6 +326,28 @@ def _inside(folder, path) -> bool:
         return False
 
 
+def _inside_remote(folder, path) -> bool:
+    """Is the remote *path* the folder *folder* itself or somewhere below it?
+    (A folder pasted there would copy into itself for ever.)"""
+    folder = posixpath.normpath(folder or "/")
+    path = posixpath.normpath(path or "/")
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def copy_name(name, taken, is_dir=False, fold=None) -> str:
+    """The name a copy pasted into its own folder gets, as Explorer does:
+    "notes - Copy.txt", then "notes - Copy (2).txt" — the first whose
+    ``fold(name)`` is not in *taken* (*fold*: how names compare there, e.g.
+    ignoring case; default: as given)."""
+    fold = fold or (lambda n: n)
+    stem, ext = (name, "") if is_dir else posixpath.splitext(name)
+    candidate, n = f"{stem} - Copy{ext}", 2
+    while fold(candidate) in taken:
+        candidate = f"{stem} - Copy ({n}){ext}"
+        n += 1
+    return candidate
+
+
 # --------------------------------------------------------------------------- #
 # Operations (worker thread, on the browser's own client)
 # --------------------------------------------------------------------------- #
@@ -448,10 +470,11 @@ def _open_sftp(handler):
     try:
         chan = transport.open_session(timeout=_SFTP_TIMEOUT)
     except paramiko.ChannelException as exc:
-        # each file browser uses two channels; a server may allow only a few
+        # each file browser uses two channels (a third while it copies on the
+        # remote host); a server may allow only a few
         raise IOError(f"the server refused another channel on this connection "
                       f"({exc}) — it may allow only a few at a time: close a file "
-                      f"browser tab") from None
+                      f"browser tab or another session to this host") from None
     try:
         chan.settimeout(_SFTP_TIMEOUT)
         chan.invoke_subsystem("sftp")
@@ -541,8 +564,20 @@ class _OwnSftp:
 # --------------------------------------------------------------------------- #
 # Transfers
 # --------------------------------------------------------------------------- #
-# kind: download | upload; log_id: the job's row in the transfer log
+# kind: download | upload | copy; log_id: the job's row in the transfer log. A
+# copy is on the remote host (Paste of a remote Copy): *remote* is where it goes,
+# *local* the REMOTE path it is copied from.
 _Job = namedtuple("_Job", "kind remote local is_dir log_id")
+_COPY_DEPTH = 64         # folders deep a remote copy goes (a link loop the server
+#                          does not resolve would go on for ever)
+
+
+def _create_empty(sftp, path) -> None:
+    """A new, empty remote file; never replaces one that is there. Opened to
+    append ("a"), not to write ("w", which truncates), so a server that ignored
+    the exclusive create ("x") would still leave a file there as it was."""
+    with sftp.open(path, "ax"):
+        pass
 
 
 def _job_name(job) -> str:
@@ -568,6 +603,7 @@ class _TransferThread(QThread):
         self._link = link
         self._cancel = threading.Event()
         self.restart = False             # stopped to run again on a new link
+        self._reader = None              # a copy's own client for reading the source
         self.notes = []                  # names changed, entries skipped
         self.in_place = []               # uploads written in place, and why
         self._file, self._last = "", 0.0
@@ -606,6 +642,9 @@ class _TransferThread(QThread):
         client = link.current()
         if client is not None:
             link.discard(client)
+        reader = self._reader            # a copy's own reading client
+        if reader is not None:
+            run_teardown(reader.close, "sftp-copy-reader")
 
     def run(self):
         started = time.monotonic()
@@ -619,18 +658,128 @@ class _TransferThread(QThread):
                 self.failed.emit(f"{type(exc).__name__}: {exc}")
         else:
             job = self.job
+            seconds = time.monotonic() - started
+            if job.kind == "copy":
+                count = f"{files} files, " if files != 1 else ""
+                self.done.emit(f"Copied {job.local} -> {job.remote}  ({count}"
+                               f"{tl.human_size(size) or '0 B'} in {seconds:.2f}s)",
+                               size, files)
+                return
             down = job.kind == "download"
             result = TransferResult(job.remote if down else job.local,
                                     job.local if down else job.remote,
                                     "pull" if down else "push", "sftp", size,
-                                    time.monotonic() - started, files)
+                                    seconds, files)
             self.done.emit(str(result), size, files)
 
     def _move(self, sftp):
         job = self.job
         if job.kind == "download":
             return self._download(sftp, job.remote, job.local)
+        if job.kind == "copy":
+            return self._copy(sftp, job.local, job.remote)
         return self._upload(sftp, job.local, job.remote)
+
+    # ---- copy on the remote host ----
+    def _copy(self, sftp, src, dst):
+        """Copy *src* to *dst*, both on the remote host. SFTP has no copy of its
+        own, so the data comes through this PC — and is written by the upload
+        policy (a temporary file renamed into place, the mode kept). It is
+        read on a client of its own: Paramiko pipelines the writes, and a
+        read waiting on the same client takes their replies for its own (the
+        writes then wait for ever). Links are followed; a folder reached
+        twice (a link loop) is copied once."""
+        reader = _open_sftp(self._link._handler)
+        self._reader = reader
+        try:
+            return self._copy_with(reader, sftp, src, dst)
+        finally:
+            self._reader = None
+            run_teardown(reader.close, "sftp-copy-reader")
+
+    def _copy_with(self, reader, sftp, src, dst):
+        try:
+            attr = reader.stat(src)
+        except socket.timeout:
+            raise
+        except IOError as exc:
+            raise IOError(f"cannot read {src}: {exc}") from None
+        if _attr_type(attr) == stat.S_IFDIR:
+            # (the copy may not exist yet: its folder is what can be resolved)
+            there = posixpath.join(self._real(reader, posixpath.dirname(dst)),
+                                   posixpath.basename(dst))
+            if _inside_remote(self._real(reader, src), there):
+                raise IOError(f"cannot copy the folder {src} into itself")
+            return self._copy_dir(reader, sftp, src, dst, set(), 0)
+        problem = kind_problem(_attr_type(attr))
+        if problem:
+            raise IOError(f"{src} {problem}, not a file that can be copied")
+        _mkdir_p(sftp, posixpath.dirname(dst))
+        return self._copy_file(reader, sftp, src, dst, attr), 1
+
+    @staticmethod
+    def _real(sftp, path):
+        try:
+            return sftp.normalize(path)
+        except socket.timeout:
+            raise
+        except IOError:
+            return path
+
+    def _copy_file(self, reader, sftp, src, dst, attr) -> int:
+        self._on_file(dst)
+        size = getattr(attr, "st_size", None) or 0
+        # Written in place (where an upload would be) only when that cannot
+        # empty the source: never over the source itself (another name for
+        # it), nor over a file with other hard links (one may be the source).
+        there = posixpath.join(self._real(reader, posixpath.dirname(dst)),
+                               posixpath.basename(dst))
+        same = self._real(reader, src) == self._real(reader, there)
+        with reader.open(src, "rb") as fl:
+            how = _transfer.put_stream(sftp, fl, size, dst, callback=self._on_bytes,
+                                       mode=getattr(attr, "st_mode", None),
+                                       in_place=not same, hard_links_in_place=False)
+        if how:
+            self.in_place.append(f"{dst} was written {how}")
+        return size
+
+    def _copy_dir(self, reader, sftp, src_dir, dst_dir, seen, depth):
+        self._check()
+        real = self._real(reader, src_dir)
+        if real in seen:
+            self.notes.append(f"skipped {src_dir}: copied already (a link loop?)")
+            return 0, 0
+        if depth > _COPY_DEPTH:
+            self.notes.append(f"skipped {src_dir}: more than {_COPY_DEPTH} folders deep")
+            return 0, 0
+        seen.add(real)
+        _mkdir_p(sftp, dst_dir)
+        total = count = 0
+        for attr in sorted(reader.listdir_attr(src_dir), key=lambda a: a.filename):
+            self._check()
+            name = attr.filename
+            spath, dpath = posixpath.join(src_dir, name), posixpath.join(dst_dir, name)
+            target = attr
+            if _attr_type(attr) == stat.S_IFLNK:
+                target = _transfer.stat_or_none(reader, spath)
+                if target is None:
+                    self.notes.append(f"skipped the broken link {spath}")
+                    continue
+            ftype = _attr_type(target)
+            if ftype == stat.S_IFDIR:
+                size, files = self._copy_dir(reader, sftp, spath, dpath, seen, depth + 1)
+            elif kind_problem(ftype):
+                self.notes.append(f"skipped {spath}: it {kind_problem(ftype)}")
+                continue
+            else:
+                try:
+                    size, files = self._copy_file(reader, sftp, spath, dpath, target), 1
+                except _transfer.NotInPlace as exc:
+                    self.notes.append(f"skipped {spath}: {exc.strerror or exc}")
+                    continue
+            total += size
+            count += files
+        return total, count
 
     # ---- download ----
     def _download(self, sftp, remote, local):
@@ -931,6 +1080,32 @@ class ListTree(QTreeWidget):
         head.setSectionsClickable(True)
         head.setSortIndicatorShown(True)
         head.setSortIndicator(0, Qt.AscendingOrder)
+        # [(QKeySequence.StandardKey, slot)]: Copy / Paste of the Files tab. The
+        # list claims these keys while it has the keyboard (ShortcutOverride)
+        # rather than holding QShortcuts: a window-wide Ctrl+C of an embedding
+        # application would make a shortcut ambiguous, and Qt fires neither.
+        self.clipboard_keys = []
+
+    def _clipboard_slot(self, event):
+        for key, slot in self.clipboard_keys:
+            if event.matches(key):
+                return slot
+        return None
+
+    def event(self, event):
+        if event.type() == QEvent.ShortcutOverride and self._clipboard_slot(event):
+            event.accept()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt API
+        slot = self._clipboard_slot(event)
+        if slot is not None:
+            event.accept()
+            if not event.isAutoRepeat():     # a held Ctrl+V pastes once
+                slot()
+            return
+        super().keyPressEvent(event)
 
     def sortByColumn(self, column, order=Qt.AscendingOrder):  # noqa: N802 - Qt API
         """Through the header's sort indicator, which the pane follows by
@@ -979,6 +1154,40 @@ def parent_icon():
     """The ".." row's icon: an arrow up."""
     from . import glyphs
     return glyphs.icon("arrow-up", "dim")
+
+
+_IMAGE_EXT = frozenset(".png .jpg .jpeg .gif .bmp .webp .heic .heif .svg .ico .tif .tiff".split())
+_VIDEO_EXT = frozenset(".mp4 .mkv .avi .mov .webm .3gp .m4v .wmv .flv .ts".split())
+_AUDIO_EXT = frozenset(".mp3 .wav .ogg .flac .m4a .aac .opus .wma .amr".split())
+_ARCHIVE_EXT = frozenset(
+    ".zip .rar .7z .tar .gz .tgz .bz2 .xz .zst .jar .img .iso .apk .deb .rpm .ipk".split())
+_TEXT_EXT = frozenset(
+    ".txt .log .md .json .xml .csv .ini .cfg .conf .yaml .yml .prop .properties .sh .py "
+    ".bat .ps1 .rc .html .htm .js .kt .java .c .h .cpp .toml .service .dlt".split())
+_SPECIAL = frozenset((stat.S_IFCHR, stat.S_IFBLK, stat.S_IFIFO, stat.S_IFSOCK))
+
+
+def kind_glyph(name, is_dir, is_link=False, ftype=0):
+    """``(glyph, tone)`` of a remote row, by its kind and extension — the icons
+    of TurboADB's device pane."""
+    if is_link:
+        return "link", "teal"
+    if is_dir:
+        return "folder", "amber"
+    if ftype in _SPECIAL:
+        return "chip", "dim"
+    ext = posixpath.splitext(name or "")[1].lower()
+    if ext in _IMAGE_EXT:
+        return "image", "purple"
+    if ext in _VIDEO_EXT:
+        return "video", "red"
+    if ext in _AUDIO_EXT:
+        return "music", "pink"
+    if ext in _ARCHIVE_EXT:
+        return "file", "orange"
+    if ext in _TEXT_EXT:
+        return "file", "blue"
+    return "file", "dim"
 
 
 def make_row(name, icon, rank, keys, *columns):
@@ -1057,10 +1266,22 @@ class SftpBrowser(QWidget):
     log = pyqtSignal(str)
     notify = pyqtSignal(str, str)        # text, kind (ok / warn / error): toasts
     transfer_ended = pyqtSignal(str, str)    # kind, local path: done, failed or not
+    # kind, remote, local, and how it ended (transfer_log DONE / FAILED /
+    # CANCELLED; QUEUED: it starts again on a new connection)
+    transfer_finished = pyqtSignal(str, str, str, str)
+    # the connection was replaced (rebind): look-ups that were in flight on the
+    # old one were dropped, so whoever waited for them asks again
+    rebound = pyqtSignal()
 
-    def __init__(self, handler, parent=None, transfer_log=None, start="."):
+    def __init__(self, handler, parent=None, transfer_log=None, start=".", pane_ops=None):
+        """*pane_ops*: ``{"Open": fn, "Copy": fn, "Paste": fn}`` from the
+        dual-pane Files tab, which owns the clipboard both panes share and
+        opening a file on this PC; its buttons are then TurboADB's (New
+        folder, New file, Open, Edit, Copy, Paste, Rename, Delete). On its
+        own the browser has Download… and Upload… instead."""
         super().__init__(parent)
         self.handler = handler
+        self._pane_ops = dict(pane_ops or {})
         self.transfers = transfer_log if transfer_log is not None else tl.TransferLog()
         self.local_target = None         # callable -> the local pane's folder
         self.show_inline_progress = True # off when a Transfers panel shows it
@@ -1127,21 +1348,25 @@ class SftpBrowser(QWidget):
         # queued: the handler may ask a question, and a modal dialog opened
         # inside the drop itself freezes Explorer until it is answered
         self.tree.dropped.connect(self._upload_paths, Qt.QueuedConnection)
-        style = self.style()
-        self._icons = {(True, False): style.standardIcon(QStyle.SP_DirIcon),
-                       (True, True): style.standardIcon(QStyle.SP_DirLinkIcon),
-                       (False, False): style.standardIcon(QStyle.SP_FileIcon),
-                       (False, True): style.standardIcon(QStyle.SP_FileLinkIcon)}
+        self._icons = {}                 # (glyph, tone) -> QIcon, shared by the rows
 
         # Scoped to the browser: with the default (window) context these fired
-        # while typing in another session's terminal in split view. Delete and
-        # Backspace belong to the list alone, so the path box keeps them too.
-        for keys, owner, slot in (("F5", self, self.refresh),
-                                  ("Delete", self.tree, self._delete),
-                                  ("Backspace", self.tree, self._up),
-                                  ("Alt+Up", self, self._up),
-                                  ("F2", self.tree, self._rename_selected)):
-            QShortcut(QKeySequence(keys), owner, activated=slot,
+        # while typing in another session's terminal in split view. Delete,
+        # Backspace and the clipboard keys belong to the list alone, so the
+        # path box keeps them too.
+        keys = [("F5", self, self.refresh),
+                ("Delete", self.tree, self._delete),
+                ("Shift+Del", self.tree, self._delete),   # nothing is binned here
+                ("Backspace", self.tree, self._up),
+                ("Alt+Up", self, self._up),
+                ("F2", self.tree, self._rename_selected),
+                ("F4", self.tree, self.edit_selected),
+                ("Ctrl+Shift+N", self, self._mkdir)]
+        if "Copy" in self._pane_ops:     # claimed by the list itself (ListTree)
+            self.tree.clipboard_keys = [(QKeySequence.Copy, self._pane_ops["Copy"]),
+                                        (QKeySequence.Paste, self._pane_ops["Paste"])]
+        for key, owner, slot in keys:
+            QShortcut(QKeySequence(key), owner, activated=slot,
                       context=Qt.WidgetWithChildrenShortcut)
 
         # transfer row: only there while something is moving
@@ -1163,19 +1388,36 @@ class SftpBrowser(QWidget):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        ops, buttons = ops_row((
-            ("New folder", self._mkdir, "Create a folder here"),
-            ("Edit", self.edit_selected, "View / edit the selected text file"),
-            ("Rename", self._rename_selected, "Rename the selected item (F2)"),
-            ("Download…", self._download, "Save the selection somewhere on this PC"),
-            ("Upload…", self._upload, "Upload files — for a folder, right-click or "
-                                      "drag it onto the list"),
-        ), self._delete, "Delete the selection on the remote host (Del)")
+        new_folder = ("New folder", self._mkdir, "Create a folder here (Ctrl+Shift+N)")
+        new_file = ("New file", self._new_file, "Create an empty file here")
+        edit = ("Edit", self.edit_selected,
+                "Edit the selected text file in TurboSSH's editor (F4)")
+        rename = ("Rename", self._rename_selected, "Rename the selected item (F2)")
+        if self._pane_ops:               # the Files tab: TurboADB's set
+            actions = (new_folder, new_file,
+                       ("Open", self._pane_ops["Open"],
+                        "Open in the app this PC has for it. A remote file opens as "
+                        "a copy on this PC, and saving it there sends it back."),
+                       edit,
+                       ("Copy", self._pane_ops["Copy"], "Copy the selection (Ctrl+C)"),
+                       ("Paste", self._pane_ops["Paste"],
+                        "Paste what was copied into this folder (Ctrl+V): from the "
+                        "other pane it is uploaded"),
+                       rename)
+        else:
+            actions = (new_folder, new_file, edit, rename,
+                       ("Download…", self._download, "Save the selection somewhere on "
+                                                     "this PC"),
+                       ("Upload…", self._upload, "Upload files — for a folder, "
+                                                 "right-click or drag it onto the list"))
+        ops, buttons = ops_row(actions, self._delete,
+                               "Delete the selection on the remote host (Del)")
+        self.ops_buttons = {b.text(): b for b in buttons}
         # locked while the list is busy
         self._controls = [self.path, up, ref, self.tree, *buttons]
 
         lay.addWidget(self.head); lay.addWidget(self.tree, 1); lay.addWidget(self.xfer_row)
-        lay.addWidget(self.status); lay.addLayout(ops)
+        lay.addWidget(self.status); lay.addWidget(ops)
 
     def add_controls(self, *widgets):
         """Lock *widgets* too while the list is busy (the quick links of the
@@ -1302,9 +1544,12 @@ class SftpBrowser(QWidget):
             self._fill = None
             return
         end = min(len(specs), start + _FILL_CHUNK)
-        icons, select, rows = self._icons, self._select, []
+        select, rows, entries = self._select, [], self._entries
         for s in specs[start:end]:
-            it = make_row(s.name, icons[s.is_dir, s.is_link], s.rank, s.keys, *s.texts)
+            entry = entries.get(s.name)
+            icon = self._row_icon(kind_glyph(s.name, s.is_dir, s.is_link,
+                                             entry.ftype if entry is not None else 0))
+            it = make_row(s.name, icon, s.rank, s.keys, *s.texts)
             if s.name == select:
                 current = it
             rows.append(it)
@@ -1354,21 +1599,47 @@ class SftpBrowser(QWidget):
             self._again = False
             self._relist()
 
+    def _row_icon(self, key):
+        """The QIcon of *key* ``(glyph, tone)``: one per kind, shared by every
+        row (it paints in the theme of the moment)."""
+        icon = self._icons.get(key)
+        if icon is None:
+            from . import glyphs
+            icon = self._icons[key] = glyphs.icon(*key)
+        return icon
+
     def _ctx_menu(self, pos):
+        from .widgets import OP_ICONS
+        from . import glyphs
+
+        def add(text, slot, op=None):
+            glyph = OP_ICONS.get(op or text)
+            if glyph and glyph[1] == "on-danger":    # white is for the red button
+                glyph = (glyph[0], "red")
+            return m.addAction(glyphs.icon(*glyph), text, slot) if glyph \
+                else m.addAction(text, slot)
         entries = self._selection()
         m = QMenu(self)
+        if "Open" in self._pane_ops and len(entries) == 1:
+            add("Open", self._pane_ops["Open"])
         if self.local_target is not None and entries:
             m.addAction("Download to the local pane", self.download_to_local_pane)
-        m.addAction("Download…", self._download)
+        add("Download…", self._download)
         if len(entries) == 1 and not kind_problem(entries[0].ftype):
-            m.addAction("Edit / view…", self.edit_selected)
+            add("Edit / view…", self.edit_selected, "Edit")
         m.addSeparator()
-        m.addAction("Upload files…", self._upload)
+        add("Upload files…", self._upload, "Upload…")
         m.addAction("Upload folder…", self._upload_folder)
         m.addSeparator()
-        m.addAction("New folder", self._mkdir)
-        m.addAction("Rename", self._rename_selected)
-        m.addAction("Delete", self._delete)
+        if "Copy" in self._pane_ops:
+            if entries:
+                add("Copy", self._pane_ops["Copy"])
+            add("Paste", self._pane_ops["Paste"])
+            m.addSeparator()
+        add("New folder", self._mkdir)
+        add("New file", self._new_file)
+        add("Rename", self._rename_selected)
+        add("Delete", self._delete)
         if entries:
             m.addAction("Copy path", self._copy_paths)
         m.addSeparator()
@@ -1478,6 +1749,69 @@ class SftpBrowser(QWidget):
         path = posixpath.join(self.cwd, name)
         return self._run_op(f"Creating {name}", lambda sftp: sftp.mkdir(path), name)
 
+    def do_new_file(self, name) -> bool:
+        """Create an empty file in the current folder; never replaces one (the
+        server is asked to create it only if it is not there). False if
+        refused or busy."""
+        if self._closing or self._busy:
+            return False
+        name = (name or "").strip()
+        problem = self._bad_name(name)
+        if not problem and self.remote_ignores_case() \
+                and name.casefold() in {n.casefold() for n in self._entries}:
+            problem = f"'{name}' already exists"
+        if problem:
+            self._error(f"New file: {problem}")
+            return False
+        path = posixpath.join(self.cwd, name)
+        return self._run_op(f"Creating {name}", lambda sftp: _create_empty(sftp, path), name)
+
+    def selected_items(self) -> list:
+        """``[(remote path, is a folder)]`` of the selection (".." never), for
+        a Copy."""
+        return [(posixpath.join(self.cwd, e.name), e.is_dir) for e in self._selection()]
+
+    def paste_copies(self, items) -> int:
+        """Paste remote *items* ``(path, is a folder)`` — copied in this pane,
+        perhaps in another folder — into the current folder, on the remote
+        host. Into their own folder they are named as Explorer names copies
+        ("x - Copy.txt"); elsewhere, what is there already is replaced only
+        if the user says so. A folder is never pasted into itself. Each is a
+        transfer (Transfers panel: progress, Cancel, Retry). Returns how many
+        were queued."""
+        if self._closing:
+            return 0
+        cwd, fold = self.cwd, (str.casefold if self.remote_ignores_case() else (lambda n: n))
+        here = {fold(n) for n in self._entries}
+        plan, refused = [], []
+        for path, is_dir in items:
+            name = posixpath.basename(path.rstrip("/"))
+            if not name:
+                continue
+            if is_dir and _inside_remote(fold(path), fold(cwd)):
+                refused.append(name)
+                continue
+            plan.append((path, is_dir, name))
+        if refused:
+            self._error(f"Paste: a folder cannot be pasted into itself: {_some(refused)}")
+        # its own folder (as the server compares names): a copy beside itself
+        own = [(p, d, n) for p, d, n in plan
+               if fold(posixpath.dirname(p.rstrip("/"))) == fold(cwd)]
+        other = [(p, d, n) for p, d, n in plan if (p, d, n) not in own]
+        wanted = set(self._keep_or_replace([n for _p, _d, n in other],
+                                           lambda n: fold(n) in here, cwd))
+        jobs = [(p, d, n) for p, d, n in other if n in wanted]
+        taken = set(here)
+        for path, is_dir, name in own:
+            new = copy_name(name, taken, is_dir, fold)
+            taken.add(fold(new))
+            jobs.append((path, is_dir, new))
+        count = 0
+        for path, is_dir, name in jobs:
+            if self._enqueue(_Job("copy", posixpath.join(cwd, name), path, is_dir, 0)):
+                count += 1
+        return count
+
     def do_rename(self, old, new) -> bool:
         """Rename an entry of the current folder. Refused (False) if *new* is
         already in the listing or is a path: a rename must never replace or
@@ -1518,6 +1852,13 @@ class SftpBrowser(QWidget):
         name, ok = QInputDialog.getText(self, "New folder", "Name:")
         if ok and name.strip():
             self.do_mkdir(name)
+
+    def _new_file(self):
+        if self._busy:
+            return
+        name, ok = QInputDialog.getText(self, "New file", "Name:")
+        if ok and name.strip():
+            self.do_new_file(name)
 
     def _rename_selected(self):
         entries = self._selection()
@@ -1562,8 +1903,11 @@ class SftpBrowser(QWidget):
         was about to start the transfer again."""
         if self._closing or self._transfer is None:
             return False
+        dropped = list(self._queue)
         self._queue.clear()
         self.transfers.cancel_queued()
+        for job in dropped:              # they end here: say so (transfer_finished)
+            self.transfer_finished.emit(job.kind, job.remote, job.local, tl.CANCELLED)
         t = self._transfer
         t.restart = False
         t.cancel()
@@ -1636,7 +1980,8 @@ class SftpBrowser(QWidget):
         else:
             name = _job_name(t.job)
             what = name if self._file in ("", name) else f"{name}: {self._file}"
-            verb = "Downloading" if t.job.kind == "download" else "Uploading"
+            verb = {"download": "Downloading", "copy": "Copying"}.get(t.job.kind,
+                                                                     "Uploading")
             text = f"{verb} {what} — {self._percent}%"
         if self._queue:
             text += f"  ·  {len(self._queue)} queued"
@@ -1703,10 +2048,11 @@ class SftpBrowser(QWidget):
         self._relist_if_here()
 
     def _relist_if_here(self):
-        """An upload — finished, failed or cancelled part-way through a folder —
-        may have changed the folder on screen."""
+        """An upload or a copy — finished, failed or cancelled part-way through
+        a folder — may have changed the folder on screen."""
         job = self._transfer.job if self._transfer is not None else None
-        if job and job.kind == "upload" and posixpath.dirname(job.remote) == self.cwd:
+        if job and job.kind in ("upload", "copy") \
+                and posixpath.dirname(job.remote) == self.cwd:
             self._relist()
 
     def _on_transfer_finished(self):
@@ -1716,7 +2062,25 @@ class SftpBrowser(QWidget):
         self._transfer = None
         if job is not None:
             self.transfer_ended.emit(job.kind, job.local)
+            item = self.transfers.get(job.log_id)
+            self.transfer_finished.emit(job.kind, job.remote, job.local,
+                                        item.status if item is not None else "")
         self._pump()
+
+    def stamp_of(self, path, done, fail) -> bool:
+        """Look up ``(size, mtime)`` of the remote file *path* (following a
+        link; None when it is not there) on a worker, then ``done(stamp)`` —
+        or ``fail(message)``. False once the browser is closing."""
+        if self._closing:
+            return False
+        link = self._remote
+
+        def look():
+            attr = link.run(lambda sftp: _transfer.stat_or_none(sftp, path))
+            return None if attr is None else (getattr(attr, "st_size", None),
+                                              getattr(attr, "st_mtime", None))
+        run_job(self._jobs, look, done, fail)
+        return True
 
     def _keep_or_replace(self, names, exists, where) -> list:
         """Ask ONCE before a batch replaces what is already in *where*; returns
@@ -1772,6 +2136,29 @@ class SftpBrowser(QWidget):
                               f"name is not possible on this PC")
             if self.queue_download(posixpath.join(cwd, e.name),
                                    os.path.join(dest, name), e.is_dir):
+                count += 1
+        return count
+
+    def download_paths_to(self, dest, items) -> int:
+        """Queue remote *items* ``(path, is a folder)`` — copied in this pane,
+        from any folder — for download into the local folder *dest* (Paste in
+        the local pane); asks once before replacing what is there. Returns how
+        many were queued."""
+        if self._closing or not dest:
+            return 0
+        names = [posixpath.basename(p.rstrip("/")) for p, _d in items]
+        local = _local_names([n for n in names if n])
+        wanted = set(self._keep_or_replace(
+            [local[n] for n in names if n],
+            lambda n: os.path.exists(os.path.join(dest, n)), dest))
+        count = 0
+        for (path, is_dir), name in zip(items, names):
+            if not name or local[name] not in wanted:
+                continue
+            if local[name] != name:
+                self.log.emit(f"[WARN] {name} is saved as {local[name]}: the original "
+                              f"name is not possible on this PC")
+            if self.queue_download(path, os.path.join(dest, local[name]), is_dir):
                 count += 1
         return count
 
@@ -1848,6 +2235,7 @@ class SftpBrowser(QWidget):
             t.cancel()                   # comes back via stopped / failed
             self._show_transfer()
         self._list(self.cwd, self._current_name())
+        self.rebound.emit()
 
     # --- teardown ---
     def close_browser(self):

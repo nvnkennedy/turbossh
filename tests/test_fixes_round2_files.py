@@ -5,6 +5,7 @@ the loopback SSH/SFTP server and fakes stand in."""
 from __future__ import annotations
 
 import errno
+import os
 import posixpath
 import stat
 import threading
@@ -108,6 +109,10 @@ def test_a_locked_file_that_is_not_recycled_asks_before_deleting_it(qapp, tmp_pa
                         lambda *a, **k: (asked.append(a[2]), QMessageBox.No)[1])
     pane = LocalPane(str(tmp_path))
     try:
+        # the start folder is checked on a worker: arriving there after the
+        # delete would clear the message this test reads
+        assert wait_until(lambda: os.path.normcase(pane.cwd) == os.path.normcase(
+            str(tmp_path)) and not pane._loading)
         pane.deleted.connect(gone.append)
         assert pane.do_delete([str(locked)])
         assert wait_until(lambda: gone)

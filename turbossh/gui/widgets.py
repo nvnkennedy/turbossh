@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QComboBox, QHBoxLayout, QPushButton, QToolButton
+from PyQt5.QtWidgets import QComboBox, QPushButton, QToolButton, QWidget
 
 
 class HostCombo(QComboBox):
@@ -128,19 +128,40 @@ def pane_title(text, glyph, tone) -> QToolButton:
     return title
 
 
+# a pane operation's glyph and its colour, as on TurboADB's Files tab
+OP_ICONS = {
+    "New folder": ("folder-plus", "amber"),
+    "New file": ("file-plus", "blue"),
+    "Open": ("external", "blue"),
+    "Edit": ("edit", "purple"),
+    "Copy": ("copy", "blue"),
+    "Paste": ("paste", "blue"),
+    "Rename": ("rename", "teal"),
+    "Download…": ("download", "green"),
+    "Upload…": ("arrow-up", "blue"),
+    "Delete": ("trash", "on-danger"),
+}
+
+
 def ops_row(actions, delete_slot=None, delete_tip=""):
-    """A pane's row of file operations: *actions* ``(text, slot, tip)`` on the
-    left, a red Delete on the right. Returns ``(layout, buttons)``; the
-    buttons are in order, Delete last."""
-    row = QHBoxLayout()
-    row.setContentsMargins(0, 0, 0, 0)
-    row.setSpacing(4)
+    """A pane's row of file operations: *actions* ``(text, slot, tip)`` as flat
+    buttons with their glyphs, a red Delete after them — at the right end while
+    they all fit on one line. The row wraps onto a second line rather than
+    make the pane wider. Returns ``(widget, buttons)``; the buttons are in
+    order, Delete last."""
+    from . import glyphs
+    from .flowlayout import ToolbarFlowLayout
+    holder = QWidget()
+    holder.setObjectName("paneOps")
+    row = ToolbarFlowLayout(holder, hspacing=2, vspacing=4)
     buttons = []
     for text, slot, tip in actions:
         button = QPushButton(text)
         button.setObjectName("paneOp")
         button.setProperty("role", "ghost")
         button.setFocusPolicy(Qt.TabFocus)
+        glyph, tone = OP_ICONS.get(text, ("file", "dim"))
+        button.setIcon(glyphs.icon(glyph, tone))
         if tip:
             button.setToolTip(tip)
         button.clicked.connect(slot)
@@ -152,9 +173,10 @@ def ops_row(actions, delete_slot=None, delete_tip=""):
         delete.setObjectName("paneOp")
         delete.setProperty("role", "danger")
         delete.setFocusPolicy(Qt.TabFocus)
+        delete.setIcon(glyphs.icon(*OP_ICONS["Delete"]))
         if delete_tip:
             delete.setToolTip(delete_tip)
         delete.clicked.connect(delete_slot)
         row.addWidget(delete)
         buttons.append(delete)
-    return row, buttons
+    return holder, buttons

@@ -11,6 +11,8 @@ import tempfile
 
 _TEST_HOME = tempfile.mkdtemp(prefix="turbossh-tests-")
 os.environ["TURBOSSH_HOME"] = os.path.join(_TEST_HOME, ".turbossh")
+# copies of remote files the Files tab opens (and tidies): never the user's
+os.environ["TURBOSSH_OPENED_DIR"] = os.path.join(_TEST_HOME, "opened")
 os.environ["HOME"] = _TEST_HOME
 os.environ["USERPROFILE"] = _TEST_HOME
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

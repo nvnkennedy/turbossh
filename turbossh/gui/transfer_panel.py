@@ -73,8 +73,10 @@ class TransferTableModel(QAbstractTableModel):
         if role == Qt.ForegroundRole and column == 0:
             return QColor(_STATUS_COLOR.get(item.status, "#8a9aa5"))
         if role == Qt.ToolTipRole:
-            return (f"{tl.DIRECTION_LABELS[item.kind]}\nRemote: {item.remote}\n"
-                    f"Local: {item.local}" + (f"\n\n{item.error}" if item.error else ""))
+            where = (f"From: {item.local}\nTo: {item.remote}" if item.kind == "copy"
+                     else f"Remote: {item.remote}\nLocal: {item.local}")
+            return (f"{tl.DIRECTION_LABELS[item.kind]}\n{where}"
+                    + (f"\n\n{item.error}" if item.error else ""))
         if role == Qt.TextAlignmentRole and column in (3, 4, 5, 6):
             return int(Qt.AlignRight | Qt.AlignVCenter)
         if role == Qt.UserRole:
@@ -160,9 +162,13 @@ class TransferPanel(QFrame):
     retry_requested = pyqtSignal(list)
     cancel_requested = pyqtSignal()
 
-    def __init__(self, log: tl.TransferLog, parent=None):
+    def __init__(self, log: tl.TransferLog, parent=None, *, hide_when_empty=False):
+        """*hide_when_empty*: the panel is there only while the history has
+        something in it (as on TurboADB's Files tab); the first transfer
+        brings it, clearing the history takes it away."""
         super().__init__(parent)
         self._log = log
+        self._hide_when_empty = hide_when_empty
         self._seen = -1
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 0); lay.setSpacing(2)
@@ -231,14 +237,23 @@ class TransferPanel(QFrame):
 
     # ---- rendering ----
     def _tick(self) -> None:
+        self._follow_log()
         if self.isVisible():
             self.refresh()
+
+    def _follow_log(self) -> None:
+        """Hide while the history is empty (*hide_when_empty*), show once not."""
+        if self._hide_when_empty:
+            shown = len(self._log) > 0
+            if self.isHidden() == shown:
+                self.setVisible(shown)
 
     def showEvent(self, event):  # noqa: N802 - Qt API
         super().showEvent(event)
         self.refresh()                   # catch up with what happened while hidden
 
     def refresh(self) -> None:
+        self._follow_log()
         active = self._log.active
         if self._log.revision == self._seen and not active:
             return
@@ -310,7 +325,8 @@ class TransferPanel(QFrame):
             self.summary.setText(f"Could not save the report: {exc}")
 
     def _open_folder(self) -> None:
-        items = self.selected_items()
+        # a copy on the remote host has no local folder (its "local" is remote)
+        items = [i for i in self.selected_items() if i.kind != "copy"]
         if items:
             folder = tl.local_folder(items[0])
             if os.path.isdir(folder):
@@ -323,7 +339,8 @@ class TransferPanel(QFrame):
         menu = QMenu(self)
         if self._log.retryable([i.id for i in items]):
             menu.addAction("Retry", self._retry_selected)
-        menu.addAction("Open local folder", self._open_folder)
+        if any(i.kind != "copy" for i in items):
+            menu.addAction("Open local folder", self._open_folder)
         menu.addAction("Copy remote path", lambda: QApplication.clipboard().setText(
             "\n".join(i.remote for i in items)))
         if any(i.finished for i in items):

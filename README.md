@@ -535,7 +535,8 @@ turbossh-gui
 
 - **Sidebar** of saved sessions with a quick-connect filter. Right-click for
   new / open / edit / duplicate / delete. Sessions log in with a password, a key
-  file, or your SSH agent.
+  file, or your SSH agent. The **‹** on its header hides it; the **›** on the
+  window's left edge brings it back (also View → Sessions list, Ctrl+Shift+B).
 - **Tabbed sessions**, each with **Terminal**, **SFTP**, and **Logs** tabs.
 - **Real terminal** — htop, vim, less render correctly and give the screen back
   when they exit. Select with the mouse, Ctrl+C copies a selection, Ctrl+wheel
@@ -549,10 +550,16 @@ turbossh-gui
   folders. Quick links along the top open Home, Desktop and Downloads on this PC
   and the remote home, `/` and `/tmp`; **New tab** opens another file browser on
   the same connection. Move files and folders with **Push →** and **← Pull**, by
-  dragging between the panes or in from Explorer; sort by any column; rename,
-  delete, make folders; double-click a remote text file to edit it in place. The
-  **Transfers** panel underneath keeps the history with progress, speed, time
-  left, cancel and retry.
+  dragging between the panes or in from Explorer; sort by any column. Each pane
+  has TurboADB's buttons: **New folder**, **New file**, **Open**, **Edit**,
+  **Copy**, **Paste**, **Rename** and **Delete**. Copy and Paste share one
+  clipboard: pasted in the same pane it copies (on the remote host itself for
+  remote files), pasted in the other pane it uploads or downloads. **Open** on a
+  remote file opens a copy in this PC's app for it, and each save goes back to
+  the remote (programs are never started; scripts open in TurboSSH's editor);
+  **Edit** (F4) opens a text file in TurboSSH's editor, local or remote. The
+  **Transfers** panel underneath appears with the first transfer and keeps the
+  history with progress, speed, time left, cancel and retry.
 - **Logs** tab — follow `journalctl -f` / `slog2info -w`, filter by regex, lines
   coloured by level, Ctrl+F to find.
 - **Local terminal** — PowerShell or Command Prompt (your shell on Linux / macOS)

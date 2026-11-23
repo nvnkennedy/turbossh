@@ -595,13 +595,37 @@ def stylesheet(name: str = "dark") -> str:
     QPushButton#quickLink:hover {{ background: {c['raised']}; border-color: {c['border']}; }}
     QPushButton#quickLink:pressed {{ background: {c['sel']}; }}
     QPushButton#quickLink:disabled {{ background: transparent; color: {c['dim']}; }}
-    QPushButton#paneOp {{ padding: 4px 9px; }}
+    QPushButton#paneOp {{ padding: 4px 7px; }}
+    QPushButton#paneOp[role="ghost"] {{ background: transparent; color: {c['text']};
+        border: 1px solid transparent; font-weight: 600; }}
+    QPushButton#paneOp[role="ghost"]:hover {{ background: {c['raised']};
+        border-color: {c['border']}; }}
+    QPushButton#paneOp[role="ghost"]:pressed {{ background: {c['sel']}; color: {c['text']}; }}
+    QPushButton#paneOp[role="ghost"]:disabled {{ background: transparent; color: {c['dim']};
+        border-color: transparent; }}
+    QSplitter#filePanes::handle {{ background: transparent; }}
+    QSplitter#filePanes::handle:hover {{ background: {c['border']}; }}
     QToolButton#paneTitle {{ background: transparent; border: none; color: {c['text']};
         padding: 2px 4px 2px 0; font-weight: 700; }}
+
+    /* ---- the sessions list: its header and the edge handle that reopens it ---- */
+    QLabel#sidebarTitle {{ color: {c['text']}; font-size: 10pt; font-weight: 700; }}
+    QLabel#countBadge {{ background: {c['raised']}; color: {c['dim']};
+        border: 1px solid {c['border']}; border-radius: 8px; padding: 0 7px;
+        font-size: 8pt; font-weight: 700; }}
+    QToolButton#iconButton {{ background: transparent; border: 1px solid transparent;
+        border-radius: 6px; padding: 3px; }}
+    QToolButton#iconButton:hover {{ background: {c['raised']}; border-color: {c['border']}; }}
+    QWidget#sidebarHandle {{ background: {c['ribbon']}; border: none;
+        border-right: 1px solid {c['border']}; }}
+    QWidget#sidebarHandle:hover {{ background: {c['raised']}; }}
+    QToolButton#sidebarHandleArrow {{ background: {c['sel']}; border: 1px solid {c['border']};
+        border-radius: 6px; padding: 0; }}
+    QToolButton#sidebarHandleArrow:hover {{ border-color: {ACCENT}; }}
     QTreeWidget#fileList {{ background: {c['panel']}; alternate-background-color: {c['raised']};
         color: {c['text']}; border: 1px solid {c['border']}; border-radius: 6px;
         selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
-    QTreeWidget#fileList::item {{ padding: 1px 2px; border: none; }}
+    QTreeWidget#fileList::item {{ padding: 4px 2px; border: none; }}
     QTreeWidget#fileList::item:hover {{ background: {c['sel']}; }}
     QTreeWidget#fileList::item:selected {{ background: {ACCENT}; color: {ON_ACCENT}; }}
     QTreeWidget#fileList QHeaderView::section {{ background: {c['panel']}; color: {c['dim']};

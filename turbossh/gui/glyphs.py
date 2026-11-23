@@ -6,7 +6,9 @@ switch (the app restyles, the buttons repaint, the new colour is used); nothing
 is cached per theme. Needs no QtSvg.
 
 Tones: ``"blue"`` (this PC), ``"green"`` (the remote host), ``"accent"``,
-``"text"``, ``"dim"``; see :func:`tone_color`.
+``"text"``, ``"dim"``, the file kinds' ``"amber"``, ``"purple"``, ``"teal"``,
+``"red"``, ``"pink"``, ``"orange"``, and ``"on-danger"`` (white, on a red
+button); see :func:`tone_color`.
 """
 
 from __future__ import annotations
@@ -21,6 +23,13 @@ from . import theme
 _HUES = {
     "blue": ("#7ab0f0", "#2a62a8"),
     "green": ("#7fcf8e", "#297539"),
+    "amber": ("#e8b84a", "#9a6a00"),
+    "purple": ("#b79cf2", "#6a45b8"),
+    "teal": ("#5fd0c4", "#137a70"),
+    "red": ("#f08a80", "#b3342a"),
+    "pink": ("#f29cc8", "#a8336e"),
+    "orange": ("#f0a060", "#a65412"),
+    "on-danger": ("#ffffff", "#ffffff"),
 }
 
 
@@ -59,11 +68,51 @@ _GLYPHS = {
     "refresh": (("arc", 12, 12, 8.5, 60, 290), _line((20.5, 3.5), (20.5, 9), (15, 9))),
     "server": (("rect", 3, 3.5, 18, 7, 2), ("rect", 3, 13.5, 18, 7, 2),
                ("dot", 7, 7, 1.3), ("dot", 7, 17, 1.3)),
+    # the sessions list: hide (on its header) and show again (the edge handle)
+    "chevron-left": (_line((15, 5), (8, 12), (15, 19)),),
+    "chevron-right": (_line((9, 5), (16, 12), (9, 19)),),
+    # file operations
+    "folder-plus": (("fill", ((3, 6), (9.5, 6), (11.5, 8), (21, 8), (21, 19), (3, 19))),
+                    _line((12, 10.5), (12, 16.5)), _line((9, 13.5), (15, 13.5))),
+    "file": (_line((14, 3), (6, 3), (6, 21), (18, 21), (18, 7), (14, 3)),
+             _line((14, 3), (14, 7), (18, 7))),
+    "file-plus": (_line((14, 3), (6, 3), (6, 21), (18, 21), (18, 7), (14, 3)),
+                  _line((14, 3), (14, 7), (18, 7)),
+                  _line((12, 11), (12, 17)), _line((9, 14), (15, 14))),
+    "external": (_line((19, 13.5), (19, 20), (4, 20), (4, 5), (10.5, 5)),
+                 _line((14, 4), (20, 4), (20, 10)), _line((20, 4), (11, 13))),
+    "edit": (_line((14.5, 5.5), (18.5, 9.5), (8.5, 19.5), (4, 20), (4.5, 15.5), (14.5, 5.5)),
+             _line((12.5, 7.5), (16.5, 11.5))),
+    "copy": (("rect", 8.5, 8.5, 12, 12, 2), _line((15.5, 8.5), (15.5, 3.5), (3.5, 3.5),
+                                                  (3.5, 15.5), (8.5, 15.5))),
+    "paste": (("rect", 5, 5, 14, 16, 2), ("rect", 9, 3, 6, 4, 1),
+              _line((9, 12), (15, 12)), _line((9, 16), (13, 16))),
+    "rename": (("rect", 3, 7, 13, 10, 2), _line((19.5, 4), (19.5, 20)),
+               _line((17.5, 4), (21.5, 4)), _line((17.5, 20), (21.5, 20))),
+    "trash": (_line((4, 6.5), (20, 6.5)), _line((9.5, 6.5), (9.5, 3.5), (14.5, 3.5),
+                                               (14.5, 6.5)),
+              _line((6, 6.5), (7, 20.5), (17, 20.5), (18, 6.5)),
+              _line((10, 10.5), (10, 16.5)), _line((14, 10.5), (14, 16.5))),
+    # file kinds (the remote pane's rows)
+    "image": (("rect", 3, 4, 18, 16, 2), ("dot", 8.5, 9.5, 1.6),
+              _line((3.5, 17.5), (9, 12.5), (13, 16), (16, 13), (20.5, 17))),
+    "video": (("rect", 2.5, 6, 13.5, 12, 2), _line((16, 10.5), (21.5, 7), (21.5, 17),
+                                                   (16, 13.5))),
+    "music": (_line((9, 17.5), (9, 4.5), (20, 3), (20, 15.5)),
+              ("arc", 6.5, 17.5, 2.5, 0, 360), ("arc", 17.5, 15.5, 2.5, 0, 360)),
+    "link": (_line((10, 14), (14, 10)),
+             _line((11, 7), (13.5, 4.5), (16.5, 4.5), (19.5, 7.5), (19.5, 10.5), (17, 13)),
+             _line((13, 17), (10.5, 19.5), (7.5, 19.5), (4.5, 16.5), (4.5, 13.5), (7, 11))),
+    "chip": (("rect", 6, 6, 12, 12, 2), _line((9, 3), (9, 6)), _line((15, 3), (15, 6)),
+             _line((9, 18), (9, 21)), _line((15, 18), (15, 21)),
+             _line((3, 9), (6, 9)), _line((3, 15), (6, 15)),
+             _line((18, 9), (21, 9)), _line((18, 15), (21, 15))),
 }
 
 
-def _paint(painter, rect, name, color):
-    """Draw glyph *name* into *rect* (a QRect / QRectF) in *color*."""
+def _paint(painter, rect, name, color, weight=1.9):
+    """Draw glyph *name* into *rect* (a QRect / QRectF) in *color*, its lines
+    *weight* (of 24) wide."""
     side = min(rect.width(), rect.height())
     if side <= 0:
         return
@@ -77,7 +126,7 @@ def _paint(painter, rect, name, color):
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing)
     pen = QPen(QColor(color))
-    pen.setWidthF(max(1.0, 1.9 * scale))
+    pen.setWidthF(max(1.0, weight * scale))
     pen.setCapStyle(Qt.RoundCap)
     pen.setJoinStyle(Qt.RoundJoin)
     painter.setPen(pen)
@@ -123,6 +172,10 @@ class _GlyphEngine(QIconEngine):
 
     def paint(self, painter, rect, mode, state):
         tone = "dim" if mode == QIcon.Disabled else self.tone
+        if tone == "on-danger":
+            # white for a red button — with a soft dark edge, so it still
+            # shows where the button is not red (a host's own look)
+            _paint(painter, rect, self.name, "#66000000", weight=4.0)
         _paint(painter, rect, self.name, tone_color(tone))
 
     def pixmap(self, size, mode, state):

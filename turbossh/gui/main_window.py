@@ -264,11 +264,16 @@ class MainWindow(QMainWindow):
     def set_chrome(self, *, menu_bar=None, ribbon=None, sidebar=None, log_dock=None,
                    status_bar=None):
         """Show or hide the parts around the tabs; ``None`` leaves one as it is."""
+        if sidebar is not None:
+            # hidden by the host: no edge handle offers it back (before the
+            # dock hides, which looks at this)
+            self._sidebar_by_host = not sidebar
         for value, part in ((menu_bar, self.menuBar()), (ribbon, self._ribbon),
                             (sidebar, self._sidebar_dock), (log_dock, self._log_dock),
                             (status_bar, self.statusBar())):
             if value is not None:
                 part.setVisible(bool(value))
+        self._sync_sidebar()             # (a list hidden already sends no event)
 
     def _report_store_problems(self):
         """Say so when sessions.json / settings.json could not be read. Staying
@@ -335,6 +340,17 @@ class MainWindow(QMainWindow):
         m_view.addAction(ic("📜"), "Logs", lambda: self._show_inner("Logs"))
         m_view.addAction(ic("🔲"), "Split / unsplit", self.toggle_split)
         m_view.addAction(ic("🧾"), "Show / hide log dock", self.toggle_log)
+        # Ctrl+Shift+B works everywhere; Ctrl+B (as in TurboADB) outside a
+        # terminal, which keeps it for the shell (tmux's prefix, for one).
+        # Hosted, only the Ctrl+Shift one: the host may have a Ctrl+B of its
+        # own, and two on one key make Qt fire neither.
+        self._sidebar_act = m_view.addAction(ic("📑"), "Sessions list")
+        self._sidebar_act.setCheckable(True)
+        self._sidebar_act.setChecked(True)
+        keys = ["Ctrl+Shift+B"] if self.embedded else ["Ctrl+Shift+B", "Ctrl+B"]
+        self._sidebar_act.setShortcuts([QKeySequence(k) for k in keys])
+        self._sidebar_act.setToolTip("Show or hide the sessions list (Ctrl+Shift+B)")
+        self._sidebar_act.triggered.connect(lambda checked: self.toggle_sidebar(checked))
         m_view.addSeparator()
         self._camera_toggle_act = m_view.addAction(ic("📷"), "Camera")
         self._camera_toggle_act.setCheckable(True)
@@ -729,10 +745,42 @@ class MainWindow(QMainWindow):
 
     # ---- sidebar (quick connect + session tree) ----
     def _build_sidebar(self):
+        from . import glyphs
         dock = QDockWidget("Sessions", self)
+        dock.setObjectName("sidebarDock")
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        # A fixed panel, as in TurboADB: its ✕ and float buttons could close it
+        # or float it off-screen, with no way to get it back. The ‹ on its
+        # header hides it; the › on the window's left edge brings it back.
+        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        dock.setTitleBarWidget(QWidget())
         panel = QWidget()
+        panel.setObjectName("sidebarPanel")
         lay = QVBoxLayout(panel)
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        title = QLabel("Sessions")
+        title.setObjectName("sidebarTitle")
+        self._session_count = QLabel("0")
+        self._session_count.setObjectName("countBadge")
+        self._session_count.setToolTip("Saved sessions")
+        add = QToolButton()
+        add.setObjectName("iconButton")
+        add.setIcon(glyphs.icon("plus", "accent"))
+        add.setToolTip("New session (Ctrl+N)")
+        add.clicked.connect(lambda: self.new_session())
+        collapse = QToolButton()
+        collapse.setObjectName("iconButton")
+        collapse.setIcon(glyphs.icon("chevron-left", "dim"))
+        collapse.setToolTip("Hide the sessions list (Ctrl+Shift+B)")
+        collapse.clicked.connect(lambda: self.toggle_sidebar(False))
+        self._sidebar_collapse = collapse
+        header.addWidget(title)
+        header.addWidget(self._session_count)
+        header.addStretch(1)
+        header.addWidget(add)
+        header.addWidget(collapse)
+        lay.addLayout(header)
         self.quick = QLineEdit()
         self.quick.setPlaceholderText("Quick connect…  (filter / Enter to open)")
         self.quick.textChanged.connect(self._filter_sessions)
@@ -754,6 +802,67 @@ class MainWindow(QMainWindow):
         dock.setWidget(panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
         self._sidebar_dock = dock
+        # The slim bar on the window's left edge while the list is hidden. A
+        # dock of its own: the split view swaps the central widget, which
+        # must stay the tabs (or the grid) alone.
+        self._sidebar_by_host = False    # the embedding application hid it
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea)   # fixed: it is not moved
+        self._sidebar_handle = _EdgeHandle()
+        self._sidebar_handle.clicked.connect(lambda: self.toggle_sidebar(True))
+        handle = QDockWidget("", self)
+        handle.setObjectName("sidebarHandleDock")
+        handle.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        handle.setTitleBarWidget(QWidget())
+        handle.setWidget(self._sidebar_handle)
+        handle.toggleViewAction().setVisible(False)   # not in the docks' menu
+        # nor the list: View → Sessions list is its entry (it knows the host's
+        # choice, and keeps the edge bar in step)
+        dock.toggleViewAction().setVisible(False)
+        self.addDockWidget(Qt.LeftDockWidgetArea, handle)
+        handle.hide()
+        self._sidebar_handle_dock = handle
+        # however the list is hidden (the ‹, the View menu, the docks' own menu
+        # on a right-click), the handle shows and the menu entry follows
+        dock.installEventFilter(self)
+
+    def toggle_sidebar(self, show=None) -> None:
+        """Show, hide or (``None``) flip the sessions list. Hidden, a slim bar
+        with a › on the window's left edge brings it back."""
+        dock = self._sidebar_dock
+        if show is None:
+            show = dock.isHidden()       # its own state, even before the window shows
+        self._sidebar_by_host = False
+        dock.setVisible(bool(show))
+        self._sync_sidebar()
+
+    def sidebar_shown(self) -> bool:
+        return not self._sidebar_dock.isHidden()
+
+    def _sync_sidebar(self):
+        """The edge handle shows while the list is hidden — unless the
+        embedding application hid it (set_chrome): that is its choice."""
+        dock = getattr(self, "_sidebar_dock", None)
+        handle = getattr(self, "_sidebar_handle_dock", None)
+        if dock is None or handle is None:
+            return
+        hidden = dock.isHidden()
+        want = hidden and not self._sidebar_by_host
+        if handle.isHidden() == want:
+            handle.setVisible(want)
+        action = getattr(self, "_sidebar_act", None)
+        if action is not None:
+            if action.isChecked() == hidden:
+                action.setChecked(not hidden)
+            # hidden by the host: neither the menu nor its keys bring it back
+            action.setEnabled(not self._sidebar_by_host)
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt API
+        if (watched is getattr(self, "_sidebar_dock", None)
+                and event.type() in (QEvent.HideToParent, QEvent.ShowToParent)):
+            if event.type() == QEvent.ShowToParent:
+                self._sidebar_by_host = False    # it shows: whoever did it
+            self._sync_sidebar()
+        return super().eventFilter(watched, event)
 
     # ---- center tabs with a "+" corner button ----
     def _build_center(self):
@@ -956,6 +1065,7 @@ class MainWindow(QMainWindow):
             self.session_list.addItem(it)
             if keep is not None and s.get("name") == keep:
                 self.session_list.setCurrentItem(it)
+        self._session_count.setText(str(len(self.store.sessions)))
         self._filter_sessions(self.quick.text())
         self._refresh_home()        # keep the Home tab's session list in sync
 
@@ -1507,3 +1617,39 @@ class MainWindow(QMainWindow):
             QApplication.instance().quit()
         except Exception:
             pass
+
+
+class _EdgeHandle(QWidget):
+    """The slim bar on the window's left edge with a › at its top that brings
+    the hidden sessions list back; a click anywhere on the bar does (as in
+    TurboADB)."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from . import glyphs
+        self.setObjectName("sidebarHandle")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedWidth(26)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Show the sessions list (Ctrl+Shift+B)")
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 8, 0, 8)
+        column.setSpacing(0)
+        arrow = QToolButton()
+        arrow.setObjectName("sidebarHandleArrow")
+        arrow.setIcon(glyphs.icon("chevron-right", "accent"))
+        arrow.setIconSize(QSize(16, 16))
+        arrow.setFixedSize(22, 34)
+        arrow.setToolTip(self.toolTip())
+        arrow.setFocusPolicy(Qt.NoFocus)
+        arrow.clicked.connect(self.clicked)
+        column.addWidget(arrow, 0, Qt.AlignHCenter | Qt.AlignTop)
+        column.addStretch(1)
+        self.arrow = arrow
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt API
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)

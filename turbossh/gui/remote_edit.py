@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import stat
 import weakref
 from collections import namedtuple
 
@@ -71,6 +72,79 @@ def _decode(data):
         return data.decode("cp1252"), "cp1252", ""
     except UnicodeDecodeError:
         return data.decode("latin-1"), "latin-1", ""
+
+
+def _loaded(data, name, mode, stamp) -> Loaded:
+    """What the editor shows of a file's *data* (read up to MAX_EDIT_BYTES + 1)."""
+    if len(data) > MAX_EDIT_BYTES:       # it grew, or its size was not true
+        raise NotEditable(f"{name} is more than {MAX_EDIT_BYTES // 1048576} MB — too "
+                          f"large to edit here.")
+    if b"\0" in data[:8192]:
+        raise NotEditable(f"{name} looks like a binary file.")
+    text, encoding, problem = _decode(data)
+    crlf = text.count("\r\n")
+    if crlf and crlf != text.count("\n") and not problem:
+        problem = "it mixes CRLF and LF line endings (saving would make them all one kind)"
+    return Loaded(text.replace("\r\n", "\n"), "\r\n" if crlf else "\n", encoding,
+                  mode, stamp, problem)
+
+
+def read_local_text(path) -> Loaded:
+    """Read a file on this PC for editing (on a worker thread), as
+    :func:`read_remote_text` reads a remote one."""
+    name = os.path.basename(path)
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise NotEditable(f"{name} is not a regular file — only a regular file can be "
+                          f"opened here.")
+    if info.st_size > MAX_EDIT_BYTES:
+        raise NotEditable(f"{name} is more than {MAX_EDIT_BYTES // 1048576} MB — too "
+                          f"large to edit here.")
+    with open(path, "rb") as fh:
+        data = fh.read(MAX_EDIT_BYTES + 1)
+    return _loaded(data, name, info.st_mode, (info.st_size, info.st_mtime))
+
+
+def write_local_text(path, data: bytes, *, stamp=None, mode=None):
+    """Save *data* as the file *path* on this PC (on a worker thread); returns
+    ``(bytes written, new stamp, how)`` as :func:`write_remote_text` does.
+
+    *stamp* is the (size, mtime) the file had when it was loaded: if it is not
+    that any more, :class:`ChangedOnRemote` is raised and nothing is written.
+    A temporary file next to it replaces it, with its permissions; a file with
+    more than one hard link is written in place (*how* says so), as replacing
+    it would part it from its other names. A symbolic link stays a link: the
+    file it points at is written."""
+    name = os.path.basename(path)
+    # edit the file, not the link: replacing the link itself with the new text
+    # would leave the file it points at as it was
+    path = os.path.realpath(path)
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        info = None
+    if stamp is not None:
+        if info is None:
+            raise ChangedOnRemote(f"{name} was deleted after you opened it.")
+        if (info.st_size, info.st_mtime) != tuple(stamp):
+            raise ChangedOnRemote(f"{name} was changed on disk after you opened it "
+                                  f"(by another program).")
+    how = ""
+    if info is not None and info.st_nlink > 1:
+        with open(path, "r+b") as fh:
+            fh.write(data)
+            fh.truncate()
+        how = f"in place (it has {info.st_nlink} hard links)"
+    else:
+        _write_local(path, data)
+        keep = info.st_mode if info is not None else mode
+        if keep is not None:
+            try:
+                os.chmod(path, stat.S_IMODE(keep))
+            except OSError:
+                pass
+    after = os.stat(path)
+    return len(data), (after.st_size, after.st_mtime), how
 
 
 def read_remote_text(sftp, path) -> Loaded:
@@ -176,6 +250,24 @@ class RemoteEditDialog(QDialog):
     """``link`` is the browser's locked SFTP client wrapper (``link.run(fn)``).
     The window deletes itself when closed."""
 
+    _WHERE = "the remote"                # where the file is, for its messages
+    _ELSEWHERE = "Download it to edit it elsewhere."
+
+    @staticmethod
+    def _base(path):
+        return posixpath.basename(path)
+
+    def _reader(self):
+        """The load, for a worker (made here, on the GUI thread: a reconnect
+        swaps the link)."""
+        link, path = self._link, self._path
+        return lambda: link.run(lambda sftp: read_remote_text(sftp, path))
+
+    def _writer(self, data, stamp, mode):
+        link, path = self._link, self._path
+        return lambda: link.run(lambda sftp: write_remote_text(
+            sftp, path, data, stamp=stamp, mode=mode))
+
     def __init__(self, link, path: str, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_DeleteOnClose)       # closed editors used to pile up
@@ -186,7 +278,8 @@ class RemoteEditDialog(QDialog):
         self._jobs: set = set()
         self._loaded = self._saving = self._offline = False
         self._problem = ""               # why it may only be viewed
-        self._title = f"{posixpath.basename(path)} — {path}"
+        self._name = self._base(path)
+        self._title = f"{self._name} — {path}"
         self.setWindowTitle(self._title)
         self.resize(820, 560)
 
@@ -238,15 +331,15 @@ class RemoteEditDialog(QDialog):
         endings = "CRLF" if self._newline == "\r\n" else "LF"
         text = f"{lines} lines · {self._encoding} · {endings}"
         if self._problem:
-            text += f" · read-only: {self._problem}. Download it to edit it elsewhere."
+            text += f" · read-only: {self._problem}. {self._ELSEWHERE}"
         return text
 
     # ---- load / save ----
     def _reload(self):
         if self.has_unsaved_changes() and QMessageBox.question(
                 self, "Reload",
-                f"Throw away your changes to {posixpath.basename(self._path)} and "
-                f"load it again from the remote?", QMessageBox.Yes | QMessageBox.No,
+                f"Throw away your changes to {self._name} and "
+                f"load it again from {self._WHERE}?", QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No) != QMessageBox.Yes:
             return
         self.load()
@@ -255,9 +348,7 @@ class RemoteEditDialog(QDialog):
         if self._offline:
             return
         self.status.setText("Loading…")
-        link, path = self._link, self._path
-        run_job(self._jobs, lambda: link.run(lambda sftp: read_remote_text(sftp, path)),
-                self._on_loaded, self._on_failed)
+        run_job(self._jobs, self._reader(), self._on_loaded, self._on_failed)
 
     def _on_loaded(self, loaded):
         self._newline, self._encoding = loaded.newline, loaded.encoding
@@ -290,13 +381,11 @@ class RemoteEditDialog(QDialog):
             self.status.setText(f"⚠ not saved: {text[exc.start:exc.end]!r} cannot be "
                                 f"written in {self._encoding}, the file's encoding")
             return
-        link, path, mode = self._link, self._path, self._mode
-        stamp = None if force else self._stamp
+        write = self._writer(data, None if force else self._stamp, self._mode)
 
         def job():
             try:
-                return link.run(lambda sftp: write_remote_text(
-                    sftp, path, data, stamp=stamp, mode=mode))
+                return write()
             except ChangedOnRemote as exc:
                 return exc               # asked about on the GUI thread
         self._saving = True
@@ -311,7 +400,7 @@ class RemoteEditDialog(QDialog):
             self.status.setText(f"⚠ not saved: {result}")
             self._buttons()
             if QMessageBox.question(
-                    self, "Changed on the remote",
+                    self, f"Changed on {self._WHERE}",
                     f"{result}\n\nSave your version over it anyway? Choose No to keep "
                     f"editing (Save a copy… keeps your text in a local file; Reload "
                     f"shows what is there now).",
@@ -337,7 +426,7 @@ class RemoteEditDialog(QDialog):
         if not self._loaded:
             return
         target, _ = QFileDialog.getSaveFileName(
-            self, "Save a copy", local_name(posixpath.basename(self._path)))
+            self, "Save a copy", local_name(self._name))
         if target:
             self.save_copy_to(target)
 
@@ -395,7 +484,7 @@ class RemoteEditDialog(QDialog):
                      "closed)" if self._offline else "")
             answer = QMessageBox.question(
                 self, "Unsaved changes",
-                f"{posixpath.basename(self._path)} has unsaved changes{where}. Close "
+                f"{self._name} has unsaved changes{where}. Close "
                 f"without saving?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes:
                 event.ignore()
@@ -407,3 +496,31 @@ class RemoteEditDialog(QDialog):
         """Stop quietly: nothing may call back here."""
         close_jobs(self._jobs)
         self.edit.document().setModified(False)
+
+
+class LocalEditDialog(RemoteEditDialog):
+    """The same editor for a file on this PC (the Files tab's local pane: Edit /
+    F4). It asks before saving over a file another program changed meanwhile,
+    and saves through a temporary file, keeping the permissions."""
+
+    _WHERE = "disk"
+    _ELSEWHERE = "Open it in another editor to change it."
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(None, path, parent)
+        self.copy_btn.setToolTip("Save the text as it is now to another file")
+
+    @staticmethod
+    def _base(path):
+        return os.path.basename(path)
+
+    def _reader(self):
+        path = self._path
+        return lambda: read_local_text(path)
+
+    def _writer(self, data, stamp, mode):
+        path = self._path
+        return lambda: write_local_text(path, data, stamp=stamp, mode=mode)
+
+    def rebind(self, link):              # no connection to follow
+        pass

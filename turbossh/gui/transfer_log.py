@@ -22,8 +22,11 @@ CANCELLED = "cancelled"
 FINISHED = frozenset((DONE, FAILED, CANCELLED))
 ACTIVE = frozenset((QUEUED, RUNNING))
 
-DIRECTION_LABELS = {"upload": "PC → Remote", "download": "Remote → PC"}
-_PAST = {"upload": "Uploaded", "download": "Downloaded"}
+# "copy": on the remote host itself (a Paste of a remote Copy); its *remote* is
+# where the copy goes and its *local* the remote path it is copied from
+DIRECTION_LABELS = {"upload": "PC → Remote", "download": "Remote → PC",
+                    "copy": "Remote → Remote"}
+_PAST = {"upload": "Uploaded", "download": "Downloaded", "copy": "Copied"}
 
 _SPEED_WINDOW = 5.0          # seconds of samples the speed is averaged over
 _HISTORY_LIMIT = 500         # finished items kept before the oldest are dropped
@@ -69,7 +72,7 @@ class TransferItem:
 
     def __init__(self, item_id, kind, remote, local, is_dir, now):
         self.id = item_id
-        self.kind = kind                 # "upload" | "download"
+        self.kind = kind                 # "upload" | "download" | "copy"
         self.remote = remote
         self.local = local
         self.is_dir = bool(is_dir)

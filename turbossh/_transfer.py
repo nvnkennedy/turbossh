@@ -321,6 +321,11 @@ def _links_of(sftp, path: str) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 # Uploads
 # --------------------------------------------------------------------------- #
+class NotInPlace(IOError):
+    """:func:`put_stream` was told not to write the file in place (a copy
+    read from the same server: in place, it might empty its own source)."""
+
+
 class _InPlace(IOError):
     """Replacing the file cannot be done here; it is written in place (why).
     An IOError, so a caller of :func:`rename_over` that does not write in place
@@ -796,14 +801,20 @@ def _write_in_place(sftp, fl, size, path, callback, regular: bool) -> None:
 
 
 def put_stream(sftp, fl, size: int, remote: str, *, callback=None,
-               existing=UNKNOWN, mode=None) -> str:
+               existing=UNKNOWN, mode=None, in_place=True,
+               hard_links_in_place=True) -> str:
     """Write the seekable *fl* (*size* bytes) to *remote* by the policy above.
 
     *existing* is what is at *remote* when the caller knows it — a listing entry
     (it carries the hard-link count) or None for nothing — else it is looked up.
     *mode* is the mode for a file that did not exist yet. ``callback(done,
     total)`` reports progress; raising from it aborts. Returns ``""``, or
-    ``"in place (why)"`` when the file was written in place."""
+    ``"in place (why)"`` when the file was written in place. For *fl* read
+    from the same server — which may be the very file, that writing in place
+    would empty before it is read — :class:`NotInPlace` is raised instead of
+    writing in place when *in_place* is False (it is the same file), or
+    *hard_links_in_place* is False and the file has other hard links (one of
+    them may be the source)."""
     if existing is UNKNOWN or (existing is not None and file_type(
             getattr(existing, "st_mode", None)) == _S_IFLNK):
         remote, existing = resolve(sftp, remote)
@@ -823,6 +834,9 @@ def put_stream(sftp, fl, size: int, remote: str, *, callback=None,
         if links is None:
             links = _links_of(sftp, remote)
         why = f"it has {links} hard links" if links and links > 1 else None
+        if why and not hard_links_in_place:
+            raise NotInPlace(errno.EPERM, f"{remote} was not replaced: {why}, and "
+                                          f"one of them may be the file copied")
     if why is None:
         start = fl.tell()
         try:
@@ -831,6 +845,9 @@ def put_stream(sftp, fl, size: int, remote: str, *, callback=None,
         except _InPlace as fallback:
             why = fallback.why
         fl.seek(start)
+    if not in_place:
+        raise NotInPlace(errno.EPERM, f"{remote} was not replaced: it could only be "
+                                      f"written in place ({why})")
     _write_in_place(sftp, fl, size, remote, callback, regular)
     return f"in place ({why})"
 

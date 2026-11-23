@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -116,6 +117,81 @@ def _remove_for_good(paths):
         except OSError as exc:
             errors.append(f"{os.path.basename(path)}: {exc}")
     return removed, errors
+
+
+_WIN_NAME_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WIN_RESERVED = frozenset(["CON", "PRN", "AUX", "NUL"]
+                          + [f"{p}{n}" for p in ("COM", "LPT") for n in range(1, 10)])
+
+
+def _plain_name(name) -> bool:
+    """A name for a new entry of the folder on screen, not a path: on Windows
+    a ":" made "C:x" a file somewhere else, or "a.txt:x" a hidden stream."""
+    if not name or name in (".", "..") or os.sep in name or "/" in name:
+        return False
+    if not _WINDOWS:
+        return True
+    # "NUL" or "con.txt" is a device, not a file: "created", and nothing there
+    return not (_WIN_NAME_BAD.search(name)
+                or name.split(".")[0].rstrip(" ").upper() in _WIN_RESERVED
+                or name.endswith((".", " ")))
+
+
+def _holds(folder, path) -> bool:
+    """Is *path* the folder *folder* itself, or below it? (Pasting a folder
+    there would copy it into itself for ever.)"""
+    folder = os.path.normcase(os.path.abspath(folder))
+    path = os.path.normcase(os.path.abspath(path))
+    try:
+        return os.path.commonpath([folder, path]) == folder
+    except ValueError:                   # another drive
+        return False
+
+
+_MOUNT_POINT = 0xA0000003           # IO_REPARSE_TAG_MOUNT_POINT: a junction
+
+
+def _folder_link(path) -> bool:
+    """A symbolic link to a folder, or a Windows junction (which os.path.islink
+    does not call a link)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return os.path.isdir(path)
+    return getattr(st, "st_reparse_tag", 0) == _MOUNT_POINT
+
+
+def _skip_folder_links(folder, names):
+    """copytree's *ignore*: a folder link inside a copied folder is left out
+    (a profile's "Application Data" junction points back up the tree, and
+    following it copied for ever); a link to a file is copied as the file."""
+    return [n for n in names if _folder_link(os.path.join(folder, n))]
+
+
+def _copy_local(jobs):
+    """``(copied, errors)``: each ``(source, target)`` of a Paste copied on this
+    PC (worker thread). A folder is merged into one that is there."""
+    copied, errors = 0, []
+    for src, dst in jobs:
+        try:
+            if os.path.isdir(src):
+                if _holds(os.path.realpath(src), os.path.realpath(dst)):
+                    raise OSError(f"cannot copy {src} into itself")
+                shutil.copytree(src, dst, ignore=_skip_folder_links, dirs_exist_ok=True)
+            elif os.path.isdir(dst):
+                raise OSError(f"a folder named {os.path.basename(dst)} is there")
+            else:
+                shutil.copy2(src, dst)
+            copied += 1
+        except shutil.Error as exc:      # copytree: what it could not copy
+            failed = exc.args[0] if exc.args and isinstance(exc.args[0], list) else []
+            errors.append(f"{os.path.basename(src)}: {len(failed) or 'some'} item(s) "
+                          f"not copied")
+        except OSError as exc:
+            errors.append(f"{os.path.basename(src)}: {exc}")
+    return copied, errors
 
 
 def _names(paths, limit=5) -> str:
@@ -764,6 +840,8 @@ class LocalPane(QWidget):
     upload_requested = pyqtSignal(list)  # local paths to send to the remote pane
     message = pyqtSignal(str)
     deleted = pyqtSignal(int)            # a delete finished: how many items went
+    copy_requested = pyqtSignal(list)    # Copy: local paths for the page's clipboard
+    paste_requested = pyqtSignal()       # Paste: the page knows what was copied
 
     def __init__(self, start_dir: str = "", parent=None):
         super().__init__(parent)
@@ -771,6 +849,7 @@ class LocalPane(QWidget):
         self._jobs = set()               # listings, start-folder check, deletes
         self._moved = False              # navigated since the pane opened
         self._deleting = False
+        self._pasting = False
         self._closing = False
         self._gen = 0                    # the listing the pane waits for
         self._entries = {}               # name -> _Entry: the listing on screen
@@ -846,23 +925,37 @@ class LocalPane(QWidget):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(self.status)
-        ops, _buttons = ops_row((
-            ("New folder", self.new_folder, "Create a folder here"),
-            ("Open", self.open_selected, "Open the selected item with its program"),
+        ops, buttons = ops_row((
+            ("New folder", self.new_folder, "Create a folder here (Ctrl+Shift+N)"),
+            ("New file", self.new_file, "Create an empty file here"),
+            ("Open", self.open_selected, "Open the selected item with its program (Enter)"),
+            ("Edit", self.edit_selected, "Edit the selected text file in TurboSSH's "
+                                         "editor (F4)"),
+            ("Copy", self.copy_selected, "Copy the selection (Ctrl+C)"),
+            ("Paste", self.paste_requested.emit,
+             "Paste what was copied into this folder (Ctrl+V): from the remote pane "
+             "it is downloaded"),
             ("Rename", self.rename_selected, "Rename the selected item (F2)"),
         ), self.delete_selected, "Delete the selection (to the recycle bin where "
-                                 "there is one) (Del)")
-        lay.addLayout(ops)
+                                 "there is one) (Del; Shift+Del: permanently)")
+        self.ops_buttons = {b.text(): b for b in buttons}
+        lay.addWidget(ops)
 
         # one owner per key: two shortcuts on one key that both apply cancel
-        # out (neither fires). Backspace and Delete belong to the list alone,
-        # so the path box keeps them.
+        # out (neither fires). Backspace, Delete and the clipboard keys belong
+        # to the list alone, so the path box keeps them.
         for keys, owner, slot in (("F5", self, self.refresh), ("Alt+Up", self, self.up),
+                                  ("Ctrl+Shift+N", self, self.new_folder),
                                   ("Backspace", self.view, self.up),
                                   ("Delete", self.view, self.delete_selected),
-                                  ("F2", self.view, self.rename_selected)):
+                                  ("Shift+Del", self.view, self.delete_permanently),
+                                  ("F2", self.view, self.rename_selected),
+                                  ("F4", self.view, self.edit_selected)):
             QShortcut(QKeySequence(keys), owner, activated=slot,
                       context=Qt.WidgetWithChildrenShortcut)
+        # claimed by the list itself (see ListTree.clipboard_keys)
+        self.view.clipboard_keys = [(QKeySequence.Copy, self.copy_selected),
+                                    (QKeySequence.Paste, self.paste_requested.emit)]
         # Start at home. The folder saved last time may be on a share that is
         # gone, and asking Windows about it here hung the window for the SMB
         # timeout (on every reconnect, too): look on a worker, then go there.
@@ -1274,21 +1367,36 @@ class LocalPane(QWidget):
             self._say("Select a file or folder to open first.")
 
     def _context_menu(self, pos):
+        from .widgets import OP_ICONS
+
+        def add(text, slot, op):
+            glyph, tone = OP_ICONS[op]
+            return menu.addAction(glyphs.icon(glyph, "red" if tone == "on-danger" else tone),
+                                  text, slot)
         paths = self.selection_paths()
         menu = QMenu(self)
         if paths and self.cwd:
             menu.addAction("Upload to the remote pane", lambda: self.upload_requested.emit(paths))
         if len(paths) == 1:
-            menu.addAction("Open", self.open_selected)
+            add("Open", self.open_selected, "Open")
+        if len(paths) == 1 and self.cwd:
+            add("Edit (F4)", self.edit_selected, "Edit")
         if self.cwd:
             menu.addAction("Show this folder in the file manager",
                            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.cwd)))
             menu.addSeparator()
-            menu.addAction("New folder", self.new_folder)
+            if paths:
+                add("Copy (Ctrl+C)", self.copy_selected, "Copy")
+            add("Paste (Ctrl+V)", self.paste_requested.emit, "Paste")
+            menu.addSeparator()
+            add("New folder", self.new_folder, "New folder")
+            add("New file", self.new_file, "New file")
         if len(paths) == 1 and self.cwd:
-            menu.addAction("Rename (F2)", self.rename_selected)
+            add("Rename (F2)", self.rename_selected, "Rename")
         if paths and self.cwd:
-            menu.addAction("Delete", self.delete_selected)
+            add("Delete", self.delete_selected, "Delete")
+            if _HAS_TRASH:
+                menu.addAction("Delete permanently (Shift+Del)", self.delete_permanently)
         if paths:
             menu.addAction("Copy path", lambda: QApplication.clipboard().setText(
                 "\n".join(paths)))
@@ -1298,7 +1406,7 @@ class LocalPane(QWidget):
 
     def do_new_folder(self, name: str) -> bool:
         name = (name or "").strip()
-        if not self.cwd or not name or os.sep in name or "/" in name:
+        if not self.cwd or not _plain_name(name):
             self._say("New folder: give a plain name (inside a folder, not the "
                       "drive list).")
             return False
@@ -1413,10 +1521,150 @@ class LocalPane(QWidget):
         if answer == QMessageBox.Yes:
             self.do_delete(paths)
 
+    def delete_permanently(self):
+        """Shift+Del: delete the selection without the recycle bin, after asking."""
+        paths = self.selection_paths()
+        if not paths or not self.cwd or self._deleting:
+            return
+        answer = QMessageBox.question(
+            self, "Delete permanently",
+            f"Permanently delete {len(paths)} local item(s)?\n{_names(paths)}\n\n"
+            f"They do not go to the recycle bin. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes or self._closing or self._deleting:
+            return
+        self._deleting = True
+        self._say(f"Deleting {_names(paths)}…")
+        run_job(self._jobs, lambda: _remove_for_good(paths),
+                lambda result: self._removed(0, result), self._delete_failed)
+
+    # ---- New file, Edit, Copy / Paste (as on TurboADB's Files tab) ----
+    def do_new_file(self, name: str) -> bool:
+        """Create an empty file in this folder; never over one that is there."""
+        name = (name or "").strip()
+        if not self.cwd or not _plain_name(name):
+            self._say("New file: give a plain name (inside a folder, not the "
+                      "drive list).")
+            return False
+        try:
+            with open(os.path.join(self.cwd, name), "xb"):
+                pass
+        except OSError as exc:
+            self._say(f"Could not create {name}: {exc}")
+            return False
+        self._message = ""
+        self._list(keep=True, after=({name}, name, None))      # on it, alone
+        return True
+
+    def new_file(self):
+        if not self.cwd:
+            self._say("New file: open a folder first (not the drive list).")
+            return
+        name, ok = QInputDialog.getText(self, "New file", "Name:")
+        if ok and name.strip():
+            self.do_new_file(name)
+
+    def edit_selected(self):
+        """Open the selected file in TurboSSH's editor (F4)."""
+        paths = self.selection_paths()
+        if len(paths) != 1 or not self.cwd:
+            self._say("Select one file to edit first.")
+            return None
+        entry = self._entries.get(os.path.basename(paths[0]))
+        if entry is not None and entry.is_dir:
+            self._say("Edit: that is a folder — select a file.")
+            return None
+        from .qtutil import owner_window
+        from .remote_edit import LocalEditDialog
+        dialog = LocalEditDialog(paths[0], owner_window(self))
+        dialog.show()
+        return dialog
+
+    def copy_selected(self):
+        """Copy (Ctrl+C): the selection goes on the Files tab's clipboard."""
+        paths = self.selection_paths()
+        if not paths or not self.cwd:
+            self._say("Select the files or folders to copy first.")
+            return
+        self.copy_requested.emit(paths)
+
+    def paste_paths(self, paths) -> int:
+        """Paste (a local Copy): copy *paths* into this folder, on a worker.
+        Into their own folder they are named as Explorer names copies ("x -
+        Copy.txt"); what is there already is replaced (folders merged) only if
+        the user says so; a folder is never pasted into itself. Returns how
+        many are being copied."""
+        if not self.cwd:
+            self._say("Paste: open a folder first (not the drive list).")
+            return 0
+        if self._pasting:
+            self._say("A paste is still running — wait for it to end.")
+            return 0
+        fold = os.path.normcase
+        here = {fold(n) for n in self._entries}
+        cwd = os.path.abspath(self.cwd)
+        own, other, refused = [], [], []
+        for src in paths:
+            src = os.path.abspath(src)
+            name = os.path.basename(src.rstrip("\\/"))
+            if not name:
+                continue
+            if _holds(src, cwd):
+                refused.append(name)
+            elif fold(os.path.dirname(src)) == fold(cwd):
+                own.append((src, name))
+            else:
+                other.append((src, name))
+        problem = (f"A folder cannot be pasted into itself: {', '.join(refused)}"
+                   if refused else "")
+        clash = [n for _s, n in other if fold(n) in here]
+        if clash:
+            answer = QMessageBox.question(
+                self, "Already there",
+                f"{len(clash)} item(s) already in {cwd}:\n{', '.join(clash[:5])}"
+                f"{' …' if len(clash) > 5 else ''}\n\nReplace? (Folders are merged.) "
+                f"\"No\" pastes only the others.")
+            if self._closing:
+                return 0
+            if answer != QMessageBox.Yes:
+                other = [(s, n) for s, n in other if fold(n) not in here]
+        from .sftp_browser import copy_name
+        jobs, taken = [(s, os.path.join(cwd, n)) for s, n in other], set(here)
+        for src, name in own:
+            entry = self._entries.get(name)
+            new = copy_name(name, taken, entry is not None and entry.is_dir, fold)
+            taken.add(fold(new))
+            jobs.append((src, os.path.join(cwd, new)))
+        if not jobs:
+            self._say(problem)
+            return 0
+        self._pasting = True
+        self._say(f"Pasting {_names([d for _s, d in jobs])}…")
+        run_job(self._jobs, lambda: _copy_local(jobs),
+                lambda result: self._pasted(result, problem, jobs),
+                lambda msg: self._pasted((0, [msg]), problem, jobs))
+        return len(jobs)
+
+    def _pasted(self, result, problem, jobs):
+        self._pasting = False
+        if self._closing:
+            return
+        count, errors = result
+        if errors:
+            problem = "; ".join(filter(None, [problem, "Could not paste "
+                                               + "; ".join(errors[:3])]))
+        names = {os.path.basename(d) for _s, d in jobs}
+        self._list(keep=True, after=(names, next(iter(names)) if len(names) == 1 else None,
+                                     None))
+        self._say(problem)
+
 
 # --------------------------------------------------------------------------- #
 # The page
 # --------------------------------------------------------------------------- #
+# copies of remote files opened on this PC are tidied once per run
+_OLD_COPIES = {"tidied": False}
+
 # the remote quick links: (label, glyph, folder, tip)
 REMOTE_LINKS = (("Home", "house", ".", "Your login folder on the remote host"),
                 ("/", "folder", "/", "The top of the remote file system"),
@@ -1452,13 +1700,27 @@ class FileBrowser(QWidget):
         close, save the local folder as the next start (not for the extra
         browsers New tab opens)."""
         super().__init__(parent)
-        from . import settings
+        from . import file_open, settings
         self._save_start = save_start
+        self._closing = False
+        self._jobs = set()
+        # what Copy put on this tab's clipboard, both panes': ("local", [paths])
+        # or ("remote", [(remote path, is a folder)]); None: nothing yet
+        self.clipboard = None
+        # remote files opened on this PC: their copies, being downloaded (by
+        # the copy's path) and being sent back
+        self._opening, self._sending = {}, {}
+        self._looks = {}                 # id(copy) -> (copy, then): asked of the remote
+        self._copies = file_open.CopyWatcher(self)
+        self._copies.saved.connect(self._send_copy_back)
         self.transfers = TransferLog()
         if local_start is None:
             local_start = settings.get("local_browser_dir") or ""
         self.local = LocalPane(local_start)
-        self.remote = SftpBrowser(handler, transfer_log=self.transfers, start=remote_start)
+        self.remote = SftpBrowser(handler, transfer_log=self.transfers, start=remote_start,
+                                  pane_ops={"Open": self.open_remote,
+                                            "Copy": self.copy_remote,
+                                            "Paste": self.paste_remote})
         self.remote.local_target = lambda: self.local.cwd or None
         self.remote.show_inline_progress = False     # the panel below shows it
         self.remote.log.connect(self.log)
@@ -1466,6 +1728,13 @@ class FileBrowser(QWidget):
         # a download into the local folder ended: list it again (a share is
         # not watched)
         self.remote.transfer_ended.connect(self._transfer_ended)
+        self.remote.transfer_finished.connect(self._transfer_finished)
+        self.remote.rebound.connect(self._rebound)
+        self.local.copy_requested.connect(self.copy_local)
+        self.local.paste_requested.connect(self.paste_local)
+        if not _OLD_COPIES["tidied"]:    # copies of files opened days ago
+            _OLD_COPIES["tidied"] = True
+            run_job(self._jobs, file_open.forget_old_copies)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1473,8 +1742,8 @@ class FileBrowser(QWidget):
         lay.addWidget(self._quick_links())
 
         body = QVBoxLayout()
-        body.setContentsMargins(8, 8, 8, 6)
-        body.setSpacing(6)
+        body.setContentsMargins(12, 12, 12, 8)
+        body.setSpacing(8)
         lay.addLayout(body, 1)
 
         middle = QWidget()
@@ -1496,24 +1765,29 @@ class FileBrowser(QWidget):
         column.addStretch(1)
 
         panes = QSplitter(Qt.Horizontal)
+        panes.setObjectName("filePanes")      # see-through handles (theme.py)
         panes.setChildrenCollapsible(False)
-        panes.setHandleWidth(4)
+        panes.setHandleWidth(8)
         panes.addWidget(self.local); panes.addWidget(middle); panes.addWidget(self.remote)
         panes.setStretchFactor(0, 1); panes.setStretchFactor(1, 0); panes.setStretchFactor(2, 1)
 
-        self.panel = TransferPanel(self.transfers)
+        # the history is there once something was transferred (as on TurboADB)
+        self.panel = TransferPanel(self.transfers, hide_when_empty=True)
         self.panel.retry_requested.connect(self.remote.retry)
         self.panel.cancel_requested.connect(self.remote.cancel_transfer)
 
         split = QSplitter(Qt.Vertical)
         split.setChildrenCollapsible(False)
+        split.setHandleWidth(8)
         split.addWidget(panes); split.addWidget(self.panel)
         split.setStretchFactor(0, 4); split.setStretchFactor(1, 1)
         body.addWidget(split, 1)
 
-        delete = "Del Recycle Bin" if _HAS_TRASH else "Del Delete"
+        delete = ("Del Recycle Bin   ·   Shift+Del Delete permanently" if _HAS_TRASH
+                  else "Del Delete")
         self.hint = QLabel("Drag files between the panes or in from Explorer   ·   "
-                           "Enter Open   ·   F2 Rename   ·   F5 Refresh   ·   "
+                           "Ctrl+A Select all   ·   Ctrl+C / Ctrl+V Copy / Paste   ·   "
+                           "Enter Open   ·   F2 Rename   ·   F4 Edit   ·   F5 Refresh   ·   "
                            f"Backspace Up   ·   {delete}")
         self.hint.setObjectName("mutedHint")
         self.hint.setWordWrap(True)
@@ -1568,6 +1842,214 @@ class FileBrowser(QWidget):
         if kind == "download" and self.local.cwd and local and os.path.normcase(
                 os.path.dirname(os.path.abspath(local))) == os.path.normcase(self.local.cwd):
             self.local.changed_soon()
+
+    # ---- Copy / Paste: one clipboard for both panes (as on TurboADB) ----
+    def copy_local(self, paths):
+        paths = list(paths or [])
+        if paths:
+            self.clipboard = ("local", paths)
+            self.local._say(f"Copied {len(paths)} item(s) — Paste in a folder here, or "
+                            f"in the remote pane to upload.")
+
+    def copy_remote(self):
+        items = self.remote.selected_items()
+        if not items:
+            self.remote.hint("Select the remote files or folders to copy first.")
+            return
+        self.clipboard = ("remote", items)
+        self.remote.hint(f"Copied {len(items)} item(s) — Paste in a remote folder, or "
+                         f"in the local pane to download.")
+
+    def paste_local(self) -> int:
+        """Paste into the local folder: a local Copy is copied there, a remote
+        one downloaded."""
+        if not self.clipboard:
+            self.local._say("Nothing to paste: Copy (Ctrl+C) something first.")
+            return 0
+        side, items = self.clipboard
+        if side == "local":
+            return self.local.paste_paths(items)
+        if not self.local.cwd:
+            self.local._say("Paste: open a local folder first (not the drive list).")
+            return 0
+        return self.remote.download_paths_to(self.local.cwd, items)
+
+    def paste_remote(self) -> int:
+        """Paste into the remote folder: a remote Copy is copied there on the
+        remote host, a local one uploaded."""
+        if not self.clipboard:
+            self.remote.hint("Nothing to paste: Copy (Ctrl+C) something first.")
+            return 0
+        side, items = self.clipboard
+        if side == "local":
+            return self.remote.upload_paths(items)
+        return self.remote.paste_copies(items)
+
+    # ---- Open a remote file in its app on this PC ----
+    def open_remote(self):
+        """Open: a folder is entered; a file is copied to this PC, opened in the
+        app this PC has for it, and each save of that copy goes back to the
+        remote file. Programs are refused; scripts and files no app opens
+        open in TurboSSH's editor (see file_open)."""
+        from . import file_open
+        from .sftp_browser import kind_problem, local_name
+        remote = self.remote
+        entries = remote._selection()
+        if len(entries) != 1:
+            remote.hint("Select one file or folder to open.")
+            return None
+        entry = entries[0]
+        path = posixpath.join(remote.cwd, entry.name)
+        if entry.is_dir:
+            remote.navigate(path)
+            return None
+        problem = kind_problem(entry.ftype)
+        if problem:
+            remote.hint(f"{entry.name} {problem} — it cannot be opened.")
+            return None
+        how, why = file_open.how_to_open(entry.name)
+        if how == file_open.REFUSE:
+            remote.hint(why)
+            return None
+        if how == file_open.EDIT:
+            self.log.emit(f"[i] {why}")
+            return remote.edit_selected()
+        try:
+            folder = file_open.new_copy_folder()
+        except OSError as exc:
+            remote._error(f"cannot open {entry.name}: no room for its copy ({exc})")
+            return None
+        known = entry.size is not None and entry.mtime is not None
+        copy = file_open.RemoteCopy(entry.name, os.path.join(folder, local_name(entry.name)),
+                                    path, stamp=(entry.size, entry.mtime) if known else None)
+        self._opening[os.path.normcase(copy.local)] = copy
+        if not remote.queue_download(path, copy.local):
+            self._opening.pop(os.path.normcase(copy.local), None)
+            return None
+        remote.hint(f"Opening {entry.name}…")
+        return copy
+
+    def _transfer_finished(self, kind, remote_path, local, status):
+        from . import file_open
+        from .transfer_log import DONE, QUEUED
+        if self._closing or status == QUEUED:    # it starts again: wait for that
+            return
+        key = os.path.normcase(local or "")
+        if kind == "download" and key in self._opening:
+            if status != DONE:
+                return       # the Transfers panel says why; a Retry still opens it
+            copy = self._opening.pop(key)
+            if file_open.start(copy.local):
+                self._copies.watch(copy)
+                self.log.emit(f"[OK] Opened {copy.name} on this PC: saving it there "
+                              f"sends it back to {copy.remote}")
+            else:
+                self.remote._error(f"no app on this PC could open {copy.name} "
+                                   f"(its copy is in {copy.local})")
+        elif kind == "upload" and key in self._sending:
+            copy = self._sending[key]
+            if status == DONE:
+                del self._sending[key]
+                copy.synced = file_open.stat_key(copy.local) if copy.sending is None \
+                    else copy.sending
+                copy.sending = None
+                # the remote file as it is now: the next save compares with it
+                # (not looked at: the next save asks first)
+                self._look(copy, lambda stamp, error, c=copy: self._sent(
+                    c, file_open.UNCHECKED if error or stamp is None else stamp))
+            else:
+                # kept, so that a Retry from the Transfers panel is followed too
+                self._not_sent(copy, f"its upload was {status or 'stopped'}")
+                if copy.saving:
+                    self._sent(copy, copy.stamp)
+
+    def _look(self, copy, then):
+        """Look up the remote file of *copy* — ``then(stamp, error)`` follows,
+        once. A reconnect drops a look-up in flight, so it is asked again then
+        (:meth:`_rebound`): a save waiting for it must never be stuck."""
+        self._looks[id(copy)] = (copy, then)
+
+        def done(stamp, c=copy):
+            if self._looks.pop(id(c), None) is not None:
+                then(stamp, "")
+
+        def fail(msg, c=copy):
+            if self._looks.pop(id(c), None) is not None:
+                then(None, msg or "the remote host did not answer")
+        if not self.remote.stamp_of(copy.remote, done, fail):
+            self._looks.pop(id(copy), None)
+            then(None, "the file browser was closed")
+
+    def _rebound(self):
+        if self._closing:
+            return
+        for copy, then in list(self._looks.values()):
+            self._look(copy, then)
+
+    def _not_sent(self, copy, why):
+        """Say so — in the status line, the log and a toast — when a save of an
+        opened remote file did not reach the remote."""
+        if self._closing:
+            return
+        text = f"{copy.name} was saved on this PC but NOT sent to the remote: {why}"
+        self.remote._error(text)
+        self.notify.emit(text, "warn")
+
+    def _sent(self, copy, stamp):
+        """A save of *copy* reached the remote (or did not): it may be sent
+        again, from the remote file as it is now."""
+        copy.saving, copy.stamp = False, stamp
+        if copy.again:
+            copy.again = False
+            self._copies.recheck(copy)
+
+    def _send_copy_back(self, copy):
+        """The app saved the copy of a remote file: send it back — asking
+        first if the remote file changed since it was opened."""
+        if self._closing:
+            return
+        if copy.saving:
+            copy.again = True                    # once this one is done
+            return
+        copy.saving = True
+        self._look(copy, lambda stamp, error, c=copy: self._send_failed(c, error)
+                   if error else self._checked(c, stamp))
+
+    def _send_failed(self, copy, msg):
+        copy.saving = False
+        self._not_sent(copy, msg)
+
+    def _checked(self, copy, stamp):
+        from . import file_open
+        if self._closing:
+            return
+        if copy.stamp == file_open.UNCHECKED:
+            changed, what = True, ("may have changed (TurboSSH could not look at it "
+                                   "after your last save)")
+        else:
+            changed = copy.stamp is not None and tuple(stamp or ()) != tuple(copy.stamp)
+            what = "was deleted" if stamp is None else "was changed"
+        if changed:
+            answer = QMessageBox.question(
+                self, "Changed on the remote",
+                f"{copy.name} {what} on the remote host since you opened it.\n\n"
+                f"Replace it with your copy from this PC?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if self._closing:
+                return
+            if answer != QMessageBox.Yes:
+                # not sent; the stamp stays the one it was opened with, so the
+                # next save asks again (the remote change is never taken for
+                # one this copy has seen)
+                copy.saving = copy.again = False
+                copy.synced = file_open.stat_key(copy.local)  # until it is saved again
+                self._not_sent(copy, "you chose to keep the remote file")
+                return
+        copy.sending = file_open.stat_key(copy.local)
+        self._sending[os.path.normcase(copy.local)] = copy
+        if not self.remote.queue_upload(copy.local, copy.remote):
+            self._sending.pop(os.path.normcase(copy.local), None)
+            copy.saving = False
 
     def showEvent(self, event):  # noqa: N802 - Qt API
         super().showEvent(event)
@@ -1628,6 +2110,12 @@ class FileBrowser(QWidget):
                 settings.save({"local_browser_dir": self.local.cwd})
         except Exception:
             pass
+        self._closing = True
+        self._copies.stop()              # copies saved from now on stay on this PC
+        self._opening.clear()
+        self._sending.clear()
+        self._looks.clear()
+        close_jobs(self._jobs)
         self.local.close_pane()
         self.panel.close_panel()
         self.remote.close_browser()
