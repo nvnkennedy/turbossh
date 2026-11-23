@@ -2,6 +2,68 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.5.0 — 2026-11-24
+
+The sessions list hides and comes back as TurboADB's device list does, and the
+Files tab has TurboADB's file operations in both panes.
+
+### Fixed
+- **The sessions list could be lost until a restart.** Its title bar had a ✕
+  that closed it and a button that floated it off the window, and nothing in
+  the window brought it back. It is now a fixed panel without those buttons.
+
+### Changed — the sessions list
+- **A ‹ on the list's header hides it; a slim bar with a › on the window's
+  left edge brings it back**, at the width it had (a click anywhere on the bar
+  does). View → **Sessions list** does both, with **Ctrl+Shift+B** — which
+  works in a terminal too — or Ctrl+B elsewhere (a terminal keeps Ctrl+B for
+  the shell: tmux's prefix). However the list was hidden, the bar is there.
+- The header shows the list's name, how many sessions are saved, and a **+**
+  for a new one.
+- Embedded, a host that hides the list (`set_chrome(sidebar=False)`, `--hide
+  sidebar`) gets no edge bar, and the menu entry is off: that part of the
+  window is the host's choice. Hosted, the key is Ctrl+Shift+B only, so a
+  host's own Ctrl+B keeps working.
+
+### Changed — the Files tab
+- **TurboADB's buttons under both panes:** New folder, New file, Open, Edit,
+  Copy, Paste, Rename and a red Delete — flat, each with its coloured icon.
+  The row wraps onto a second line rather than widen the pane.
+- **New file** creates an empty file; it never replaces one that is there. On
+  Windows, New file and New folder refuse names with `:` and the other
+  characters Windows does not allow (`a.txt:x` made a hidden stream).
+- **Edit** (F4) opens a text file in TurboSSH's editor — now local files too.
+  Saving asks first if another program changed the file meanwhile, keeps its
+  permissions, and through a link writes the file it points at.
+- **Copy / Paste** (Ctrl+C / Ctrl+V on a list) share one clipboard between
+  the panes. Pasted in the other pane, the items are uploaded or downloaded.
+  Pasted in the same pane, they are copied there — on the remote host itself
+  for remote files, as a transfer in the Transfers panel (progress, Cancel,
+  Retry). Into their own folder copies are named as Explorer names them
+  ("notes - Copy.txt"); elsewhere, what is there is replaced only if you say
+  so; a folder is never pasted into itself, and links back up a folder (a
+  Windows profile's junctions) are not followed. A copy on the remote host is
+  never written in place where that could empty its source (over the source
+  itself, or a file with other hard links): such a file is skipped and the
+  copy says so. The lists take Ctrl+C / Ctrl+V themselves while they have the
+  keyboard, so an application TurboSSH is embedded in keeps its own.
+- **Open** on a remote file copies it to this PC, opens it in the app this PC
+  has for it, and sends each save back to the remote file — asking first, at
+  every save, if that changed on the remote meanwhile (or could not be looked
+  at); a save that is not sent (kept the remote's, cancelled, failed) is
+  always reported, and Retry in the Transfers panel finishes it. A reconnect
+  does not stop it. Copies are kept in the temp folder and tidied after a
+  week. Programs (`.exe`, `.msi`, `.lnk`,
+  `.apk` …) are never started from a remote host; scripts (`.sh`, `.py`,
+  `.bat` …) and files no app opens go to TurboSSH's editor instead. Open on a
+  folder enters it. A double-click on a remote file still opens the editor.
+- **Shift+Del** deletes local items permanently, after asking (Del still uses
+  the recycle bin); **Ctrl+Shift+N** makes a folder.
+- Remote rows have icons by kind, as on TurboADB: folders, links, images,
+  video, audio, archives, text and devices each look their own.
+- Rows are a little taller, the splitter between the panes is see-through,
+  and the **Transfers** panel appears with the first transfer.
+
 ## 2.4.0 — 2026-11-18
 
 Radio buttons and check boxes show in a host application's look, dark or
