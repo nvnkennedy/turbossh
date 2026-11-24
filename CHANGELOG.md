@@ -11,6 +11,9 @@ Files tab has TurboADB's file operations in both panes.
 - **The sessions list could be lost until a restart.** Its title bar had a ✕
   that closed it and a button that floated it off the window, and nothing in
   the window brought it back. It is now a fixed panel without those buttons.
+- The toolbar showed a pale box between Help and Theme, most visible in the
+  light themes: the empty stretch there took the window's colour. It is
+  see-through now.
 
 ### Changed — the sessions list
 - **A ‹ on the list's header hides it; a slim bar with a › on the window's

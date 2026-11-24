@@ -637,7 +637,12 @@ class MainWindow(QMainWindow):
             self.named_actions[key] = act
         from PyQt5.QtWidgets import QSizePolicy
         spacer = QWidget()
+        spacer.setObjectName("ribbonSpacer")
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # see-through: the themes paint every plain widget in the window colour,
+        # which showed as a box on the ribbon (set here, not in theme.py, so it
+        # holds under a host application's style too)
+        spacer.setStyleSheet("QWidget#ribbonSpacer { background: transparent; }")
         tb.addWidget(spacer)
         # one-click theme toggle (light <-> dark), changes everything instantly
         self._theme_act = QAction(self._theme_icon(), "Theme", self)

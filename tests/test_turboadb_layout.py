@@ -179,6 +179,30 @@ def test_the_count_shows_the_saved_sessions(window):
     assert window._session_count.text() == str(len(window.store.sessions))
 
 
+def test_the_ribbon_has_no_box_between_its_buttons(window):
+    """The empty stretch between Help and Theme took the window colour (every
+    plain widget's), a box on the ribbon most visible in the light themes."""
+    # drawn on its own over nothing: it must leave the ribbon showing through
+    # (offscreen the buttons can overflow the ribbon and hide the stretch, so
+    # sampling the ribbon itself would depend on the fonts there are)
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtGui import QImage, QRegion
+    from PyQt5.QtWidgets import QToolBar
+    from turbossh.gui import theme
+    spacer = window.findChild(QWidget, "ribbonSpacer")
+    assert isinstance(spacer.parentWidget(), QToolBar)
+    before = theme.current_name()
+    try:
+        window.apply_theme("light")
+        spacer.ensurePolished()
+        image = QImage(40, 20, QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+        spacer.render(image, QPoint(), QRegion(), QWidget.DrawChildren)
+        assert image.pixelColor(20, 10).alpha() == 0
+    finally:
+        window.apply_theme(before)
+
+
 def test_a_host_that_hides_the_list_gets_no_edge_bar(qapp):
     from turbossh.gui.main_window import MainWindow, WindowOptions
     holder = QWidget()
