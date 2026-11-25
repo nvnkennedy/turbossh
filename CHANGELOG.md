@@ -2,6 +2,45 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.6.0 — 2026-11-25
+
+The Files tab and the text look as on TurboADB, embedded in another
+application too.
+
+### Fixed
+- **Embedded in a host's own look (`theme="inherit"`), the Files tab still had
+  the old plain boxed buttons.** Its buttons and folder links are flat
+  buttons now, as TurboADB's, so no style draws a box round them; the host's
+  colours and font are kept as before.
+- **The text was drawn in Tahoma.** Qt 5 on Windows starts from "MS Shell Dlg
+  2", which Windows draws as Tahoma — an old look, in which the weights between
+  regular and bold came out bold. TurboSSH's windows use Segoe UI 9 pt, as
+  TurboADB's: in the app, and embedded with a TurboSSH theme (on TurboSSH's own
+  window only; the host's font is left alone). The terminal and the logs keep
+  their own fonts.
+- **The tabs' close button was an old boxed ×** (the Windows style's own
+  title-bar glyph). It is a thin × now, white on Windows' close red when
+  hovered, and drawn sharp at any display scaling.
+
+### Changed — the Files tab, as TurboADB's
+- Remote files and folders show **Windows' own icons**, by file type (a remote
+  file does not exist on this PC): the yellow folder, Notepad's icon for a
+  `.txt`, and so on, with Explorer's link mark on a symbolic link. They are
+  looked up on a thread of their own, so a big folder never waits for them; a
+  row shows its drawn icon until its own is in, and keeps it where Windows has
+  none (device nodes, pipes, sockets) and on systems without file icons. A
+  suffix that is no file type (a Maildir message, `core.1234`, `x.001`) gets
+  the plain file icon.
+- Rows as tall as TurboADB's, its column headings, and its text weights: the
+  buttons and folder links are no longer bold, and no heading is heavier than
+  bold.
+- `..` says `<DIR>` like the folders below it.
+- This PC's **Owner** column is gone on Windows, where it was always empty. The
+  remote one steps aside while the names would be cut short (a narrow pane),
+  and is back once there is room.
+- The toolbar's buttons are TurboADB's size, so Compact and Exit fit on a
+  1366-pixel screen.
+
 ## 2.5.0 — 2026-11-24
 
 The sessions list hides and comes back as TurboADB's device list does, and the
