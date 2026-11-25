@@ -314,7 +314,7 @@ def test_tab_close_buttons_are_plain_to_see(qapp, styled, name):
     image = button.grab().toImage()
     tab_bg = QColor(theme.THEMES[name]["tab"])
     assert visible_pixels(image, tab_bg) >= 8, "the close button vanishes on its tab"
-    # the image the stylesheet names is the native glyph, recoloured
+    # the image the stylesheet names is the drawn ×, in the close colour
     sheet = theme.stylesheet(name)
     assert "QTabBar::close-button { image: url(" in sheet
     url = sheet.split("QTabBar::close-button { image: url('", 1)[1].split("'", 1)[0]
@@ -360,14 +360,20 @@ def test_checkboxes_show_their_state_clearly(qapp, styled, name):
     box.deleteLater()
 
 
-def test_the_close_glyph_has_a_drawn_fallback(qapp, monkeypatch):
-    """The close glyph falls back to a drawn × when the style has none."""
+def test_the_close_glyph_is_a_thin_cross_not_a_box(qapp):
+    """The style's title-bar glyph was an old boxed × on Windows: the tabs'
+    close glyph is drawn, two thin strokes and nothing at the edges."""
     from turbossh.gui import theme
-    monkeypatch.setattr(theme, "_native_close_glyph", lambda side: None)
-    image = theme.close_glyph(16, "#ff0000")
-    red = sum(1 for y in range(16) for x in range(16)
-              if image.pixelColor(x, y).alpha() > 128)
-    assert red >= 10
+    for side in (16, 32):
+        image = theme.close_glyph(side, "#ff0000")
+        inked = [(x, y) for y in range(side) for x in range(side)
+                 if image.pixelColor(x, y).alpha() > 128]
+        assert len(inked) >= side, "hardly any cross"
+        assert len(inked) <= side * side // 5, "a filled box, not a thin cross"
+        edge = [p for p in inked if min(p) < side // 5 or max(p) >= side - side // 5]
+        assert not edge, "ink at the edges: a frame"
+        middle = image.pixelColor(side // 2, side // 2)
+        assert middle.alpha() > 128 and middle.name() == "#ff0000"
 
 
 def test_file_list_rows_alternate_in_the_theme(qapp, styled):
@@ -609,31 +615,20 @@ def test_only_a_download_into_the_local_folder_lists_it_again(browser):
     assert pane._settle.isActive()
 
 
-def test_a_high_dpi_close_glyph_is_scaled_not_cropped(qapp, monkeypatch):
-    from PyQt5.QtGui import QPainter, QPen, QPixmap
+def test_a_hovered_tab_close_button_is_white_on_windows_red(qapp):
+    """As Windows' own close button: a thin × that turns white on red, drawn
+    twice as fine for a high-DPI screen (the @2x image)."""
     from turbossh.gui import theme
-
-    class Icon:
-        def pixmap(self, w, h):                           # what Qt gives at 200 %
-            pm = QPixmap(2 * w, 2 * h)
-            pm.fill(Qt.transparent)
-            p = QPainter(pm)
-            p.setPen(QPen(QColor("#202020"), 3))
-            p.drawLine(6, 6, 2 * w - 7, 2 * h - 7)
-            p.drawLine(2 * w - 7, 6, 6, 2 * h - 7)
-            p.end()
-            pm.setDevicePixelRatio(2.0)
-            return pm
-
-    class Style:
-        def standardIcon(self, which):
-            return Icon()
-    monkeypatch.setattr(QApplication, "style", staticmethod(lambda: Style()))
-    glyph = theme._native_close_glyph(16)
-    assert (glyph.width(), glyph.height()) == (16, 16)
-    image = theme.close_glyph(16, "#ffffff")
-    corners = [image.pixelColor(x, y).alpha() for x, y in ((0, 0), (15, 0), (0, 15), (15, 15))]
-    assert max(corners) < 60, "the glyph fills the button: cropped, not scaled"
+    sheet = theme.stylesheet("dark")
+    hover = sheet.split("QTabBar::close-button:hover {", 1)[1].split("}", 1)[0]
+    assert f"background: {theme.CLOSE_RED}" in hover
+    url = hover.split("image: url('", 1)[1].split("'", 1)[0]
+    assert os.path.exists(url.replace(".png", "@2x.png"))
+    white = QImage(url)
+    shades = {white.pixelColor(x, y).name() for y in range(white.height())
+              for x in range(white.width()) if white.pixelColor(x, y).alpha() == 255}
+    assert shades == {"#ffffff"}
+    assert theme.contrast("#ffffff", theme.CLOSE_RED) >= 4.5
 
 
 # ------------------------------------------------------------------ third review

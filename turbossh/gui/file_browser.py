@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
 
 from . import glyphs
 from .qtutil import close_jobs, run_job
-from .sftp_browser import (_FILL_CHUNK, PARENT_KEYS, REMOTE_MIME, REMOTE_SOURCE_MIME,
+from .sftp_browser import (_FILL_CHUNK, DIR_SIZE, PARENT_KEYS, REMOTE_MIME, REMOTE_SOURCE_MIME,
                            ListTree, SftpBrowser, _Entry, _row_specs, _sorted_rows,
                            _Spec, listing_summary, make_row, parent_icon,
                            reorder_rows, select_rows)
@@ -910,6 +910,9 @@ class LocalPane(QWidget):
         lay.addWidget(self.head)
 
         self.view = _LocalView()
+        if _WINDOWS:                     # Windows keeps no owner a listing can show:
+            self.view.owner_room = False         # the column was always empty
+            self.view.setColumnHidden(4, True)
         self.view.header().sortIndicatorChanged.connect(self._resort)
         # scrolling: once it pauses (a drag through a folder of programs
         # asked the shell at every step)
@@ -1156,7 +1159,7 @@ class LocalPane(QWidget):
         self.view.clear()
         self.view.folder = path
         if path:
-            self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS))
+            self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS, DIR_SIZE))
         self.view.addTopLevelItems(rows)
         self._rows_are(gen)
         self._loading = False
@@ -1253,7 +1256,7 @@ class LocalPane(QWidget):
         self.view.clear()
         self.view.folder = path
         if path:                         # ".." to get away from here
-            self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS))
+            self.view.addTopLevelItem(make_row("..", parent_icon(), 0, PARENT_KEYS, DIR_SIZE))
         self._summary = ""
         self._watch("")
         self._say(f"Cannot list {path or 'the drives'}: {msg}")

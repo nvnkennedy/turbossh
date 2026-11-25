@@ -514,8 +514,12 @@ def test_the_settings_dialog_never_restyles_the_host(qapp, embed, monkeypatch):
 
 def test_inherit_keeps_the_hosts_styling(embed):
     from turbossh.gui import settings, theme
+    from PyQt5.QtCore import Qt
     turbo = embed(theme="inherit")
     assert turbo.main_window.styleSheet() == ""
+    # nor a font of its own: the host's comes through (theme.ui_font is for
+    # TurboSSH's own look)
+    assert not turbo.main_window.testAttribute(Qt.WA_SetFont)
     assert turbo.current_theme() == "inherit"
     assert theme.current_name() in ("dark", "light") and settings.get("theme") == "dark"
 

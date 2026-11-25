@@ -813,3 +813,221 @@ def test_only_folders_made_for_opened_files_are_tidied(monkeypatch, tmp_path):
         os.utime(path, (1, 1))
     file_open.forget_old_copies()
     assert not os.path.exists(ours) and theirs.is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# 2.6.0: the Files tab as TurboADB's, also embedded in a host's own look
+# --------------------------------------------------------------------------- #
+def _solid(color, side=16):
+    from PyQt5.QtGui import QColor, QImage
+    image = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor(color))
+    return image
+
+
+def test_remote_rows_get_the_systems_icon_by_type(qapp, ssh, ssh_server, tmp_path,
+                                                   monkeypatch):
+    """As on TurboADB's device pane: a remote folder gets the system's folder
+    icon and a file its type's, looked up by extension on a thread of their own
+    (a remote file does not exist here); the ".." row keeps its arrow."""
+    from turbossh.gui import file_icons
+    from turbossh.gui.file_browser import FileBrowser
+    from turbossh.gui.shell_icons import ShellIcons
+    colours = {".txt": "#00aa00", "": "#0000aa"}
+    asked = []
+
+    def lookup(path, attributes, flags):
+        asked.append(path)
+        if attributes & 0x10:                       # the folder icon
+            return [_solid("#aa0000")]
+        return [_solid(colours.get(os.path.splitext(path)[1], "#555555"))]
+    shell = ShellIcons(qapp, lookup=lookup)
+    monkeypatch.setattr(file_icons, "_shared",
+                        file_icons.FileIcons(native=True, shell=shell))
+    root = ssh_server.root
+    (root / "docs").mkdir()
+    (root / "alpha.txt").write_text("alpha")
+    (root / "README").write_text("readme")
+    widget = FileBrowser(ssh)
+    widget.show()
+    try:
+        tree = widget.remote.tree
+
+        def colour_of(name):
+            for i in range(tree.topLevelItemCount()):
+                it = tree.topLevelItem(i)
+                if it.data(0, Qt.UserRole) == name:
+                    return it.icon(0).pixmap(16, 16).toImage().pixelColor(8, 8).name()
+            return None
+        assert wait_until(lambda: colour_of("alpha.txt") == "#00aa00"
+                          and colour_of("docs") == "#aa0000"
+                          and colour_of("README") == "#0000aa")
+        assert colour_of("..") not in ("#00aa00", "#aa0000", "#0000aa", "#555555")
+        # by extension, in a folder that does not exist: never a file of this PC
+        assert asked and set(asked) <= {"folder", "x.txt", "x"}
+        assert not widget.remote._icon_wait
+    finally:
+        widget.close_browser()
+        widget.deleteLater()
+        shell.stop()
+        QTest.qWait(50)
+
+
+def test_a_row_waits_with_its_glyph_and_takes_the_icon_when_it_comes(qapp):
+    from PyQt5.QtGui import QIcon
+    from turbossh.gui import file_icons
+
+    class Shell:
+        changed = None
+
+        def __init__(self):
+            self.icons = {}
+
+        def folder(self, ask=True):
+            return self.icons.get("folder")
+
+        def type_icon(self, ext, ask=True):
+            return self.icons.get(ext)
+
+        def new_batch(self):
+            pass
+    shell = Shell()
+    icons = file_icons.FileIcons(native=True, shell=shell)
+    glyph = QIcon()
+    icon, ready = icons.row_icon_ready("a.log", False, False, False, glyph)
+    assert icon is glyph and not ready
+    from PyQt5.QtGui import QPixmap
+    shell.icons[".log"] = QIcon(QPixmap.fromImage(_solid("#123456")))
+    icon, ready = icons.row_icon_ready("a.log", False, False, False, glyph)
+    assert ready and icon is shell.icons[".log"]
+    # a device node or pipe: the system has no icon for it, the glyph stays
+    assert icons.row_icon_ready("tty0", False, False, True, glyph) == (glyph, True)
+    # a link: its kind's icon with the link badge
+    shell.icons["folder"] = QIcon(QPixmap.fromImage(_solid("#aa0000")))
+    linked, ready = icons.row_icon_ready("conf", True, True, False, glyph)
+    assert ready and linked is not shell.icons["folder"] and not linked.isNull()
+    # headless (the tests' platform): the glyphs, as before
+    plain = file_icons.FileIcons(native=False)
+    assert plain.row_icon_ready("a.log", False, False, False, glyph) == (glyph, True)
+
+
+def test_the_parent_rows_say_dir(browser):
+    for tree in (browser.remote.tree, browser.local.view):
+        top = tree.topLevelItem(0)
+        assert top.data(0, Qt.UserRole) == ".." and top.text(1) == "<DIR>"
+
+
+def test_this_pcs_owner_column_is_hidden_on_windows(qapp, monkeypatch, tmp_path):
+    """Windows keeps no owner a listing can show: the column was always empty."""
+    from turbossh.gui import file_browser
+    for windows in (True, False):
+        monkeypatch.setattr(file_browser, "_WINDOWS", windows)
+        pane = file_browser.LocalPane(str(tmp_path))
+        try:
+            assert pane.view.isColumnHidden(4) is windows
+            assert not pane.view.isColumnHidden(3)
+        finally:
+            pane.close_pane()
+            pane.deleteLater()
+    QTest.qWait(50)
+
+
+def test_the_files_tab_buttons_are_flat_in_any_look(browser):
+    """Embedded in a host's own look (theme="inherit", no stylesheet of ours)
+    the Files tab's buttons were the host's plain boxed ones: they are flat
+    buttons, as TurboADB's, so no style draws a box round them."""
+    from PyQt5.QtWidgets import QPushButton
+    found = [b for b in browser.findChildren(QPushButton)
+             if b.objectName() in ("paneOp", "quickLink")]
+    ghost = [b for b in found if b.property("role") != "danger"]
+    assert len(ghost) >= 14 and all(b.isFlat() for b in ghost)
+
+
+def test_turbosshs_own_windows_use_segoe_ui_not_tahoma(qapp, monkeypatch):
+    """Qt 5 on Windows starts from MS Shell Dlg 2, drawn as Tahoma: TurboSSH
+    uses Segoe UI there, as TurboADB; other systems keep their own font."""
+    from turbossh.gui import theme
+    monkeypatch.setattr(theme, "_ON_WINDOWS", True)
+    font = theme.ui_font()
+    assert (font.family(), font.pointSize()) == ("Segoe UI", 9)
+    monkeypatch.setattr(theme, "_ON_WINDOWS", False)
+    assert theme.ui_font() is None
+
+
+def test_a_themed_window_takes_the_ui_font_and_inherit_gives_it_back(qapp, monkeypatch):
+    from PyQt5.QtGui import QFont
+    from turbossh.gui import theme
+    from turbossh.gui.main_window import INHERIT_THEME, MainWindow, WindowOptions
+    monkeypatch.setattr(theme, "ui_font", lambda: QFont("Segoe UI", 9))
+    holder = QWidget()
+    win = MainWindow(holder, WindowOptions(embedded=True, home=False, theme="dark"))
+    try:
+        assert win.testAttribute(Qt.WA_SetFont) and win.font().family() == "Segoe UI"
+        win.set_theme(INHERIT_THEME)
+        assert not win.testAttribute(Qt.WA_SetFont)
+        win.set_theme("dark")
+        assert win.font().family() == "Segoe UI"
+    finally:
+        win.deleteLater()
+        holder.deleteLater()
+        QTest.qWait(50)
+        theme.set_active(None)           # the theme the window chose, for this run
+
+
+def test_the_text_is_turboadbs_size_and_weight(qapp):
+    from turbossh.gui import theme
+    sheet = theme.stylesheet("dark")
+    assert "font-size: 9pt" in sheet.split("QWidget {", 1)[1].split("}", 1)[0]
+    ghost = sheet.split('QPushButton#paneOp[role="ghost"] {', 1)[1].split("}", 1)[0]
+    assert "font-weight: 500" in ghost
+    link = sheet.split("QPushButton#quickLink {", 1)[1].split("}", 1)[0]
+    assert "font-weight: 500" in link
+    # the weight is the tab bar's, never a bolder selected tab (clipped labels)
+    selected = sheet.split("QTabBar::tab:selected {", 1)[1].split("}", 1)[0]
+    assert "font-weight" not in selected
+    # Qt 5 makes CSS 700 weight 87: Segoe UI Black. 600 is bold.
+    import re
+    for name in theme.THEME_NAMES:
+        weights = {int(w) for w in re.findall(r"font-weight:\s*(\d+)", theme.stylesheet(name))}
+        assert weights and max(weights) <= 600, name
+
+
+def test_odd_suffixes_are_no_file_type(qapp):
+    """A Maildir message, core.1234 or x.001 would each be a type of its own,
+    looked up and kept for good: they get the generic file icon."""
+    from turbossh.gui.file_icons import type_of
+    assert type_of("notes.TXT") == ".txt" and type_of("a.tar.gz") == ".gz"
+    for name in ("1700000000.M1P2.host,S=1234:2,S", "core.1234", "x.001", "README",
+                 "dump.verylongext", ".bashrc", "f.\u00e9t\u00e9"):
+        assert type_of(name) == "", name
+
+
+def test_waiting_rows_are_grouped_by_what_they_wait_for(qapp):
+    from turbossh.gui.file_icons import FileIcons
+    key = FileIcons.wait_key
+    assert key("a.txt", False, False) == key("b.TXT", False, False)
+    assert key("a.txt", False, False) != key("a.txt", False, True)
+    assert key("docs", True, False) == key("etc.d", True, False)
+    assert key("core.1", False, False) == key("x.001", False, False)
+
+
+def test_the_owner_column_steps_aside_for_the_names_in_a_narrow_pane(browser):
+    """TurboADB's lists have no Owner column: TurboSSH's remote one steps aside
+    while the names would be cut short, and is back once there is room. (Done
+    once a resize is over: hidden from inside the header's own resize, Qt
+    crashed.)"""
+    from turbossh.gui import sftp_browser as sb
+    tree = browser.remote.tree
+    head = tree.header()
+
+    def crowded():
+        others = sum(head.sectionSize(c) for c in (1, 2, 3))
+        return tree.viewport().width() - others - tree._owner_width < sb._NAME_ROOM
+
+    for _round in range(2):
+        browser.resize(3200, 600)
+        QTest.qWait(80)
+        assert not crowded() and not tree.isColumnHidden(4)
+        browser.resize(600, 600)                     # as narrow as it goes
+        QTest.qWait(80)
+        assert crowded() and tree.isColumnHidden(4)

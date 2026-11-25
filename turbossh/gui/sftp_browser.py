@@ -73,6 +73,8 @@ _CANCEL_WAIT_MAX = 300.0  # s a cancelled transfer that moves nothing is waited
                           # for at most, however slow its link was
 _STAT_WINDOW = 64        # link stats in flight at once
 _FILL_CHUNK = 2000       # listing rows added per turn of the event loop
+_OWNER = 4               # the Owner column
+_NAME_ROOM = 180         # px the names keep before the Owner column steps aside
 _MAX_LINK_HOPS = 8       # symlinked folders followed inside one download
 _PART = _transfer.TEMP_SUFFIX    # suffix of a file still being written
 _WINDOWS = os.name == "nt"   # this PC's file names follow Windows' rules
@@ -1080,11 +1082,45 @@ class ListTree(QTreeWidget):
         head.setSectionsClickable(True)
         head.setSortIndicatorShown(True)
         head.setSortIndicator(0, Qt.AscendingOrder)
+        # the Owner column steps aside while the names would be cut short (a
+        # narrow pane; TurboADB's lists have no such column), and is back once
+        # there is room. False: never shown (this PC on Windows keeps none).
+        self.owner_room = True
+        self._owner_width = self.columnWidth(_OWNER)
+        # never from inside a resize: hiding a column while the header is
+        # laying its sections out (sectionResized, resizeEvent) pulls them
+        # from under it, and Qt crashed. Once the resize is over, then.
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(0)
+        self._fit_timer.timeout.connect(self._fit_owner)
+        head.sectionResized.connect(lambda *_a: self._fit_timer.start())
         # [(QKeySequence.StandardKey, slot)]: Copy / Paste of the Files tab. The
         # list claims these keys while it has the keyboard (ShortcutOverride)
         # rather than holding QShortcuts: a window-wide Ctrl+C of an embedding
         # application would make a shortcut ambiguous, and Qt fires neither.
         self.clipboard_keys = []
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._fit_timer.start()
+
+    def _fit_owner(self):
+        """Hide the Owner column while the names would get less than
+        _NAME_ROOM pixels with it; show it again once they would not."""
+        if not self.owner_room:
+            return
+        head = self.header()
+        if not self.isColumnHidden(_OWNER):
+            self._owner_width = head.sectionSize(_OWNER) or self._owner_width
+        others = sum(head.sectionSize(c) for c in range(1, _OWNER)
+                     if not self.isColumnHidden(c))
+        crowded = self.viewport().width() - others - self._owner_width < _NAME_ROOM
+        if crowded != self.isColumnHidden(_OWNER):
+            if crowded and head.sortIndicatorSection() == _OWNER:
+                # never sorted by a column that is not there: by name
+                head.setSortIndicator(0, Qt.AscendingOrder)
+            self.setColumnHidden(_OWNER, crowded)
 
     def _clipboard_slot(self, event):
         for key, slot in self.clipboard_keys:
@@ -1349,6 +1385,13 @@ class SftpBrowser(QWidget):
         # inside the drop itself freezes Explorer until it is answered
         self.tree.dropped.connect(self._upload_paths, Qt.QueuedConnection)
         self._icons = {}                 # (glyph, tone) -> QIcon, shared by the rows
+        # the system's own icons (Windows' per file type, as on TurboADB's
+        # device pane); a row shows its glyph till its icon is in
+        from .file_icons import file_icons
+        self._native = file_icons()
+        self._icon_wait = {}             # wait_key -> rows still showing their glyph
+        if self._native.changed is not None:
+            self._native.changed.connect(self._icons_came)
 
         # Scoped to the browser: with the default (window) context these fired
         # while typing in another session's terminal in split view. Delete,
@@ -1528,7 +1571,9 @@ class SftpBrowser(QWidget):
         if order != self.tree.order:     # the order was changed meanwhile
             specs = _sorted_rows(specs, *self.tree.order)
         self.tree.clear()
-        top = make_row("..", parent_icon(), 0, PARENT_KEYS)
+        self._icon_wait = {}             # (those rows are gone)
+        self._native.new_batch()         # this folder's icons first
+        top = make_row("..", parent_icon(), 0, PARENT_KEYS, DIR_SIZE)
         self.tree.addTopLevelItem(top)
         self._fill = [self._list_gen, specs, 0, top]
         self._fill_more()
@@ -1545,11 +1590,17 @@ class SftpBrowser(QWidget):
             return
         end = min(len(specs), start + _FILL_CHUNK)
         select, rows, entries = self._select, [], self._entries
+        native = self._native
         for s in specs[start:end]:
             entry = entries.get(s.name)
-            icon = self._row_icon(kind_glyph(s.name, s.is_dir, s.is_link,
-                                             entry.ftype if entry is not None else 0))
+            ftype = entry.ftype if entry is not None else 0
+            glyph = self._row_icon(kind_glyph(s.name, s.is_dir, s.is_link, ftype))
+            special = ftype in _SPECIAL
+            icon, ready = native.row_icon_ready(s.name, s.is_dir, s.is_link, special, glyph)
             it = make_row(s.name, icon, s.rank, s.keys, *s.texts)
+            if not ready:
+                key = native.wait_key(s.name, s.is_dir, s.is_link)
+                self._icon_wait.setdefault(key, []).append(it)
             if s.name == select:
                 current = it
             rows.append(it)
@@ -1598,6 +1649,25 @@ class SftpBrowser(QWidget):
         if self._again:
             self._again = False
             self._relist()
+
+    def _icons_came(self):
+        """The system's icons came in: the rows waiting for one of them get it
+        (one look-up per kind of row, not per row); the rest keep waiting."""
+        if self._closing or not self._icon_wait:
+            return
+        for key in list(self._icon_wait):
+            is_dir, is_link, ext = key
+            icon = self._native.lookup("x" + ext, is_dir, is_link)
+            if icon is None:             # not in yet
+                continue
+            rows = self._icon_wait.pop(key)
+            if icon.isNull():            # the system has none: the glyph stays
+                continue
+            for it in rows:
+                try:
+                    it.setIcon(0, icon)
+                except RuntimeError:     # the row was deleted meanwhile
+                    pass
 
     def _row_icon(self, key):
         """The QIcon of *key* ``(glyph, tone)``: one per kind, shared by every
@@ -2250,6 +2320,12 @@ class SftpBrowser(QWidget):
         self._closing = True
         self._fill_timer.stop()
         self._stop_timer.stop()
+        self._icon_wait = {}
+        if self._native.changed is not None:
+            try:
+                self._native.changed.disconnect(self._icons_came)
+            except (TypeError, RuntimeError):
+                pass
         self._queue.clear()
         self.transfers.cancel_queued()
         for editor in self._live_editors():

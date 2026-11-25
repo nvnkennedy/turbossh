@@ -41,7 +41,7 @@ class HomeTab(QWidget):
             head.addWidget(logo)
         tbox = QVBoxLayout(); tbox.setSpacing(0)
         title = QLabel("TurboSSH")
-        title.setStyleSheet(f"color:{theme.ACCENT}; font-size:16pt; font-weight:800;")
+        title.setStyleSheet(f"color:{theme.ACCENT}; font-size:16pt; font-weight:600;")
         sub = QLabel("SSH / Serial / SFTP toolkit for automotive & embedded work")
         sub.setStyleSheet("color:#9aa0a6; font-size:9pt;")
         tbox.addWidget(title); tbox.addWidget(sub)
@@ -64,7 +64,7 @@ class HomeTab(QWidget):
 
         # --- saved sessions (double-click to connect) ---
         sh = QLabel("Saved sessions")
-        sh.setStyleSheet(f"color:{theme.ACCENT}; font-size:13pt; font-weight:700;")
+        sh.setStyleSheet(f"color:{theme.ACCENT}; font-size:13pt; font-weight:600;")
         lay.addWidget(sh)
         hint = QLabel("Double-click to connect.  Manage them from the left sidebar.")
         hint.setStyleSheet("color:#9aa0a6;")

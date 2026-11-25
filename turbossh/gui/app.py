@@ -208,6 +208,9 @@ def main(argv=None):
     # apply the saved theme + its matching app/taskbar icon (dark = original
     # artwork, light = generated light-tile variant)
     from . import theme, settings as settings_mod
+    _font = theme.ui_font()              # Segoe UI, as TurboADB (not Tahoma)
+    if _font is not None:
+        app.setFont(_font)
     _theme = settings_mod.get("theme") or "dark"
     app.setStyleSheet(theme.stylesheet(_theme))
     try:

@@ -546,8 +546,9 @@ turbossh-gui
   output**, which writes the whole session to disk, not just what's on screen.
 - **Dual-pane file browser**, laid out like TurboADB's Files tab — this PC on
   the left (with its drive box), the remote host on the right, both listing Name,
-  Size, Date Modified, Permissions and Owner, with `..` on top and `<DIR>` for
-  folders. Quick links along the top open Home, Desktop and Downloads on this PC
+  Size, Date Modified and Permissions (and the remote Owner while the pane is
+  wide enough), with `..` on top and `<DIR>` for folders, and Windows' own icon
+  for each file type on both sides. Quick links along the top open Home, Desktop and Downloads on this PC
   and the remote home, `/` and `/tmp`; **New tab** opens another file browser on
   the same connection. Move files and folders with **Push →** and **← Pull**, by
   dragging between the panes or in from Explorer; sort by any column. Each pane

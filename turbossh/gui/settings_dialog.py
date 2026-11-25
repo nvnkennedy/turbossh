@@ -124,7 +124,7 @@ class SettingsDialog(QDialog):
         page = QWidget(); v = QVBoxLayout(page)
         v.setContentsMargins(16, 6, 8, 8)
         title = QLabel(name)
-        title.setStyleSheet(f"color:{theme.ACCENT}; font-size:14pt; font-weight:700;")
+        title.setStyleSheet(f"color:{theme.ACCENT}; font-size:14pt; font-weight:600;")
         v.addWidget(title)
         v.addWidget(content)
         v.addStretch(1)

@@ -6,13 +6,33 @@ automotive coral redline. Styling matches TurboADB for a consistent toolkit."""
 
 from __future__ import annotations
 
+import os
+
+_ON_WINDOWS = os.name == "nt"
 # brand accents (clean cyan-teal + speedometer amber/coral redline)
 ACCENT = "#28c2d6"        # cyan-teal (clean, not greenish)
 ACCENT_2 = "#48d6e8"      # brighter cyan
 ACCENT_DARK = "#0c7a88"   # darker cyan — readable as TEXT on a light background
 DANGER = "#ff6b5e"        # coral/redline
+CLOSE_RED = "#e81123"     # a hovered close button: Windows' own close red
 WARN = "#ffc34d"          # amber
 TERM_BG = "#000000"       # true black terminal
+
+
+# The UI font, as TurboADB's. Qt 5 on Windows starts from "MS Shell Dlg 2",
+# which Windows draws as Tahoma: an old look, and its weights between regular
+# and bold come out bold. None elsewhere: the system's own font stays.
+UI_FONT_FAMILY = "Segoe UI"
+UI_FONT_POINTS = 9
+
+
+def ui_font():
+    """The QFont TurboSSH's own windows use (Segoe UI 9 pt), or None off
+    Windows. Widgets with a font of their own (the terminal, the logs) keep it."""
+    if not _ON_WINDOWS:
+        return None
+    from PyQt5.QtGui import QFont
+    return QFont(UI_FONT_FAMILY, UI_FONT_POINTS)
 
 
 def accent_text(name: str = "dark") -> str:
@@ -272,62 +292,31 @@ def _png(file_name: str, draw) -> str:
         return ""
 
 
-def _native_close_glyph(side: int):
-    """The current style's own close glyph (its title-bar ×) at *side* px, as
-    a QImage — None without a QApplication or when the style has none."""
-    from PyQt5.QtWidgets import QApplication, QStyle
-    if QApplication.instance() is None:
-        return None
-    try:
-        pm = QApplication.style().standardIcon(QStyle.SP_TitleBarCloseButton).pixmap(side, side)
-    except Exception:
-        return None
-    if pm.isNull():
-        return None
-    img = pm.toImage()
-    if img.width() > side or img.height() > side:     # a high-DPI pixmap: 2x
-        from PyQt5.QtCore import Qt
-        img = img.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    img.setDevicePixelRatio(1.0)
-    # no visible pixel: nothing to recolour
-    if not any(img.pixelColor(x, y).alpha() > 40
-               for y in range(img.height()) for x in range(img.width())):
-        return None
-    return img
-
-
 def close_glyph(side: int, color: str):
-    """A *side* px QImage of the close glyph: the style's own (its title-bar
-    ×) recoloured to *color* — Qt draws it dark grey, which vanished on the
-    dark themes — or, if the style has none, a plain ×."""
-    from PyQt5.QtCore import QPointF, QRect, Qt
+    """A *side* px QImage of the tabs' close glyph: a thin × in *color*,
+    drawn (as TurboADB's): the style's own title-bar glyph was an old boxed
+    one on Windows."""
+    from PyQt5.QtCore import QPointF, Qt
     from PyQt5.QtGui import QColor, QImage, QPainter, QPen
     img = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
     img.fill(Qt.transparent)
     p = QPainter(img)
     p.setRenderHint(QPainter.Antialiasing)
-    glyph = _native_close_glyph(side)
-    if glyph is not None:
-        # at its own size, centred
-        p.drawImage(QRect((side - glyph.width()) // 2, (side - glyph.height()) // 2,
-                          glyph.width(), glyph.height()), glyph)
-        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
-        p.fillRect(0, 0, side, side, QColor(color))
-    else:
-        pen = QPen(QColor(color))
-        pen.setWidthF(side / 9.0)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        lo, hi = side * 0.3, side * 0.7
-        p.drawLine(QPointF(lo, lo), QPointF(hi, hi))
-        p.drawLine(QPointF(hi, lo), QPointF(lo, hi))
+    pen = QPen(QColor(color))
+    pen.setWidthF(max(1.0, side * 0.1))
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    lo, hi = side * 0.31, side * 0.69
+    p.drawLine(QPointF(lo, lo), QPointF(hi, hi))
+    p.drawLine(QPointF(hi, lo), QPointF(lo, hi))
     p.end()
     return img
 
 
 def close_color(name: str = None, hover: bool = False) -> str:
     """The colour of the close glyph on a tab of theme *name*: near the text
-    colour, so it is plain to see; white on the red of a hovered button."""
+    colour, so it is plain to see; white on the red of a hovered button
+    (CLOSE_RED)."""
     if hover:
         return "#ffffff"
     c = THEMES.get(name or current_name(), _DARK)
@@ -416,7 +405,7 @@ def _tone_rules(c: dict, name: str) -> str:
         hover = _mix(c["panel"], hue, 0.32 if light else 0.42)
         rules.append(
             f'QPushButton[tone="{tone}"] {{ background: {wash}; color: {c["text"]};'
-            f' border: 1px solid {edge}; border-radius: 7px; font-weight: 700; }}\n'
+            f' border: 1px solid {edge}; border-radius: 7px; font-weight: 600; }}\n'
             f'    QPushButton[tone="{tone}"]:hover {{ background: {hover}; border-color: {hue}; }}\n'
             f'    QPushButton[tone="{tone}"]:pressed {{ background: {edge}; }}\n'
             f'    QPushButton[tone="{tone}"]:disabled {{ background: {c["panel"]};'
@@ -441,7 +430,7 @@ def stylesheet(name: str = "dark") -> str:
     box_edge = _mix(c["input"], c["text"], 0.62 if light else 0.58)
     tones = _tone_rules(c, name)
     return f"""
-    QWidget {{ background: {c['win']}; color: {c['text']}; font-size: 9.5pt; }}
+    QWidget {{ background: {c['win']}; color: {c['text']}; font-size: 9pt; }}
     QMainWindow::separator {{ background: {c['border']}; width: 1px; height: 1px; }}
     QToolBar {{
         background: {c['ribbon']}; border: none;
@@ -454,15 +443,16 @@ def stylesheet(name: str = "dark") -> str:
     QToolButton:hover {{ background: {c['raised']}; border: 1px solid {c['border']}; }}
     QToolButton:pressed {{ background: {ACCENT}; color: #042830; }}
     QToolButton[role="ok"] {{ background: {ACCENT}; color: #042830; border-radius: 8px;
-        padding: 6px 12px; font-weight: 700; }}
+        padding: 6px 12px; font-weight: 600; }}
     QToolButton[role="ok"]:hover {{ background: {ACCENT_2}; border: 1px solid {ACCENT_2}; }}
     QToolButton[role="ghost"] {{ background: {c['raised']}; color: {c['text']};
         border: 1px solid {c['border']}; border-radius: 8px; padding: 6px 12px; font-weight: 600; }}
     QToolButton[role="ghost"]:hover {{ border: 1px solid {ACCENT}; }}
     QToolButton[role="danger"] {{ background: {DANGER}; color: white; border-radius: 8px;
-        padding: 6px 12px; font-weight: 700; }}
+        padding: 6px 12px; font-weight: 600; }}
     QToolButton[role="ok"]:disabled, QToolButton[role="ghost"]:disabled {{
         background: {c['border']}; color: {c['dim']}; border-color: {c['border']}; }}
+    QToolBar QToolButton {{ padding: 4px 8px; }}
     QToolButton::menu-indicator {{ subcontrol-position: right center;
         subcontrol-origin: padding; right: 5px; }}
     QDockWidget {{ color: {c['dim']}; }}
@@ -487,7 +477,7 @@ def stylesheet(name: str = "dark") -> str:
     QHeaderView::section {{
         background: {c['ribbon']}; color: {atext}; padding: 6px 8px; border: none;
         border-right: 1px solid {c['border']}; border-bottom: 1px solid {c['border']};
-        font-weight: 700;
+        font-weight: 600;
     }}
     QTableCornerButton::section {{ background: {c['ribbon']}; border: none; }}
     QLineEdit, QSpinBox, QComboBox {{
@@ -511,7 +501,7 @@ def stylesheet(name: str = "dark") -> str:
     QLabel {{ background: transparent; color: {c['dim']}; }}
     QPushButton {{
         background: {ACCENT}; color: #042830; border: none; border-radius: 7px;
-        padding: 7px 16px; font-weight: 700;
+        padding: 7px 16px; font-weight: 600;
     }}
     QPushButton:hover {{ background: {ACCENT_2}; }}
     QPushButton:disabled {{ background: {c['border']}; color: {c['dim']}; }}
@@ -519,7 +509,7 @@ def stylesheet(name: str = "dark") -> str:
     QPushButton[role="danger"] {{ background: {DANGER}; color: white; }}
     QPushButton[role="ghost"] {{
         background: {c['raised']}; color: {c['text']}; border: 1px solid {c['border']};
-        font-weight: 600;
+        font-weight: 500;
     }}
     QPushButton[role="ghost"]:hover {{ border-color: {ACCENT}; background: {c['sel']}; }}
     QPushButton[role="ghost"]:pressed {{ background: {ACCENT}; color: #042830; }}
@@ -529,20 +519,22 @@ def stylesheet(name: str = "dark") -> str:
     }}
     QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; color: {atext}; }}
     QTabWidget::pane {{ border: 1px solid {c['border']}; background: {c['panel']}; border-radius: 6px; }}
+    QTabBar {{ font-weight: 600; }}
     QTabBar::tab {{
         background: {c['tab']}; color: {c['dim']}; padding: 3px 12px; min-width: 90px;
         border: 1px solid {c['border']}; border-bottom: none;
         border-top-left-radius: 7px; border-top-right-radius: 7px; margin-right: 2px;
     }}
-    QTabBar::tab:selected {{ background: {c['panel']}; color: {atext}; font-weight: 700; }}
+    QTabBar::tab:selected {{ background: {c['panel']}; color: {atext}; }}
     QTabBar::tab:hover {{ color: {c['text']}; }}
     QTabBar::close-button {{ {close} subcontrol-position: right; border-radius: 4px;
         margin: 1px; padding: 1px; }}
-    QTabBar::close-button:hover {{ {close_hover} background: {DANGER}; }}
-    QTabBar::close-button:pressed {{ {close_hover} background: {_mix(DANGER, '#000000', 0.25)}; }}
+    QTabBar::close-button:hover {{ {close_hover} background: {CLOSE_RED}; }}
+    QTabBar::close-button:pressed {{ {close_hover} background: {_mix(CLOSE_RED, '#000000', 0.2)}; }}
     QToolButton#innerTabClose {{ background: transparent; border: none; border-radius: 4px;
         padding: 1px; margin: 0; }}
-    QToolButton#innerTabClose:hover {{ background: {DANGER}; border: none; }}
+    QToolButton#innerTabClose:hover {{ background: {CLOSE_RED}; border: none; }}
+    QToolButton#innerTabClose:pressed {{ background: {_mix(CLOSE_RED, '#000000', 0.2)}; }}
     QTabBar::scroller {{ width: 28px; }}
     QSplitter::handle {{ background: {c['border']}; }}
     QSplitter::handle:hover {{ background: {ACCENT}; }}
@@ -591,28 +583,28 @@ def stylesheet(name: str = "dark") -> str:
     QWidget#pageToolbar {{ background: {c['ribbon']}; border-bottom: 1px solid {c['border']}; }}
     QLabel#mutedHint {{ color: {c['dim']}; font-size: 8.5pt; }}
     QPushButton#quickLink {{ background: transparent; color: {c['text']};
-        border: 1px solid transparent; border-radius: 6px; padding: 3px 8px; font-weight: 600; }}
+        border: 1px solid transparent; border-radius: 6px; padding: 3px 8px; font-weight: 500; }}
     QPushButton#quickLink:hover {{ background: {c['raised']}; border-color: {c['border']}; }}
     QPushButton#quickLink:pressed {{ background: {c['sel']}; }}
     QPushButton#quickLink:disabled {{ background: transparent; color: {c['dim']}; }}
-    QPushButton#paneOp {{ padding: 4px 7px; }}
+    QPushButton#paneOp {{ padding: 4px 6px; }}
     QPushButton#paneOp[role="ghost"] {{ background: transparent; color: {c['text']};
-        border: 1px solid transparent; font-weight: 600; }}
+        border: 1px solid transparent; font-weight: 500; }}
     QPushButton#paneOp[role="ghost"]:hover {{ background: {c['raised']};
-        border-color: {c['border']}; }}
+        border-color: transparent; }}
     QPushButton#paneOp[role="ghost"]:pressed {{ background: {c['sel']}; color: {c['text']}; }}
     QPushButton#paneOp[role="ghost"]:disabled {{ background: transparent; color: {c['dim']};
         border-color: transparent; }}
     QSplitter#filePanes::handle {{ background: transparent; }}
     QSplitter#filePanes::handle:hover {{ background: {c['border']}; }}
     QToolButton#paneTitle {{ background: transparent; border: none; color: {c['text']};
-        padding: 2px 4px 2px 0; font-weight: 700; }}
+        padding: 2px 4px 2px 0; font-weight: 600; }}
 
     /* ---- the sessions list: its header and the edge handle that reopens it ---- */
-    QLabel#sidebarTitle {{ color: {c['text']}; font-size: 10pt; font-weight: 700; }}
+    QLabel#sidebarTitle {{ color: {c['text']}; font-size: 10pt; font-weight: 600; }}
     QLabel#countBadge {{ background: {c['raised']}; color: {c['dim']};
         border: 1px solid {c['border']}; border-radius: 8px; padding: 0 7px;
-        font-size: 8pt; font-weight: 700; }}
+        font-size: 8pt; font-weight: 600; }}
     QToolButton#iconButton {{ background: transparent; border: 1px solid transparent;
         border-radius: 6px; padding: 3px; }}
     QToolButton#iconButton:hover {{ background: {c['raised']}; border-color: {c['border']}; }}
@@ -625,11 +617,11 @@ def stylesheet(name: str = "dark") -> str:
     QTreeWidget#fileList {{ background: {c['panel']}; alternate-background-color: {c['raised']};
         color: {c['text']}; border: 1px solid {c['border']}; border-radius: 6px;
         selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
-    QTreeWidget#fileList::item {{ padding: 4px 2px; border: none; }}
+    QTreeWidget#fileList::item {{ padding: 0px 2px; border: none; }}
     QTreeWidget#fileList::item:hover {{ background: {c['sel']}; }}
     QTreeWidget#fileList::item:selected {{ background: {ACCENT}; color: {ON_ACCENT}; }}
     QTreeWidget#fileList QHeaderView::section {{ background: {c['panel']}; color: {c['dim']};
-        padding: 4px 6px; border: none; border-bottom: 1px solid {c['border']};
+        padding: 6px 8px; border: none; border-bottom: 1px solid {c['border']};
         font-weight: 600; font-size: 8.5pt; }}
     QTreeWidget#fileList QHeaderView::section:hover {{ color: {c['text']}; }}
     {tones}

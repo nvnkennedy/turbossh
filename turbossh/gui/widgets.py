@@ -105,6 +105,7 @@ def flat_button(text, glyph=None, tone="dim", tip="", name="quickLink") -> QPush
     from . import glyphs
     button = QPushButton(text)
     button.setObjectName(name)
+    button.setFlat(True)                 # no box in a host's own look either
     if glyph:
         button.setIcon(glyphs.icon(glyph, tone))
     if tip:
@@ -159,6 +160,7 @@ def ops_row(actions, delete_slot=None, delete_tip=""):
         button = QPushButton(text)
         button.setObjectName("paneOp")
         button.setProperty("role", "ghost")
+        button.setFlat(True)             # no box in a host's own look either
         button.setFocusPolicy(Qt.TabFocus)
         glyph, tone = OP_ICONS.get(text, ("file", "dim"))
         button.setIcon(glyphs.icon(glyph, tone))

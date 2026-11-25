@@ -240,8 +240,15 @@ class MainWindow(QMainWindow):
         tree (dialogs and menus inherit it from their parent), or nothing at all
         when the host's own styling is to be kept — then only the check boxes'
         boxes and radio buttons' rings are TurboSSH's (see indicators.py): some
-        styles draw them from a dark palette in a colour that does not show."""
+        styles draw them from a dark palette in a colour that does not show.
+
+        The font: TurboSSH's own (theme.ui_font, Segoe UI on Windows) on this
+        window, unless the host's look is kept — then the host's."""
         from . import indicators
+        from PyQt5.QtGui import QFont
+        font = None if self._inherit_style else theme.ui_font()
+        # QFont(): nothing of its own, the host's font comes through again
+        self.setFont(font if font is not None else QFont())
         if not self.embedded:
             QApplication.instance().setStyleSheet(theme.stylesheet(name))
         elif self._inherit_style:
@@ -662,7 +669,7 @@ class MainWindow(QMainWindow):
             tb.addAction(exit_act)
             btn = tb.widgetForAction(exit_act)
             if btn is not None:
-                btn.setStyleSheet("color:#f06e60; font-weight:700;")
+                btn.setStyleSheet("color:#f06e60; font-weight:600;")
         self._apply_ribbon_density()
 
     def _apply_ribbon_density(self):
