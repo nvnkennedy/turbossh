@@ -2,6 +2,81 @@
 
 All notable changes to TurboSSH. Dates are ISO-8601.
 
+## 2.7.0 — 2026-11-26
+
+For test benches with head units: logins without a password, a Stop for every
+blocking call, commands in a login shell, raw binary streams, a fast link, an
+SFTP start that cannot hang, a login check that says what happened, and serial
+ports that come back.
+
+### Added — SSH
+- **The "none" login.** QNX and RichOS head units accept SSH's `none` method:
+  no password, no key. Paramiko never tries it, so a server that offers only
+  `none` (or `none` before `password`) could not be logged in. With no
+  password (or `password=""`) and no key file, TurboSSH now tries `none` first,
+  then the blank password and the keys and the agent, all on one connection —
+  the keys first when there are any (`~/.ssh/id_*`, or an agent holding some),
+  so a key user's login sends no blank password (fail2ban, MaxAuthTries). A
+  user name left empty is this computer's, as before.
+  The server's answer to `none` lists what it allows, so a method it does not
+  offer is skipped. A password login refused by a server that lists `none`
+  tries `none` on the same connection. `SSHConfig(allow_none_auth=True)` is the
+  default; `SSHHandler.auth_method` says what worked: `"none"`, `"password"`,
+  `"empty-password"`, `"key"` or `"agent"`.
+- **Stop any blocking call.** `run`, `stream`, `iter_lines`,
+  `ShellSession.read_until`, `push`, `pull`, `connect`, `run_login` and
+  `exec_bytes` take `cancel`: a `threading.Event`, or a callable returning True.
+  It is looked at at least every 0.25 s. When it fires, the channel is closed
+  (the remote command gets SIGHUP) and the call returns at once:
+  `CommandResult.cancelled` / `ShellResult.cancelled` / `stream()["cancelled"]`,
+  or the new `SSHCancelledError` (`push`, `pull`, `connect`, and `run` with
+  `check=True`). The connection stays usable unless the connect was cancelled. A
+  cancelled `pull` / `push` leaves no partial file.
+- **Commands in an interactive login shell.** `SSHHandler.run_login(command)`
+  for a target whose exec sessions cannot start programs ("sh: mount: cannot
+  execute" on QNX) while a login can. The command runs in a subshell of a fresh
+  login shell, so a syntax error, `exit` or `set -e` ends only the command and
+  its status comes back. `SSHConfig(command_mode="exec" | "login" | "auto")`
+  makes `run()` do the same; "auto" probes once per handler with
+  `uname` (exec, then exec with a pty, then the login shell) and keeps the way
+  that works (`SSHHandler.command_way`).
+- **Raw channels.** `SSHHandler.open_channel(command, pty=False,
+  window_size=None)` returns the paramiko Channel for binary streams (a `cat`
+  of a screenshot, raw PCM from `parec`); `exec_bytes(command, on_bytes)` hands
+  the bytes over chunk by chunk. `SSHHandler.transport` is documented and
+  supported.
+- **Transport tuning.** `SSHConfig(window_size=..., max_packet_size=...,
+  tcp_nodelay=...)`: a 64 MiB window (`2**26`) carries a 5 MB transfer without
+  waiting for window updates. `max_retries=1` is confirmed to mean exactly one
+  attempt, with no wait.
+- **A login check that says what happened.** `SSHHandler.check(timeout=...,
+  cancel=None)` makes one full login on a connection of its own, closes it and
+  returns `dict(ok, kind, seconds, banner, error)`: `"ok"`, `"refused"`,
+  `"reset"`, `"banner-timeout"`, `"auth-failed"`, `"timeout"`, `"unreachable"`,
+  `"cancelled"` or `"error"`. Lines before the SSH greeting are accepted. It
+  logs nothing below a warning (Paramiko's tracebacks included), so a boot
+  watch can poll it every second.
+
+### Fixed — SSH
+- **SFTP could hang for an hour.** Paramiko opens the SFTP channel with its
+  3600 s default: a target that accepted the login but stopped answering held
+  the caller that long. SFTP now has to start within
+  `SSHConfig(sftp_start_timeout=20)` (`open_sftp(timeout=...)` for a client of
+  your own); past that the connection is closed and `SSHTimeoutError("SFTP did
+  not start within 20 s - the target accepted the login but stopped
+  answering")` raised. The next call reconnects.
+
+### Added — serial
+- `SerialHandler(auto_reopen=False, on_gap=None)`: when the port disappears (a
+  USB console unplugged, a head unit's power cycle dropping a USB-serial
+  adapter) it is opened again about every second; reads wait meanwhile instead
+  of failing, and `on_gap(started, ended)` reports the gap once it is back.
+- Typed errors: `SerialBusyError` (another program has the port: "Access is
+  denied", "Zugriff verweigert") and `SerialMissingError` (no such port), both
+  `SerialError`s; every `SerialError` has `kind` = "busy" | "missing" | "error".
+- Reading on one thread while writing on another is safe, also across a
+  reopen; `write_bytes` keeps its write timeout.
+
 ## 2.6.0 — 2026-11-25
 
 The Files tab and the text look as on TurboADB, embedded in another

@@ -23,7 +23,7 @@ so anything Paramiko can do is possible.
 
 from __future__ import annotations
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 # Light modules stay eager — they're cheap to import (no paramiko/pywinrm/pyserial).
 from .config import SSHConfig, FTPConfig
@@ -35,6 +35,7 @@ from .exceptions import (
     SSHAuthenticationError,
     SSHTimeoutError,
     SSHCommandError,
+    SSHCancelledError,
     SSHTransferError,
     SSHNotConnectedError,
     FTPError,
@@ -60,6 +61,7 @@ _LAZY_SUBMODULES = {
     "WinRMTimeoutError": "winrm_bootstrap",
     "SerialHandler": "serial_handler", "list_serial_ports": "serial_handler",
     "serial_available": "serial_handler", "SerialError": "serial_handler",
+    "SerialBusyError": "serial_handler", "SerialMissingError": "serial_handler",
 }
 
 
@@ -82,9 +84,10 @@ __all__ = [
     "enable_openssh_via_winrm", "enable_openssh_via_winrm_offline",
     "winrm_available", "WinRMError", "WinRMTimeoutError",
     "SerialHandler", "list_serial_ports", "serial_available", "SerialError",
+    "SerialBusyError", "SerialMissingError",
     "Secret", "CredentialStore", "prompt_password", "mask",
     "CommandResult", "TransferResult", "ShellResult", "OperationResult",
     "SSHError", "SSHConnectionError", "SSHAuthenticationError",
-    "SSHTimeoutError", "SSHCommandError", "SSHTransferError",
+    "SSHTimeoutError", "SSHCommandError", "SSHCancelledError", "SSHTransferError",
     "SSHNotConnectedError", "FTPError", "CredentialError", "__version__",
 ]
