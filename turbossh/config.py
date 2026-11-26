@@ -41,6 +41,11 @@ class SSHConfig:
     look_for_keys: bool = True
     allow_empty_password: bool = True     # when NO password is given, fall back
                                           # to a blank-password login (lab targets)
+    allow_none_auth: bool = True          # when no password (or password="") and
+                                          # no key file is given, try SSH's "none"
+                                          # login first (QNX / RichOS head units),
+                                          # then the blank password, then keys /
+                                          # agent - all on ONE connection
     passwordless: bool = False            # force key/agent only
 
     # --- connection behaviour ---
@@ -48,10 +53,27 @@ class SSHConfig:
     auth_timeout: float = 20.0
     banner_timeout: float = 20.0
     command_timeout: Optional[float] = None
-    keepalive_interval: int = 30
+    keepalive_interval: int = 30          # s between keepalives (0: none); 5
+                                          # shows a target that powered off as a
+                                          # dead connection within seconds
+
+    # How run() starts a command: "exec" (an exec request, as always), "login"
+    # (in an interactive login shell, see SSHHandler.run_login: for a QNX whose
+    # exec sessions cannot start programs), or "auto" (probe once per handler
+    # with `uname`: exec, then exec with a pty, then the login shell; the way
+    # that works is kept for the handler's life).
+    command_mode: str = "exec"
 
     # --- performance ---
     compress: bool = False                # enable on slow/high-latency links
+    window_size: Optional[int] = None     # SSH window of every channel (bytes);
+                                          # None: Paramiko's 2 MiB. 2**26 (64 MiB)
+                                          # lets a fast link carry a 5 MB stream
+                                          # without waiting for window updates
+    max_packet_size: Optional[int] = None  # largest packet a channel accepts
+                                          # (None: Paramiko's 32 KiB)
+    tcp_nodelay: bool = False             # send small writes at once (no Nagle):
+                                          # interactive / request-reply traffic
     fast_auth: bool = True                # skip key probing when a password is
                                           # supplied -> much faster, avoids
                                           # "Too many authentication failures"
@@ -103,8 +125,15 @@ class SSHConfig:
     # for ever, Paramiko's default — which hung a transfer or a file listing
     # indefinitely on a link that went silent, e.g. a dropped VPN).
     sftp_timeout: Optional[float] = 60.0
+    # Seconds the SFTP subsystem may take to start (the channel, the subsystem
+    # request and the version handshake together). A target that accepted the
+    # login but stopped answering made the caller wait an hour (Paramiko's
+    # channel default); past this the connection is closed and SSHTimeoutError
+    # raised.
+    sftp_start_timeout: float = 20.0
 
     _HOST_KEY_POLICIES = ("auto", "reject", "warn", "ignore")
+    _COMMAND_MODES = ("exec", "login", "auto")
 
     def __post_init__(self):
         # Normalize secrets so they are never plain strings internally.
@@ -117,6 +146,10 @@ class SSHConfig:
             raise ValueError(
                 f"host_key_policy must be one of {self._HOST_KEY_POLICIES}, "
                 f"got {self.host_key_policy!r}")
+        if self.command_mode not in self._COMMAND_MODES:
+            raise ValueError(
+                f"command_mode must be one of {self._COMMAND_MODES}, "
+                f"got {self.command_mode!r}")
 
     @property
     def auth_username(self) -> Optional[str]:

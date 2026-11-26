@@ -54,10 +54,13 @@ class CommandResult:
     duration: float
     host: str = ""
     started_at: float = field(default_factory=time.time)
+    # True when the call was stopped through its ``cancel`` (exit_code is -1,
+    # stdout / stderr hold what had arrived by then)
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0
+        return self.exit_code == 0 and not self.cancelled
 
     @property
     def text(self) -> str:
@@ -71,7 +74,8 @@ class CommandResult:
         return asdict(self)
 
     def __str__(self) -> str:
-        status = "ok" if self.ok else f"FAILED (exit {self.exit_code})"
+        status = ("cancelled" if self.cancelled
+                  else "ok" if self.ok else f"FAILED (exit {self.exit_code})")
         return f"$ {self.command}  [{status}, {self.duration:.2f}s]"
 
 
@@ -120,14 +124,16 @@ class ShellResult:
     matched: Optional[str]
     timed_out: bool
     duration: float
+    cancelled: bool = False         # stopped through ``cancel`` (channel closed)
 
     def __bool__(self) -> bool:
-        return not self.timed_out
+        return not self.timed_out and not self.cancelled
 
     def __str__(self) -> str:
         return (
             f"<ShellResult matched={self.matched!r} "
-            f"timed_out={self.timed_out} dur={self.duration:.2f}s>"
+            f"timed_out={self.timed_out} cancelled={self.cancelled} "
+            f"dur={self.duration:.2f}s>"
         )
 
 

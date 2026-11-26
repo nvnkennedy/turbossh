@@ -27,6 +27,20 @@ class SSHTimeoutError(SSHError):
         self.result = result
 
 
+class SSHCancelledError(SSHError):
+    """A call was stopped through its ``cancel`` (a set threading.Event, or a
+    callable that returned True).
+
+    ``result`` holds what a command had printed by then (a CommandResult with
+    ``cancelled=True``) when there is one; the connection stays usable unless
+    the cancelled call was the connect itself.
+    """
+
+    def __init__(self, message: str = "", result=None):
+        super().__init__(message)
+        self.result = result
+
+
 class SSHCommandError(SSHError):
     """A remote command exited non-zero while check=True."""
 

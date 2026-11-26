@@ -81,7 +81,10 @@ def test_explicit_blank_password_is_sent_once(ssh_server, make_config):
     handler = SSHHandler(make_config(username="blank", password=""), quiet=True)
     handler.connect()
     handler.disconnect()
-    assert ssh_server.server.auth_log == [""]
+    # 2.7.0: SSH's "none" login is tried first (head units take it); the
+    # blank password is still sent once, on the same connection
+    assert ssh_server.server.auth_log == ["<none>", ""]
+    assert ssh_server.accepted == 1
 
 
 def test_no_password_falls_back_to_blank(ssh_server, make_config):

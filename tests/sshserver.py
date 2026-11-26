@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import socket
 import threading
 import time
@@ -118,6 +119,7 @@ class StubSFTP(paramiko.SFTPServerInterface):
         return handle
 
     def remove(self, path):
+        time.sleep(self._srv.sftp_delay)     # a slow link's round trip
         try:
             os.remove(self._real(path))
         except OSError as exc:
@@ -192,10 +194,26 @@ class Server(paramiko.ServerInterface):
         self.rename_calls = []
         self.tcpip_dest = {}             # chanid -> (host, port)
         self.execs = []
+        # what the login takes: get_allowed_auths, and SSH's "none" method (a
+        # QNX / RichOS head unit logs in without a password or key)
+        self.allowed_auths = "password,publickey"
+        self.none_ok = False
+        # a QNX head unit: an exec session cannot start programs ("sh: uname:
+        # cannot execute"), an interactive login shell can (see _qnx_shell)
+        self.qnx = False
+        self.shell_lines = []            # what the QNX shell was sent, line by line
+        # called (on the server's thread) when a password is refused: a test
+        # closes the connection there, as a server at MaxAuthTries does
+        self.on_refusal = None
+        self.sftp_delay = 0.0            # s an SFTP remove takes (a slow link)
 
     # ---- auth ----
     def get_allowed_auths(self, username):
-        return "password,publickey"
+        return self.allowed_auths
+
+    def check_auth_none(self, username):
+        self.auth_log.append("<none>")
+        return paramiko.AUTH_SUCCESSFUL if self.none_ok else paramiko.AUTH_FAILED
 
     def check_auth_password(self, username, password):
         self.auth_log.append(password)
@@ -203,6 +221,8 @@ class Server(paramiko.ServerInterface):
             ok = password == ""
         else:
             ok = password == "good"
+        if not ok and self.on_refusal is not None:
+            self.on_refusal()
         return paramiko.AUTH_SUCCESSFUL if ok else paramiko.AUTH_FAILED
 
     def check_auth_publickey(self, username, key):
@@ -220,6 +240,11 @@ class Server(paramiko.ServerInterface):
 
     def check_channel_shell_request(self, channel):
         """An interactive "shell" that echoes back whatever is typed."""
+        if self.qnx:
+            threading.Thread(target=self._qnx_shell, args=(channel,),
+                             daemon=True).start()
+            return True
+
         def echo():
             try:
                 channel.sendall(b"$ ")
@@ -251,9 +276,109 @@ class Server(paramiko.ServerInterface):
         channel.send_exit_status(status)
         channel.close()
 
+    def _qnx_shell(self, channel):
+        """A login shell as QNX's: a banner and a "# " prompt, echo of what is
+        typed (with a pty) until ``stty -echo``; runs echo (with $? and the ''
+        of the markers), eval of a quoted script, export, uname, true / false,
+        hang, exit, and quit-now (the shell dies at once). A quoted string
+        open at the end of a line goes on to the next one."""
+        state = {"echo": True, "status": 0, "prompt": "# "}
+
+        def out(text):
+            channel.sendall((text + "\r\n").encode())
+
+        def parts_of(line):
+            parts, cur, quoted = [], "", False
+            for ch in line:
+                if ch == "'":
+                    quoted = not quoted
+                if ch == ";" and not quoted:
+                    parts.append(cur)
+                    cur = ""
+                else:
+                    cur += ch
+            parts.append(cur)
+            return parts
+
+        def run(part):
+            part = part.strip()
+            if part.startswith("(") and part.endswith(")"):   # a subshell
+                part = part[1:-1].strip()
+            if not part:
+                return None
+            if part == "stty -echo":
+                state["echo"] = False
+            elif part.startswith("PS1="):
+                state["prompt"] = ""
+            elif part.startswith("PS2="):
+                pass
+            elif part.startswith("export "):
+                state["status"] = 0
+            elif part == "exit":
+                return "exit"
+            elif part == "quit-now":
+                return "quit"
+            elif part.startswith("eval "):
+                for line in shlex.split(part[5:])[0].split("\n"):
+                    for piece in parts_of(line):
+                        stop = run(piece)
+                        if stop:
+                            return stop
+            elif part.startswith("echo "):
+                out(part[5:].replace("''", "").replace("$?", str(state["status"])))
+                state["status"] = 0
+            elif part == "uname":
+                out("QNX")
+                state["status"] = 0
+            elif part == "true":
+                state["status"] = 0
+            elif part == "false":
+                state["status"] = 1
+            elif part == "hang":
+                time.sleep(120)
+            else:
+                out(f"sh: {part}: not found")
+                state["status"] = 127
+            return None
+        try:
+            channel.sendall(b"QNX Neutrino 7.1\r\nWelcome\r\n# ")
+            buf, pending = b"", None
+            while True:
+                data = channel.recv(4096)
+                if not data:
+                    return
+                if state["echo"]:
+                    channel.sendall(data.replace(b"\n", b"\r\n"))
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode().rstrip("\r")
+                    self.shell_lines.append(text)
+                    pending = text if pending is None else pending + "\n" + text
+                    if pending.count("'") % 2:     # a quoted string goes on
+                        continue
+                    logical, pending = pending, None
+                    for part in parts_of(logical):
+                        stop = run(part)
+                        if stop == "exit":
+                            channel.send_exit_status(state["status"])
+                            channel.close()
+                            return
+                        if stop == "quit":
+                            channel.close()
+                            return
+                    if state["prompt"]:
+                        channel.sendall(state["prompt"].encode())
+        except Exception:
+            pass
+
     def _run(self, channel, cmd):
         time.sleep(0.2)                  # let the exec-request reply go out first
         try:
+            if self.qnx:
+                channel.sendall_stderr(f"sh: {cmd.split()[0]}: cannot execute\n".encode())
+                self._finish(channel, 126)
+                return
             sudo = _SUDO_RE.match(cmd)
             if sudo:
                 self._sudo(channel, sudo.group(1), sudo.group(2))
@@ -350,6 +475,14 @@ def _pump(chan, sock):
                      daemon=True).start()
 
 
+class _SilentSFTP(paramiko.SubsystemHandler):
+    """An SFTP subsystem that is accepted but never answers (a target that
+    took the login and then stopped answering)."""
+
+    def start_subsystem(self, name, transport, channel):
+        time.sleep(600)
+
+
 class LoopbackSSH:
     """Listens on 127.0.0.1:<port>; ``.server`` is the scripted behaviour."""
 
@@ -360,6 +493,9 @@ class LoopbackSSH:
         self._sock.listen(50)
         self.port = self._sock.getsockname()[1]
         self.transports = []
+        self.accepted = 0                # TCP connections taken
+        self.sftp_silent = False         # SFTP accepted, never answering
+        self.pre_banner = b""            # sent before the SSH greeting
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
     def _accept_loop(self):
@@ -368,12 +504,18 @@ class LoopbackSSH:
                 client, _ = self._sock.accept()
             except OSError:
                 return
+            self.accepted += 1
             threading.Thread(target=self._serve, args=(client,), daemon=True).start()
 
     def _serve(self, client):
+        if self.pre_banner:
+            client.sendall(self.pre_banner)
         transport = paramiko.Transport(client)
         transport.add_server_key(HOST_KEY)
-        transport.set_subsystem_handler("sftp", paramiko.SFTPServer, StubSFTP)
+        if self.sftp_silent:
+            transport.set_subsystem_handler("sftp", _SilentSFTP)
+        else:
+            transport.set_subsystem_handler("sftp", paramiko.SFTPServer, StubSFTP)
         try:
             transport.start_server(server=self.server)
         except Exception:

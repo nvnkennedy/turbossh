@@ -11,6 +11,7 @@ Designed for three consumers from one object:
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import os
 import shlex
@@ -19,6 +20,7 @@ import time
 import logging
 import posixpath
 import re
+import selectors
 import threading
 from typing import Callable, Optional, Sequence, Union
 
@@ -34,6 +36,7 @@ from .exceptions import (
     SSHAuthenticationError,
     SSHTimeoutError,
     SSHCommandError,
+    SSHCancelledError,
     SSHTransferError,
     SSHNotConnectedError,
 )
@@ -297,6 +300,383 @@ def _close_soon(sftp) -> None:
                          daemon=True).start()
 
 
+# --------------------------------------------------------------------------- #
+# Cancelling a blocking call
+# --------------------------------------------------------------------------- #
+# How often a ``cancel`` is looked at (s). The calls promise "at least every
+# 0.25 s"; their own loops look at it as often as they wake up, this is the
+# watcher thread that also catches a call blocked inside Paramiko.
+_CANCEL_POLL = 0.1
+
+
+def _cancel_test(cancel):
+    """A no-argument function that says whether *cancel* has fired: *cancel*
+    is a threading.Event (anything with ``is_set``) or a callable returning
+    a bool; None never fires (and gives None). A callable that raises counts
+    as not fired: a bug in the caller's check must not stop the work."""
+    if cancel is None:
+        return None
+    is_set = getattr(cancel, "is_set", None)
+    if callable(is_set):
+        return is_set
+    if callable(cancel):
+        def fired():
+            try:
+                return bool(cancel())
+            except Exception:
+                return False
+        return fired
+    raise TypeError("cancel must be a threading.Event (or anything with is_set()) "
+                    "or a callable returning bool")
+
+
+class _CancelWatch:
+    """The cancel of one call. The call looks at it in its own loop (:meth:`check`);
+    a helper thread looks at it too, every _CANCEL_POLL, and closes what the
+    call is blocked on (:meth:`guard`: a channel, a socket, a transport), so a
+    call waiting inside Paramiko wakes up at once.
+
+    ``grace``: how long the watcher leaves the call to notice by itself before
+    it closes anything. A call that noticed (a transfer stopping between two
+    chunks) is tidying up after itself — removing its temporary file over the
+    very channel — so it is not cut off: it gets _TIDY_WAIT more, and only a
+    call stuck even then (a stalled link) has its targets closed."""
+
+    _TIDY_WAIT = 5.0
+
+    def __init__(self, cancel, *, grace: float = 0.0):
+        self._fired = _cancel_test(cancel)
+        self._grace = grace
+        self.cancelled = False
+        self.noticed = False             # the call saw it itself (check())
+        self._targets = []
+        self._closed_all = False         # the watcher closed the targets
+        # held while a target is signalled and closed, and to take one back:
+        # a "signal" request sent after the channel was freed made OpenSSH drop
+        # the whole connection
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+
+    @property
+    def active(self) -> bool:
+        return self._fired is not None
+
+    def _fire_test(self) -> bool:
+        return self._fired is not None and bool(self._fired())
+
+    def check(self) -> bool:
+        """True once cancelled (the call should stop now)."""
+        if not self.cancelled and self._fire_test():
+            self.cancelled = True
+        if self.cancelled:
+            self.noticed = True
+        return self.cancelled
+
+    def guard(self, *targets) -> None:
+        """Close *targets* when the call is cancelled (at once if the watcher
+        has closed what it guarded already)."""
+        new = [t for t in targets if t is not None]
+        with self._lock:
+            if not self._closed_all:
+                self._targets.extend(new)
+                return
+            for target in new:
+                self._shut(target, signal=False)
+
+    def release(self, target) -> None:
+        """Take *target* back (the call is done with it, or keeps it): the
+        watcher no longer closes it. Waits for a close in progress."""
+        with self._lock:
+            try:
+                self._targets.remove(target)
+            except ValueError:
+                pass
+
+    def hangup(self, chan) -> None:
+        """The call stops *chan* itself: SIGHUP, then close — never while the
+        watcher is at it."""
+        with self._lock:
+            try:
+                self._targets.remove(chan)
+            except ValueError:
+                pass
+            self._shut(chan, signal=True)
+
+    def wait(self, seconds: float) -> bool:
+        """Sleep up to *seconds*; True (at once) if cancelled meanwhile."""
+        end = time.monotonic() + seconds
+        while True:
+            if self.check():
+                return True
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(_CANCEL_POLL, left))
+
+    @staticmethod
+    def _shut(target, *, signal: bool) -> None:
+        if signal:
+            _send_signal(target, "HUP")
+        if isinstance(target, socket.socket):
+            try:                         # wakes a connect() blocked on it (Linux)
+                target.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            target.close()
+        except Exception:
+            pass
+
+    def _close_targets(self) -> None:
+        with self._lock:
+            if self._done.is_set():          # the call ended meanwhile: nothing to stop
+                return
+            targets, self._targets = list(self._targets), []
+            self._closed_all = True
+            for target in targets:
+                self._shut(target, signal=True)
+
+    def _watch(self) -> None:
+        while not self._done.wait(_CANCEL_POLL):
+            if not self._fire_test():
+                continue
+            self.cancelled = True
+            end = time.monotonic() + self._grace
+            while not self.noticed and time.monotonic() < end:
+                if self._done.wait(_CANCEL_POLL / 2):
+                    return
+            if self.noticed and self._grace:
+                # the call is stopping by itself, and tidying up: let it
+                if self._done.wait(self._TIDY_WAIT):
+                    return
+            if not self._done.is_set():
+                self._close_targets()
+            return
+
+    def __enter__(self) -> "_CancelWatch":
+        if self._fired is not None:
+            threading.Thread(target=self._watch, name="turbossh-cancel",
+                             daemon=True).start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        with self._lock:                 # (never while the watcher closes)
+            self._done.set()
+
+
+def _send_signal(chan, name: str) -> None:
+    """Ask the server to deliver signal *name* ("HUP", "TERM", "KILL"…) to the
+    channel's command (RFC 4254 6.9) — before the channel is closed: without
+    a pty, closing alone does not stop a command that is not writing. Only for
+    a live session channel; best effort (an old server ignores it)."""
+    if not isinstance(chan, paramiko.Channel):
+        return
+    try:
+        from paramiko.common import cMSG_CHANNEL_REQUEST
+        m = paramiko.Message()
+        m.add_byte(cMSG_CHANNEL_REQUEST)
+        m.add_int(chan.remote_chanid)
+        m.add_string("signal")
+        m.add_boolean(False)
+        m.add_string(name)
+        # Under the channel's lock, as Paramiko's own close: the server's close
+        # is handled under it too, so our request never follows our CLOSE (a
+        # request for a freed channel made OpenSSH drop the whole connection).
+        # Not for a command that ended (its exit status is in).
+        with chan.lock:
+            if chan.closed or chan.exit_status_ready():
+                return
+            chan.transport._send_user_message(m)
+    except Exception:
+        pass
+
+
+class _ChannelReasons(logging.Handler):
+    """Keeps what a jump host said when it could not open the channel to the
+    target ("Connection refused", "Connection timed out"): Paramiko's
+    ChannelException only carries its own table's words ("Connect failed"),
+    the server's are in its log line "Secsh channel N open FAILED: <reason>:
+    ..."."""
+
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self.said = []
+
+    def emit(self, record) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if "open FAILED" in message:
+            self.said.append(message)
+
+    def take(self) -> str:
+        said, self.said = self.said, []
+        return " ".join(said)
+
+
+_CHECK_LOGS = {}             # logger name -> its _ChannelReasons
+_CHECK_LOGS_LOCK = threading.Lock()
+
+
+def _quiet_paramiko_log():
+    """``(logger name, reasons)`` for Paramiko's log lines of check()'s
+    connections: nothing is printed (a target that is off made Paramiko print
+    a traceback per poll to stderr), and what a jump host said about the
+    target is kept. One logger per calling thread (a boot watch polls each
+    target on a thread of its own), so the set stays small."""
+    name = f"turbossh.check.paramiko.t{threading.get_ident()}"
+    with _CHECK_LOGS_LOCK:
+        reasons = _CHECK_LOGS.get(name)
+        if reasons is None:
+            log = logging.getLogger(name)
+            log.propagate = False
+            log.setLevel(logging.ERROR)
+            reasons = _ChannelReasons()
+            log.addHandler(reasons)
+            _CHECK_LOGS[name] = reasons
+    reasons.take()
+    return name, reasons
+
+
+class _CheckFailed(Exception):
+    """A step of SSHHandler.check failed in a way that says what happened."""
+
+    def __init__(self, kind: str, exc: BaseException):
+        super().__init__(kind)
+        self.kind = kind
+        self.reason = str(exc) or type(exc).__name__
+
+
+class _BlankAgain(Exception):
+    """The connection ended during the keys, before the blank password was
+    tried — the keys used up the server's MaxAuthTries, or the link dropped
+    (Paramiko cannot tell the two apart): once more on a new connection, the
+    blank password first, then the keys again. Carries what the first
+    connection learned (the methods allowed, what was tried)."""
+
+    def __init__(self, allowed=None, tried=()):
+        super().__init__("again")
+        self.allowed = allowed
+        self.tried = list(tried)
+
+
+class _Cancelled(Exception):
+    """Raised from a transfer's callback once its cancel fired (an Exception,
+    not an IOError: the transfer code tidies up after it as after an abort)."""
+
+
+class _PassThrough(Exception):
+    """Carries an exception of the caller's own callback past the handling of
+    the library's errors (see exec_bytes)."""
+
+
+class _SftpChannel:
+    """What a cancel closes for a transfer stuck on a stalled link: the SFTP
+    client's channel (not the connection)."""
+
+    def __init__(self, sftp):
+        self._sftp = sftp
+
+    def close(self) -> None:
+        try:
+            chan = self._sftp.get_channel()
+        except Exception:
+            return
+        if chan is not None:
+            chan.close()
+
+
+# connect_ex's "under way" answers (POSIX and Winsock)
+_CONNECTING = frozenset((0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY,
+                         10035, 10036, 10037))
+
+
+def _connect_polled(sock, address, timeout: Optional[float],
+                    watch: Optional[_CancelWatch]) -> None:
+    """Connect *sock* to *address* within *timeout*, looking at the cancel every
+    0.1 s: a blocking connect() waits in one poll that closing the socket from
+    another thread does not wake on Linux. Raises what connect() would
+    (socket.timeout, ConnectionRefusedError, ...)."""
+    sock.setblocking(False)
+    code = sock.connect_ex(address)
+    if code not in _CONNECTING:
+        raise OSError(code, _error_text(code))
+    end = None if timeout is None else time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    try:
+        _wait_connected(sock, code, end, watch, selector)
+    finally:
+        selector.close()
+    sock.setblocking(True)
+    sock.settimeout(timeout)
+
+
+def _wait_connected(sock, code, end, watch, selector) -> None:
+    selector.register(sock, selectors.EVENT_WRITE)
+    while code != 0:
+        if watch is not None and watch.check():
+            raise OSError(errno.ECANCELED if hasattr(errno, "ECANCELED") else 125,
+                          "connect cancelled")
+        step = 0.1
+        if end is not None:
+            left = end - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("timed out")
+            step = min(step, left)
+        if selector.select(step):
+            err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err == 0:
+                try:
+                    sock.getpeername()   # connected: done
+                    break
+                except OSError:          # Windows: failed without a code yet
+                    err = 10061 if os.name == "nt" else errno.ECONNREFUSED
+            raise OSError(err, _error_text(err))
+
+
+def _error_text(code: int) -> str:
+    """The system's words for error *code* (a Winsock code on Windows)."""
+    if os.name == "nt" and code >= 10000:
+        try:
+            import ctypes
+            return ctypes.FormatError(code).strip()
+        except Exception:
+            return f"Windows socket error {code}"
+    return os.strerror(code)
+
+
+def _tcp_connect(host: str, port: int, timeout: Optional[float], *,
+                 nodelay: bool = False, watch: Optional[_CancelWatch] = None):
+    """socket.create_connection, but one a cancel stops within 0.1 s, and with
+    TCP_NODELAY when asked."""
+    last = None
+    for family, kind, proto, _name, address in socket.getaddrinfo(
+            host, port, 0, socket.SOCK_STREAM):
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            _connect_polled(sock, address, timeout, watch)
+            if nodelay:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+            return sock
+        except OSError as exc:
+            last = exc
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            if watch is not None and watch.check():
+                break
+    if last is not None:
+        raise last
+    raise OSError(f"getaddrinfo returned nothing for {host}:{port}")
+
+
 _KNOWN_HOSTS_LOCK = threading.Lock()
 
 
@@ -500,17 +880,28 @@ class ShellSession:
         # sendall: send() may accept only part of a large write
         self._chan.sendall(data)
 
-    def read_until(self, marker: str, timeout: float = 30.0) -> ShellResult:
-        """Read output until *marker* appears or *timeout* elapses."""
+    def read_until(self, marker: str, timeout: float = 30.0, *,
+                   cancel=None) -> ShellResult:
+        """Read output until *marker* appears or *timeout* elapses.
+
+        ``cancel`` (a threading.Event, or a callable returning True to stop) is
+        looked at every 0.25 s at least: when it fires, the shell's channel is
+        closed (the shell gets SIGHUP) and the result has ``cancelled=True``."""
         start = time.time()
+        fired = _cancel_test(cancel)
         # Accumulate chunks in a list and join once at the end. Searching a small
         # sliding window (rather than re-scanning the whole growing buffer each
         # recv) keeps a long send/expect exchange linear instead of O(n²).
         parts = []
         window = ""
         overlap = max(0, len(marker) - 1)
-        self._chan.settimeout(0.5)
+        self._chan.settimeout(0.5 if fired is None else 0.2)
         while time.time() - start < timeout:
+            if fired is not None and fired():
+                _send_signal(self._chan, "HUP")
+                self.close()
+                return ShellResult("".join(parts), None, False, time.time() - start,
+                                   cancelled=True)
             try:
                 chunk = self._chan.recv(65536)
                 if not chunk:
@@ -607,6 +998,15 @@ class SSHHandler:
         # markers of the camera streams THIS handler started (see webcam_release)
         self._cam_tokens: set = set()
         self._cam_lock = threading.Lock()
+        # how the last login worked (see auth_method) and the server's version
+        # string from the last handshake (see check)
+        self._auth_method: Optional[str] = None
+        self._last_banner = ""
+        # command_mode="auto": (host, way) once probed — way "exec" | "pty" | "login"
+        self._way: Optional[tuple] = None
+        self._way_lock = threading.Lock()
+        # the cancel of the connect in progress (see _connect_with_retries)
+        self._connect_watch: Optional[_CancelWatch] = None
 
     # ------------------------------------------------------------------ #
     # Logging (secret-aware)
@@ -671,10 +1071,20 @@ class SSHHandler:
 
     @property
     def transport(self) -> paramiko.Transport:
+        """The connection's paramiko Transport (connecting first if needed) —
+        supported for what is not wrapped here, e.g. ``open_session()`` for a
+        raw channel of your own (see also :meth:`open_channel`). Channels opened
+        on it get ``config.window_size`` / ``max_packet_size``."""
         t = self.client.get_transport()
         if t is None:
             raise SSHNotConnectedError(f"Disconnected from {self.config.host}.")
         return t
+
+    @property
+    def auth_method(self) -> Optional[str]:
+        """How the current connection logged in: ``"none"``, ``"password"``,
+        ``"empty-password"``, ``"key"`` or ``"agent"`` (None before a login)."""
+        return self._auth_method
 
     def _ensure_connected(self) -> None:
         if self.is_connected:
@@ -695,7 +1105,7 @@ class SSHHandler:
     # ------------------------------------------------------------------ #
     # Connect / disconnect
     # ------------------------------------------------------------------ #
-    def connect(self, *, safe: Optional[bool] = None):
+    def connect(self, *, cancel=None, safe: Optional[bool] = None):
         """Connect (with retries).
 
         On a handler that already looks connected, the link is checked first
@@ -704,15 +1114,22 @@ class SSHHandler:
         leaked (``ssh.connect()`` followed by ``with ssh:``) — and a dead one is
         closed and replaced. After a DUT reboot the old TCP link still looks
         open until something is sent on it, so ``ssh.run("reboot"); wait;
-        ssh.connect()`` opens a fresh connection, as it did in 2.0."""
-        return self._guard("connect", self._connect_explicit, safe=safe)
+        ssh.connect()`` opens a fresh connection, as it did in 2.0.
+
+        ``cancel`` (a threading.Event, or a callable returning True to stop) is
+        looked at every 0.25 s at least — while the TCP connection is made,
+        during the handshake and the login, and between retries; when it fires
+        the half-made connection is closed and :class:`SSHCancelledError` is
+        raised. ``config.max_retries=1`` is exactly one attempt: no retry, no
+        wait."""
+        return self._guard("connect", self._connect_explicit, cancel=cancel, safe=safe)
 
     # The least time (s) connect() gives a connected server to show it is alive;
     # the connect timeout, when longer. A slow VPN with bulk data in flight can
     # hold the answer back for seconds.
     _LIVENESS_TIMEOUT = 10.0
 
-    def _connect_explicit(self) -> "SSHHandler":
+    def _connect_explicit(self, cancel=None) -> "SSHHandler":
         with self._conn_lock:
             self._closed = False
             client = self._client
@@ -734,7 +1151,7 @@ class SSHHandler:
                                f"answers (the target rebooted, or the link dropped); "
                                f"opening a new one…")
                     self._drop_dead_link(client)
-            return self._connect_with_retries()
+            return self._connect_with_retries(cancel)
 
     def _liveness_timeout(self) -> float:
         return max(self._LIVENESS_TIMEOUT, self.config.connect_timeout or 0.0)
@@ -909,11 +1326,19 @@ class SSHHandler:
         except Exception:
             pass
 
+    # A logger name for Paramiko's own log lines of this handler's connections
+    # (None: Paramiko's "paramiko.transport"); see check
+    _paramiko_log: Optional[str] = None
+    # A check's throwaway handler: its jump connection logs nothing either
+    _silent = False
+
     def _make_client(self) -> paramiko.SSHClient:
         if (self.config.enable_legacy_algorithms
                 and not self._supports_transport_factory()):
             self._apply_legacy_algorithms()
         client = paramiko.SSHClient()
+        if self._paramiko_log:
+            client.set_log_channel(self._paramiko_log)
         if self.config.host_key_policy == "ignore":
             # Lab mode: don't load any known_hosts and accept whatever key the
             # server presents - even a CHANGED one. Use for reimaged / DHCP
@@ -993,7 +1418,12 @@ class SSHHandler:
                 logger=self.log,
                 quiet=self._quiet,
             )
-            self._jump._connect_with_retries()
+            if self._silent:                 # (a check: no log lines)
+                self._jump._silent = True
+                self._jump._emit = lambda level, msg: None
+                self._jump._paramiko_log = self._paramiko_log
+            watch = self._connect_watch
+            self._jump._connect_with_retries(watch._fired if watch is not None else None)
             self._emit(logging.INFO, f"Tunnelling through jump host "
                                      f"{self.config.jump_host.host}.")
         return self._jump.transport.open_channel(
@@ -1064,14 +1494,332 @@ class SSHHandler:
                 kwargs["look_for_keys"] = False
         return kwargs
 
-    def _attempt_strategies(self, open_sock=None) -> None:
+    def _open_socket(self, watch=None):
+        """The TCP connection to the target (not through a jump host): one a
+        cancel can interrupt, with TCP_NODELAY when the config asks for it."""
+        cfg = self.config
+        return _tcp_connect(cfg.host, cfg.port, cfg.connect_timeout,
+                            nodelay=cfg.tcp_nodelay, watch=watch)
+
+    def _shut(self, client) -> None:
+        """Close the client of a failed attempt, keeping the server's version
+        string (see :meth:`check`)."""
+        t = client.get_transport()
+        if t is not None and getattr(t, "remote_version", ""):
+            self._last_banner = t.remote_version
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    def _supplied_password(self):
+        cfg = self.config
+        return cfg.password.reveal() if isinstance(cfg.password, Secret) else cfg.password
+
+    def _none_first(self) -> bool:
+        """True when the login starts with SSH's "none" method: allowed, and
+        neither a password (password="" counts as none given) nor a key file."""
+        cfg = self.config
+        return (cfg.allow_none_auth and not cfg.passwordless
+                and not cfg.normalized_key_files()
+                and self._supplied_password() in (None, ""))
+
+    def _cancelled_connect(self) -> SSHCancelledError:
+        cfg = self.config
+        return SSHCancelledError(f"Connecting to {cfg.host}:{cfg.port} was cancelled.")
+
+    @staticmethod
+    def _method_of(client, empty_password: bool) -> str:
+        """How *client* logged in (see auth_method), from Paramiko's record."""
+        t = client.get_transport()
+        handler = getattr(t, "auth_handler", None)
+        method = getattr(handler, "auth_method", "") or ""
+        if method == "none":
+            return "none"
+        if method == "publickey":
+            key = getattr(handler, "private_key", None)
+            return "agent" if isinstance(key, paramiko.AgentKey) else "key"
+        return "empty-password" if empty_password else "password"
+
+    def _paramiko_auth(self, client, username: str) -> None:
+        """Paramiko's own key / agent login (SSHClient._auth) on the transport
+        *client* already has — the keys and the agent as a plain connect tries
+        them, without a second connection. Its signature differs between
+        Paramiko releases (the GSS arguments went in 4.0)."""
+        import inspect
+        cfg = self.config
+        passphrase = (cfg.key_passphrase.reveal()
+                      if isinstance(cfg.key_passphrase, Secret) else cfg.key_passphrase)
+        auth = client._auth
+        params = inspect.signature(auth).parameters
+        values = {"username": username, "password": None, "pkey": None,
+                  "key_filenames": [], "allow_agent": cfg.allow_agent,
+                  "look_for_keys": cfg.look_for_keys, "passphrase": passphrase,
+                  "gss_auth": False, "gss_kex": False, "gss_deleg_creds": False,
+                  "gss_host": None}
+        auth(**{name: values[name] for name in params if name in values})
+
+    def _login_user(self) -> str:
+        """The login name: the configured one, else this computer's user name,
+        as Paramiko's connect does (a blank User field in the GUI)."""
+        user = self.config.auth_username
+        if user:
+            return user
+        import getpass
+        try:
+            return getpass.getuser()
+        except Exception:
+            return "root"
+
+    _DEFAULT_KEYS = ("id_rsa", "id_ecdsa", "id_ed25519", "id_dsa")
+
+    def _have_keys(self) -> bool:
+        """True when a key login has something to offer: one of the default key
+        files (~/.ssh/id_*) or an agent holding keys."""
+        cfg = self.config
+        if cfg.look_for_keys:
+            home = os.path.expanduser("~")
+            names = [n for n in self._DEFAULT_KEYS
+                     if n != "id_dsa" or hasattr(paramiko, "DSSKey")]
+            for folder in (".ssh", "ssh"):      # (Paramiko looks in ~/ssh too)
+                for name in names:
+                    if os.path.isfile(os.path.join(home, folder, name)):
+                        return True
+        if cfg.allow_agent:
+            try:
+                agent = paramiko.Agent()
+                try:
+                    return bool(agent.get_keys())
+                finally:
+                    agent.close()
+            except Exception:
+                return False
+        return False
+
+    def _login_without_secret(self, client, watch, again=None) -> str:
+        """Log in on *client*'s started transport when no password and no key
+        file were given: SSH's "none" first (a QNX / RichOS head unit takes
+        it), then the blank password (password and keyboard-interactive) and
+        the keys / agent as a plain connect tries them — the keys first when
+        there are any: a blank password is a "Failed password" line a fail2ban
+        counts, and two failures can use up a strict MaxAuthTries before the
+        right key comes. The server's answer to "none" lists what it allows,
+        so a method it does not offer is skipped and nothing needs a second
+        connection. Returns the method that worked (see auth_method); raises
+        SSHAuthenticationError naming what the server offers and what was
+        tried — also when the server hangs up after a refusal. *again*: the
+        _BlankAgain of a first connection (this is the second one)."""
+        cfg = self.config
+        t = client.get_transport()
+        user = self._login_user()
+        allowed = list(again.allowed) if again is not None and again.allowed else None
+        tried = list(again.tried) if again is not None else []
+
+        def note(exc):
+            nonlocal allowed
+            if isinstance(exc, paramiko.BadAuthenticationType) and exc.allowed_types:
+                allowed = [str(m) for m in exc.allowed_types]
+
+        def offered(kind):
+            return allowed is None or kind in allowed
+
+        def refused(closed: bool) -> SSHAuthenticationError:
+            offers = ", ".join(allowed) if allowed else "unknown"
+            how = ("closed the connection after refusing the login"
+                   if closed else "refused the login")
+            return SSHAuthenticationError(
+                f"{cfg.host} {how} as {user!r} without a password (the server "
+                f"offers: {offers}; tried: {', '.join(tried) or 'nothing'}). Give "
+                f"password=..., key_filename=..., or passwordless=True for an SSH "
+                f"key / agent.")
+
+        def gone():
+            """The transport ended. Paramiko mostly cannot tell a server that
+            hung up after a refusal (a DISCONNECT) from a link that dropped:
+            its login wait takes the saved error and calls both an
+            authentication failure. Where it kept a connection error (EOF, a
+            reset), that is raised, and retried; otherwise a login failure."""
+            lost = t.get_exception()
+            if isinstance(lost, (EOFError, OSError)):
+                err = paramiko.SSHException("the connection was lost during the login")
+                err.__cause__ = lost
+                return err
+            return refused(True)
+
+        def attempt(label, fn) -> bool:
+            """One method; True once logged in."""
+            if not t.is_active():
+                raise gone()
+            try:
+                fn()
+            except paramiko.AuthenticationException as exc:
+                note(exc)
+            except paramiko.SSHException as exc:
+                text = str(exc).lower()
+                # nothing to offer ("no authentication methods"), or the server
+                # hung up ("no existing session"): not a connection failure
+                if ("no authentication methods" not in text
+                        and "no existing session" not in text and t.is_active()):
+                    raise
+            if t.is_authenticated():
+                return True
+            tried.append(label)
+            if watch.check():
+                raise self._cancelled_connect()
+            return False
+
+        if again is None and attempt("none", lambda: t.auth_none(user)):
+            return "none"
+
+        def blank():
+            if not cfg.allow_empty_password:
+                return None
+            if offered("password") and attempt(
+                    "blank password", lambda: t.auth_password(user, "")):
+                return "empty-password"
+            if offered("keyboard-interactive") and attempt(
+                    "blank keyboard-interactive",
+                    lambda: t.auth_interactive(user, lambda _title, _text, prompts:
+                                               ["" for _ in prompts])):
+                return "empty-password"
+            return None
+
+        def try_keys():
+            try:
+                self._paramiko_auth(client, user)
+            except paramiko.AuthenticationException:
+                raise
+            except (paramiko.SSHException, OSError) as exc:
+                # a default key Paramiko cannot read (a PKCS#8 file, an
+                # encrypted one): the keys failed, the blank password may not
+                if not t.is_active():
+                    raise
+                self._emit(logging.DEBUG, f"Keys / agent: {exc}")
+
+        def keys():
+            if not ((cfg.allow_agent or cfg.look_for_keys) and offered("publickey")):
+                return None
+            if attempt("keys / agent", try_keys):
+                return self._method_of(client, False)
+            return None
+
+        if again is not None:
+            order = (blank, keys)        # (the keys may only have met a dropped link)
+        else:
+            order = (keys, blank) if self._have_keys() else (blank, keys)
+        def blank_still_to_come(step) -> bool:
+            """The keys used up the server's MaxAuthTries (an agent and the key
+            files holding the same keys) before the blank password came."""
+            return (step is keys and again is None and cfg.allow_empty_password
+                    and blank in order[order.index(keys) + 1:]
+                    and (offered("password") or offered("keyboard-interactive")))
+
+        for step in order:
+            try:
+                method = step()
+            except SSHAuthenticationError:
+                if blank_still_to_come(step):
+                    raise _BlankAgain(allowed, tried) from None
+                raise
+            if method:
+                return method
+            if not t.is_active() and blank_still_to_come(step):
+                raise _BlankAgain(allowed, tried)
+        if not t.is_active():
+            raise gone()
+        raise refused(False)
+
+    def _attempt_none_first(self, open_sock, watch) -> None:
+        """One connection: the transport is started and the host key checked as
+        a plain connect does (Paramiko then has no credential to try and says
+        so), and :meth:`_login_without_secret` logs in on it. Only when the
+        connection ended during the keys, before the blank password came (the
+        keys used up MaxAuthTries, or the link dropped), is a second one made:
+        the blank password first there, then the keys again."""
+        try:
+            self._none_first_once(open_sock, watch)
+        except _BlankAgain as again:
+            if watch.check():
+                raise self._cancelled_connect() from None
+            self._emit(logging.DEBUG, "The connection ended during the keys; the "
+                                      "blank password, then the keys, on a new one…")
+            self._none_first_once(open_sock, watch, again)
+
+    def _none_first_once(self, open_sock, watch, again=None) -> None:
+        cfg = self.config
+        sock = open_sock() if open_sock else self._open_socket(watch)
+        watch.guard(sock)
+        client = self._make_client()
+        kwargs = self._build_connect_kwargs(empty_password=False, sock=sock)
+        for name in ("password", "key_filename", "passphrase"):
+            kwargs.pop(name, None)
+        kwargs["allow_agent"] = False
+        kwargs["look_for_keys"] = False
+        try:
+            self._emit(logging.DEBUG, f"Auth attempt (none first) as {cfg.auth_username}…")
+            try:
+                client.connect(**kwargs)
+            except paramiko.AuthenticationException:
+                pass
+            except paramiko.SSHException as exc:
+                if "no authentication methods" not in str(exc).lower():
+                    raise
+            except EOFError as exc:
+                raise paramiko.SSHException(
+                    "the server closed the connection during the SSH handshake"
+                ) from exc
+            t = client.get_transport()
+            if t is None or not t.is_active():
+                raise paramiko.SSHException(
+                    "the server closed the connection before the login")
+            method = ("none" if t.is_authenticated()
+                      else self._login_without_secret(client, watch, again))
+        except (SSHCancelledError, _BlankAgain):
+            self._shut(client)
+            raise
+        except BaseException as exc:
+            self._shut(client)
+            if watch.check():
+                raise self._cancelled_connect() from exc
+            raise
+        finally:
+            watch.release(sock)
+        if watch.check():                # cancelled just as it logged in
+            self._shut(client)
+            raise self._cancelled_connect()
+        self._install_client(client, method)
+        self._post_connect()
+        self._emit(logging.INFO, f"Connected to {cfg.auth_username}@{cfg.host}:{cfg.port} "
+                                 f"({method}).")
+
+    def _none_after(self, client, exc) -> bool:
+        """A password / key login was refused by a server that lists "none":
+        try that on the same connection. True if it logged in."""
+        if not (self.config.allow_none_auth
+                and isinstance(exc, paramiko.BadAuthenticationType)
+                and "none" in [str(m) for m in (exc.allowed_types or ())]):
+            return False
+        t = client.get_transport()
+        if t is None or not t.is_active():
+            return False
+        try:
+            t.auth_none(self._login_user())
+        except paramiko.SSHException:
+            return False
+        return t.is_authenticated()
+
+    def _attempt_strategies(self, open_sock=None, watch=None) -> None:
         """Try each auth strategy on its own connection. ``open_sock`` (jump
         hosts) is called per attempt, because a rejected attempt closes the
-        channel it ran over."""
+        channel it ran over. Without a password or key file, the login starts
+        with SSH's "none" method on one connection (_attempt_none_first)."""
+        watch = watch or _CancelWatch(None)
+        if self._none_first():
+            self._attempt_none_first(open_sock, watch)
+            return
         cfg = self.config
         last_auth: Optional[Exception] = None
-        supplied = (cfg.password.reveal() if isinstance(cfg.password, Secret)
-                    else cfg.password)
+        supplied = self._supplied_password()
         strategies = [False]
         # The blank-password fallback is for accounts where NO password was given
         # (lab targets with an empty root password). After a real password was
@@ -1082,26 +1830,46 @@ class SSHHandler:
             strategies.append(True)
 
         for empty in strategies:
-            sock = open_sock() if open_sock else None
+            if watch.check():
+                raise self._cancelled_connect()
+            sock = open_sock() if open_sock else self._open_socket(watch)
+            watch.guard(sock)
             client = self._make_client()
             kwargs = self._build_connect_kwargs(empty_password=empty, sock=sock)
             label = "empty-password" if empty else "primary"
+            blank = empty or supplied == ""
             try:
                 self._emit(logging.DEBUG, f"Auth attempt ({label}) as "
                                           f"{cfg.auth_username}…")
-                client.connect(**kwargs)
-                self._install_client(client)
+                try:
+                    client.connect(**kwargs)
+                    method = self._method_of(client, blank)
+                except paramiko.AuthenticationException as exc:
+                    if watch.check() or not self._none_after(client, exc):
+                        raise
+                    method = "none"
+                watch.release(sock)          # (before the last look: see below)
+                if watch.check():
+                    self._shut(client)
+                    raise self._cancelled_connect()
+                self._install_client(client, method)
                 self._post_connect()
                 self._emit(logging.INFO,
                            f"Connected to {cfg.auth_username}@{cfg.host}:{cfg.port} "
                            f"({label}).")
                 return
+            except SSHCancelledError:
+                raise
             except paramiko.AuthenticationException as exc:
+                self._shut(client)
+                if watch.check():
+                    raise self._cancelled_connect() from exc
                 last_auth = exc
-                client.close()
                 self._emit(logging.DEBUG, f"Auth strategy '{label}' rejected.")
             except paramiko.SSHException as exc:
-                client.close()
+                self._shut(client)
+                if watch.check():
+                    raise self._cancelled_connect() from exc
                 # "No authentication methods available" means paramiko had no
                 # credential the server would accept (no password/key/agent).
                 # That's an auth problem, not a transport one - try the next
@@ -1113,16 +1881,22 @@ class SSHHandler:
                     continue
                 raise exc
             except OSError as exc:
-                client.close()
+                self._shut(client)
+                if watch.check():
+                    raise self._cancelled_connect() from exc
                 raise exc
             except EOFError as exc:
                 # Paramiko surfaces a peer that hangs up mid-handshake as a bare
                 # EOFError; turn it into the connection error it is, so it is
                 # retried and reported through our own exception types.
-                client.close()
+                self._shut(client)
+                if watch.check():
+                    raise self._cancelled_connect() from exc
                 raise paramiko.SSHException(
                     "the server closed the connection during the SSH handshake"
                 ) from exc
+            finally:
+                watch.release(sock)
         if last_auth and "no authentication methods" in str(last_auth).lower():
             raise SSHAuthenticationError(
                 f"No usable credentials for {cfg.auth_username}@{cfg.host}. "
@@ -1135,35 +1909,50 @@ class SSHHandler:
             f"{cfg.auth_username}@{cfg.host}: {last_auth}"
         )
 
-    def _connect_with_retries(self) -> "SSHHandler":
+    def _connect_with_retries(self, cancel=None) -> "SSHHandler":
         with self._conn_lock:
+            outer = self._connect_watch
             try:
-                return self._connect_locked()
+                with _CancelWatch(cancel) as watch:
+                    # read by _connect_locked (under the lock: one connect at a time)
+                    self._connect_watch = watch
+                    return self._connect_locked()
             except BaseException:
                 self._close_jump()      # never leave a jump connection behind
                 raise
+            finally:
+                self._connect_watch = outer
 
     def _connect_locked(self) -> "SSHHandler":
         cfg = self.config
+        watch = self._connect_watch or _CancelWatch(None)
         attempt, delay, last_exc = 0, cfg.retry_backoff, None
         opener = self._open_jump_channel if cfg.jump_host else None
+        # max_retries=1 is exactly one attempt, with no wait before or after it
         while attempt < max(1, cfg.max_retries):
             attempt += 1
+            if watch.check():
+                raise self._cancelled_connect()
             try:
-                self._attempt_strategies(opener)
+                self._attempt_strategies(opener, watch)
                 return self
-            except SSHAuthenticationError:
+            except (SSHAuthenticationError, SSHCancelledError):
                 raise  # retrying won't help
             except socket.timeout as exc:
+                if watch.check():
+                    raise self._cancelled_connect() from exc
                 last_exc = exc
                 self._emit(logging.WARNING,
                            f"Connect timeout (attempt {attempt}/{cfg.max_retries}).")
             except (OSError, paramiko.SSHException) as exc:
+                if watch.check():
+                    raise self._cancelled_connect() from exc
                 last_exc = exc
                 self._emit(logging.WARNING,
                            f"Connect error (attempt {attempt}/{cfg.max_retries}): {exc}")
             if attempt < cfg.max_retries:
-                time.sleep(delay)
+                if watch.wait(delay):
+                    raise self._cancelled_connect()
                 delay *= cfg.retry_backoff
 
         # Optional self-heal: if SSH is down but WinRM is up, enable sshd and retry.
@@ -1198,6 +1987,159 @@ class SSHHandler:
         raise SSHConnectionError(
             f"Could not connect to {cfg.host}:{cfg.port}: {last_exc}.{hint}") \
             from last_exc
+
+    # ------------------------------------------------------------------ #
+    # A login check that says WHAT happened (boot / power-off checks)
+    # ------------------------------------------------------------------ #
+    # errno values of "no route to the host" / "host down" (POSIX and Winsock)
+    _UNREACHABLE = frozenset((101, 113, 112, 10051, 10065, 10064, 65, 51, 64))
+
+    def check(self, timeout: float = 5.0, *, cancel=None) -> dict:
+        """One full login to the target, then close — on a connection of its
+        own (this handler's connection, if any, is left alone). What a boot /
+        power-off watch asks every second: it says WHAT happened.
+
+        Returns ``dict(ok, kind, seconds, banner, error)``. *kind* is:
+
+        * ``"ok"`` — logged in;
+        * ``"refused"`` — the TCP connection was refused: the network is up,
+          the SSH server is not (yet);
+        * ``"reset"`` — the connection was closed during the handshake;
+        * ``"banner-timeout"`` — connected, but no SSH greeting in time (an SSH
+          server still starting); lines before the greeting are accepted
+          (RFC 4253 4.2);
+        * ``"auth-failed"`` — the server refused the login;
+        * ``"timeout"`` — no TCP answer within *timeout*;
+        * ``"unreachable"`` — no route to the host, or it is down;
+        * ``"cancelled"`` — *cancel* fired;
+        * ``"error"`` — anything else (*error* says what).
+
+        *banner* is the server's version string when it sent one, *seconds*
+        how long the check took, *error* the reason (empty when ok). Nothing
+        is logged below a warning. *timeout* bounds each step (TCP, greeting,
+        login). A boot watch counts 2-3 "ok" in a row as booted, and 3
+        "timeout" / "unreachable" in a row as off — "refused" / "reset" mean
+        the target is there."""
+        import dataclasses
+        # connect_timeout bounds Paramiko's whole handshake: twice the greeting's
+        # timeout, so a missing greeting is reported as what it is
+        quick = dict(max_retries=1, connect_timeout=2 * timeout, banner_timeout=timeout,
+                     auth_timeout=timeout, auto_reconnect=False, diagnose_on_failure=False,
+                     auto_bootstrap_via_winrm=False, keepalive_interval=0)
+        jump = self.config.jump_host
+        cfg = dataclasses.replace(
+            self.config, jump_host=dataclasses.replace(jump, **quick) if jump else None,
+            **quick)
+        probe = SSHHandler(cfg, quiet=True)
+        # a poll every second: no log lines, and none of Paramiko's tracebacks
+        probe._silent = True
+        probe._emit = lambda level, msg: None
+        probe._paramiko_log, reasons = _quiet_paramiko_log()
+        start = time.monotonic()
+        kind, error = "ok", ""
+        with _CancelWatch(cancel) as watch:
+            try:
+                if cfg.jump_host:
+                    probe._connect_watch = watch
+                    probe._attempt_strategies(probe._open_jump_channel, watch)
+                else:
+                    first = [None]
+                    try:
+                        first[0] = _tcp_connect(cfg.host, cfg.port, timeout,
+                                                nodelay=cfg.tcp_nodelay, watch=watch)
+                    except socket.timeout as exc:
+                        raise _CheckFailed("timeout", exc) from exc
+                    except ConnectionRefusedError as exc:
+                        raise _CheckFailed("refused", exc) from exc
+                    except (ConnectionResetError, ConnectionAbortedError) as exc:
+                        raise _CheckFailed("reset", exc) from exc
+                    except socket.gaierror as exc:
+                        raise _CheckFailed("error", exc) from exc
+                    except OSError as exc:
+                        code = exc.errno or getattr(exc, "winerror", None)
+                        if code in self._UNREACHABLE:
+                            raise _CheckFailed("unreachable", exc) from exc
+                        raise _CheckFailed("error", exc) from exc
+
+                    def opener():
+                        sock, first[0] = first[0], None
+                        return sock if sock is not None else probe._open_socket(watch)
+                    probe._attempt_strategies(opener, watch)
+            except _CheckFailed as failed:
+                kind, error = failed.kind, failed.reason
+            except SSHCancelledError as exc:
+                kind, error = "cancelled", str(exc)
+            except SSHAuthenticationError as exc:
+                kind, error = "auth-failed", str(exc)
+            except Exception as exc:     # (Ctrl+C goes through)
+                said = reasons.take()
+                kind = self._check_kind(exc, probe._last_banner, said)
+                error = str(exc) or type(exc).__name__
+                if said:                 # what the jump host said about the target
+                    error = f"{error} ({said})"
+            finally:
+                probe.disconnect()
+            if watch.cancelled and kind != "ok":
+                kind = "cancelled"
+        return {"ok": kind == "ok", "kind": kind,
+                "seconds": round(time.monotonic() - start, 3),
+                "banner": probe._last_banner or "", "error": error}
+
+    @classmethod
+    def _check_kind(cls, exc: BaseException, banner: str, said: str = "") -> str:
+        """The kind (see check) of a handshake / login failure — through a jump
+        host also of the jump's connect and of its channel to the target."""
+        chain, seen = [], exc
+        while seen is not None and len(chain) < 8 and all(seen is not e for e in chain):
+            chain.append(seen)
+            seen = seen.__cause__ or seen.__context__
+        for e in chain:
+            if isinstance(e, ConnectionRefusedError):
+                return "refused"
+            if isinstance(e, OSError) and (getattr(e, "winerror", None) or e.errno) \
+                    in cls._UNREACHABLE:
+                return "unreachable"
+            if isinstance(e, paramiko.ChannelException):   # the jump could not reach it
+                if getattr(e, "code", None) == 1:          # forwarding not allowed
+                    return "error"
+                words = (said + " " + (getattr(e, "text", "") or "")).lower()
+                if ("name or service not known" in words
+                        or "name resolution" in words or "nodename nor servname" in words):
+                    return "error"           # a host name the jump host cannot resolve
+                if "refused" in words:
+                    return "refused"
+                if "timed out" in words or "timeout" in words:
+                    return "timeout"
+                if "reset" in words:
+                    return "reset"
+                return "unreachable"
+        if isinstance(exc, SSHTimeoutError) or "timeout opening channel" in str(exc).lower():
+            return "timeout"
+        if "connection was lost" in str(exc).lower():
+            return "reset"
+        cause = exc.__cause__ or exc.__context__
+        text = str(exc).lower()
+        if isinstance(exc, (EOFError, ConnectionResetError, ConnectionAbortedError)):
+            return "reset"
+        if isinstance(exc, socket.timeout):
+            return "timeout" if banner else "banner-timeout"
+        if isinstance(exc, paramiko.SSHException):
+            if "no existing session" in text or "negotiation failed" in text:
+                # the handshake ran out of time
+                return "timeout" if banner else "banner-timeout"
+            if "protocol banner" in text:
+                if isinstance(cause, (EOFError, ConnectionResetError,
+                                      ConnectionAbortedError)):
+                    return "reset"
+                return "banner-timeout"
+            if "closed the connection" in text or "reset" in text:
+                return "reset"
+            if isinstance(cause, socket.timeout):
+                return "timeout"
+        if isinstance(exc, OSError) and exc.errno is None and isinstance(
+                cause, (EOFError, ConnectionResetError)):
+            return "reset"
+        return "error"
 
     # ------------------------------------------------------------------ #
     # Connectivity diagnosis (turns "errno None" into something actionable)
@@ -1375,13 +2317,18 @@ class SSHHandler:
 
         return self._guard("bootstrap_sshd_via_winrm", _do, safe=safe)
 
-    def _install_client(self, client: paramiko.SSHClient) -> None:
+    def _install_client(self, client: paramiko.SSHClient,
+                        method: Optional[str] = None) -> None:
         """Make *client* the connection, closing the one it replaces (a reconnect
         after the link died) and with it that connection's SFTP session. The old
         transport is closed first, so nothing is sent on a link that may have
-        stalled (see _drop_dead_link)."""
+        stalled (see _drop_dead_link). *method*: how it logged in (auth_method)."""
         old, self._client = self._client, client
         self._made_with = _link_key(self.config)
+        self._auth_method = method
+        t = client.get_transport()
+        if t is not None and getattr(t, "remote_version", ""):
+            self._last_banner = t.remote_version
         if old is not None and old is not client:
             try:
                 old.close()
@@ -1408,9 +2355,22 @@ class SSHHandler:
         _close_soon(self._forget_shared_sftp(only))
 
     def _post_connect(self) -> None:
+        cfg = self.config
         t = self._client.get_transport()
-        if t and self.config.keepalive_interval > 0:
-            t.set_keepalive(self.config.keepalive_interval)
+        if t is None:
+            return
+        if cfg.keepalive_interval > 0:
+            t.set_keepalive(cfg.keepalive_interval)
+        # every channel opened from here on (sessions, SFTP) gets these: a big
+        # window lets a fast link stream megabytes without waiting for the
+        # window updates of Paramiko's 2 MiB default
+        from paramiko.common import MAX_WINDOW_SIZE, MIN_PACKET_SIZE, MIN_WINDOW_SIZE
+        if cfg.window_size:
+            t.default_window_size = max(MIN_WINDOW_SIZE,
+                                        min(int(cfg.window_size), MAX_WINDOW_SIZE))
+        if cfg.max_packet_size:
+            t.default_max_packet_size = max(MIN_PACKET_SIZE,
+                                            min(int(cfg.max_packet_size), MAX_WINDOW_SIZE))
 
     def disconnect(self, sticky: bool = False) -> None:
         """Close the connection. A later call reconnects by itself, as always,
@@ -1490,25 +2450,436 @@ class SSHHandler:
     def run(self, command: str, *, timeout: Optional[float] = None,
             check: bool = False, get_pty: bool = False,
             environment: Optional[dict] = None, encoding: str = "utf-8",
-            safe: Optional[bool] = None):
-        """Execute a command. Returns CommandResult (or OperationResult if safe)."""
+            cancel=None, safe: Optional[bool] = None):
+        """Execute a command. Returns CommandResult (or OperationResult if safe).
+
+        ``cancel`` (a threading.Event, or a callable returning True to stop) is
+        looked at every 0.25 s at least: when it fires, the command's channel
+        is closed (the remote command gets SIGHUP) and the result comes back at
+        once with ``cancelled=True`` and the output so far (with ``check=True``,
+        :class:`SSHCancelledError` carrying it). The connection stays usable.
+
+        ``config.command_mode`` decides how the command starts: an exec request
+        ("exec", the default), an interactive login shell ("login", see
+        :meth:`run_login`), or whichever works on this target ("auto")."""
         return self._guard("run", self._run, command, timeout=timeout, check=check,
                            get_pty=get_pty, environment=environment,
-                           encoding=encoding, safe=safe)
+                           encoding=encoding, cancel=cancel, safe=safe)
 
     def _run(self, command, *, timeout, check, get_pty, environment, encoding,
-             expected=()):
+             expected=(), cancel=None):
         """*expected*: exit codes besides 0 that are an answer, not a failure
         (logged as information, not as a warning)."""
         eff_timeout = timeout if timeout is not None else self.config.command_timeout
-        result = self._exec(command, timeout=eff_timeout, get_pty=get_pty,
-                            environment=environment, encoding=encoding)
+        way = self._way_for(get_pty)
+        if way == "login":
+            result = self._login_exec(command, timeout=eff_timeout, encoding=encoding,
+                                      environment=environment, cancel=cancel)
+        else:
+            result = self._exec(command, timeout=eff_timeout,
+                                get_pty=get_pty or way == "pty",
+                                environment=environment, encoding=encoding,
+                                cancel=cancel)
+        if result.cancelled:
+            self._emit(logging.WARNING, f"cancelled ({result.duration:.2f}s)")
+            if check:
+                raise SSHCancelledError(f"Command cancelled: {command!r}", result=result)
+            return result
         lvl = (logging.INFO if result.ok or result.exit_code in expected
                else logging.WARNING)
         self._emit(lvl, f"exit={result.exit_code} ({result.duration:.2f}s)")
         if check and not result.ok:
             raise SSHCommandError(command, result)
         return result
+
+    # ------------------------------------------------------------------ #
+    # How a command starts (config.command_mode)
+    # ------------------------------------------------------------------ #
+    _PROBE_TIMEOUT = 15.0
+
+    def _way_for(self, get_pty: bool) -> str:
+        """"exec", "pty" or "login": how _run starts a command now."""
+        mode = self.config.command_mode
+        if mode == "login":
+            return "login"
+        if mode == "auto":
+            return self._command_way()
+        return "exec"
+
+    @property
+    def command_way(self) -> Optional[str]:
+        """How commands start on this target: "exec", "pty" or "login" — once
+        known (``command_mode="auto"`` probes on the first command), else None.
+        Never touches the network."""
+        mode = self.config.command_mode
+        if mode == "login":
+            return "login"
+        if mode == "exec":
+            return "exec"
+        way = self._way
+        return way[1] if way is not None and way[0] == self.config.host else None
+
+    def _command_way(self) -> str:
+        """Probe once per handler (and host) how a command can start here:
+        ``uname`` by exec, then by exec with a pty, then in the login shell —
+        the first one that prints something and exits 0 is kept (a QNX head
+        unit whose exec sessions cannot start programs answers only the last).
+        If none works, "exec": the command's own error then says why."""
+        host = self.config.host
+        way = self._way
+        if way is not None and way[0] == host:
+            return way[1]
+        with self._way_lock:
+            way = self._way
+            if way is not None and way[0] == host:
+                return way[1]
+            found = "exec"
+            for candidate in ("exec", "pty", "login"):
+                try:
+                    if candidate == "login":
+                        r = self._login_exec("uname", timeout=self._PROBE_TIMEOUT,
+                                             encoding="utf-8", environment=None,
+                                             cancel=None)
+                    else:
+                        r = self._exec("uname", timeout=self._PROBE_TIMEOUT,
+                                       get_pty=candidate == "pty", environment=None,
+                                       encoding="utf-8")
+                except (SSHCommandError, SSHTimeoutError, SSHConnectionError) as exc:
+                    if not self.is_connected:
+                        raise            # the target is not there (yet): ask again later
+                    self._emit(logging.DEBUG, f"Probe by {candidate}: {exc}")
+                    continue
+                if r.ok and r.stdout.strip() and "cannot execute" not in r.stdout:
+                    found = candidate
+                    break
+            self._way = (host, found)
+            self._emit(logging.INFO, f"Commands on {host} start by {found}.")
+            return found
+
+    # ------------------------------------------------------------------ #
+    # A command in an interactive login shell (QNX head units)
+    # ------------------------------------------------------------------ #
+    # The markers are written with '' in the middle (NDK''READY): what the
+    # shell echoes of the input never matches them, only what echo prints.
+    # (never set +o emacs / vi there: fatal on a POSIX sh)
+    _LOGIN_SETUP = ("stty -echo; PS1=''; PS2=''; "
+                    "export PAGER=cat SYSTEMD_PAGER=cat GIT_PAGER=cat; echo NDK''READY{tag}\n")
+    _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+    _LOGIN_PROMPT_WAIT = 10.0         # s the shell may take to show its prompt
+    _LOGIN_QUIET = 0.4                # s of silence after the prompt: it is ready
+
+    def run_login(self, command: str, *, timeout: Optional[float] = None,
+                  check: bool = False, environment: Optional[dict] = None,
+                  encoding: str = "utf-8", cancel=None, safe: Optional[bool] = None):
+        """Run *command* in an interactive login shell (a pty), for a target
+        whose plain exec sessions cannot start programs ("sh: mount: cannot
+        execute" on a QNX head unit) while a login can.
+
+        The shell's prompt is waited for, then ``stty -echo; PS1=''; PS2=''``
+        quiets it, and the command runs between two markers; its exit code is
+        what ``$?`` said after it. The output is what the command printed (no
+        echoed input, no prompts; pty output, so stdout and stderr together, in
+        ``stdout``). A shell that closes before the command finished raises
+        :class:`SSHConnectionError`; *timeout* and *cancel* work as in
+        :meth:`run`."""
+        def _do():
+            eff = timeout if timeout is not None else self.config.command_timeout
+            result = self._login_exec(command, timeout=eff, encoding=encoding,
+                                      environment=environment, cancel=cancel)
+            if result.cancelled:
+                if check:
+                    raise SSHCancelledError(f"Command cancelled: {command!r}",
+                                            result=result)
+                return result
+            self._emit(logging.INFO if result.ok else logging.WARNING,
+                       f"exit={result.exit_code} ({result.duration:.2f}s)")
+            if check and not result.ok:
+                raise SSHCommandError(command, result)
+            return result
+        return self._guard("run_login", _do, safe=safe)
+
+    @classmethod
+    def _login_script(cls, command: str, environment: Optional[dict] = None,
+                      tag: str = "") -> str:
+        """What run_login sends: the command, quoted, through ``eval`` in a
+        subshell, on the line of the end marker and the exit. The shell reads
+        all of it before it runs any of it, so a command that reads its input
+        (a prompt, a pager) never takes the marker as input. In the subshell,
+        a syntax error (dash, ash and ksh drop the rest of the line after one
+        in eval), ``exit 3`` or ``set -e`` end only the command, and the
+        marker always comes, with its status. *tag* makes the markers this
+        call's own: output that prints an older marker does not end it."""
+        lines = []
+        for name, value in (environment or {}).items():
+            if not cls._ENV_NAME.match(str(name)):
+                raise ValueError(f"not a variable name for the shell: {name!r}")
+            lines.append(f"export {name}={shlex.quote(str(value))}")
+        lines.append(command if command.strip() else ":")
+        return (f"echo NDK''BEGIN{tag}; (eval {shlex.quote(chr(10).join(lines))}); "
+                f"echo NDK''END{tag}:$?; exit")
+
+    @staticmethod
+    def _looks_like_prompt(text: str) -> bool:
+        tail = text.rstrip(" ")[-2:]
+        return bool(tail) and tail[-1] in "$#>%"
+
+    def _login_exec(self, command, *, timeout, encoding, environment=None,
+                    cancel=None) -> CommandResult:
+        watch = _CancelWatch(cancel)     # a bad cancel fails here, before anything starts
+        transport = self.transport
+        self._emit(logging.INFO, f"$ {command}  (login shell)")
+        started_at, start = time.time(), time.monotonic()
+        deadline = None if not timeout else start + timeout
+        raw = bytearray()
+
+        tag = os.urandom(4).hex()
+        script = self._login_script(command, environment, tag).split("\n")
+        ready_at = re.compile(b"NDKREADY" + tag.encode() + rb"\r?\n")
+        begin_at = re.compile(b"NDKBEGIN" + tag.encode() + rb"\r?\n")
+        end_at = re.compile(b"NDKEND" + tag.encode() + rb":(\d+)\r?\n")
+
+        def tail(nbytes: int = 256) -> str:
+            return bytes(raw[-nbytes:]).decode(encoding, errors="replace").replace("\r", "")
+
+        def body() -> str:
+            from .results import strip_ansi
+            begin = begin_at.search(raw)
+            if begin is None:
+                return ""
+            end = end_at.search(raw, begin.end())
+            chunk = bytes(raw[begin.end():end.start() if end else len(raw)])
+            lines = strip_ansi(chunk.decode(encoding, errors="replace")).split("\n")
+            # a shell that kept echoing shows the script first: not output
+            sent = [s.strip() for s in script if s.strip()]
+            for line in sent:
+                if lines and lines[0].strip() == line:
+                    lines.pop(0)
+                else:
+                    break
+            return "\n".join(lines)
+
+        def result(code: int, *, cancelled: bool = False, note: str = "") -> CommandResult:
+            return CommandResult(command, code, body(), note, time.monotonic() - start,
+                                 host=self.config.host, started_at=started_at,
+                                 cancelled=cancelled)
+
+        to = self.config.connect_timeout
+        with watch:
+            chan = transport.open_session(timeout=to)
+            watch.guard(chan)
+            try:
+                self._request(chan, to, chan.get_pty, term="dumb", width=512, height=50)
+                self._request(chan, to, chan.invoke_shell)
+                chan.settimeout(0.1)
+
+                def pump() -> bool:
+                    """Take what arrived; False once the shell is gone."""
+                    got = False
+                    while True:
+                        try:
+                            data = chan.recv(65536)
+                        except socket.timeout:
+                            return True if got or not chan.closed else False
+                        if not data:
+                            return False
+                        raw.extend(data)
+                        got = True
+                        if not chan.recv_ready():
+                            return True
+
+                def expired() -> bool:
+                    return deadline is not None and time.monotonic() > deadline
+
+                # 1. the prompt: something that looks like one and then quiet,
+                # or nothing more for a while (a shell with no prompt at all)
+                prompt_end = time.monotonic() + self._LOGIN_PROMPT_WAIT
+                last = time.monotonic()
+                while time.monotonic() < prompt_end:
+                    if watch.check():
+                        return result(-1, cancelled=True)
+                    before = len(raw)
+                    if not pump():
+                        raise SSHConnectionError(
+                            f"The login shell on {self.config.host} closed before "
+                            f"it showed a prompt: {tail(300)!r}")
+                    now = time.monotonic()
+                    if len(raw) != before:
+                        last = now
+                    quiet = now - last
+                    if (raw and self._looks_like_prompt(tail()) and quiet >= self._LOGIN_QUIET) \
+                            or quiet >= 2.0:
+                        break
+                # 2. quiet the shell (no echo, no prompts, no pager)
+                chan.sendall(self._LOGIN_SETUP.format(tag=tag))
+                ready_end = time.monotonic() + self._LOGIN_PROMPT_WAIT
+                scan = len(raw)
+                while True:
+                    ready = ready_at.search(raw, max(0, scan - 24))
+                    if ready is not None:
+                        break
+                    scan = len(raw)
+                    if watch.check():
+                        return result(-1, cancelled=True)
+                    if not pump():
+                        raise SSHConnectionError(
+                            f"The login shell on {self.config.host} closed while it "
+                            f"was being set up: {tail(300)!r}")
+                    if time.monotonic() > ready_end or expired():
+                        raise SSHTimeoutError(
+                            f"The login shell on {self.config.host} did not answer "
+                            f"within {self._LOGIN_PROMPT_WAIT:g}s.", result=result(-1))
+                del raw[:ready.end()]
+                # 3. the command between the markers, and its output up to the end
+                chan.sendall("\n".join(script) + "\n")
+                scan = 0
+                while True:
+                    found = end_at.search(raw, max(0, scan - 32))
+                    if found is not None:
+                        code = int(found.group(1))
+                        break
+                    scan = len(raw)
+                    if watch.check():
+                        return result(-1, cancelled=True)
+                    if not pump():
+                        found = end_at.search(raw, max(0, scan - 32))
+                        if found is not None:
+                            code = int(found.group(1))
+                            break
+                        raise SSHConnectionError(
+                            f"The login shell on {self.config.host} closed before "
+                            f"{command!r} finished: {tail(300)!r}")
+                    if expired():
+                        raise SSHTimeoutError(
+                            f"Command timed out after {timeout}s: {command!r}",
+                            result=result(-1))
+                # 4. what the shell printed last, as it ended (exit)
+                drain_end = time.monotonic() + 1.0
+                while time.monotonic() < drain_end and pump():
+                    if chan.exit_status_ready() and not chan.recv_ready():
+                        break
+                return result(code)
+            except (SSHConnectionError, SSHTimeoutError):
+                if watch.cancelled:
+                    return result(-1, cancelled=True)
+                raise
+            except (paramiko.SSHException, OSError, EOFError) as exc:
+                if watch.cancelled:
+                    return result(-1, cancelled=True)
+                raise SSHConnectionError(
+                    f"The login shell on {self.config.host} failed: "
+                    f"{exc or type(exc).__name__}") from exc
+            finally:
+                watch.release(chan)
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------ #
+    # Raw channels (binary streams)
+    # ------------------------------------------------------------------ #
+    def open_channel(self, command: str, *, pty: bool = False,
+                     window_size: Optional[int] = None,
+                     max_packet_size: Optional[int] = None,
+                     timeout: Optional[float] = None) -> paramiko.Channel:
+        """Start *command* on a channel of its own and return the paramiko
+        Channel: unbuffered, the caller reads the bytes (``recv``,
+        ``recv_stderr``, ``exit_status_ready``…) and closes it. For binary
+        streams — a ``cat`` of a screenshot, raw PCM from ``parec`` (no pty:
+        a pty would translate line ends). *window_size* / *max_packet_size*
+        default to the config's; *timeout* bounds opening the channel and
+        starting the command (default ``config.connect_timeout``)."""
+        to = timeout or self.config.connect_timeout
+        chan = self.transport.open_session(window_size=window_size,
+                                           max_packet_size=max_packet_size, timeout=to)
+        try:
+            if pty:
+                self._request(chan, to, chan.get_pty)
+            self._request(chan, to, chan.exec_command, command)
+        except BaseException:
+            chan.close()
+            raise
+        return chan
+
+    def exec_bytes(self, command: str, on_bytes, *, cancel=None,
+                   timeout: Optional[float] = None, pty: bool = False,
+                   window_size: Optional[int] = None, encoding: str = "utf-8",
+                   safe: Optional[bool] = None):
+        """Run *command* and hand its stdout to ``on_bytes(data)`` chunk by chunk,
+        as raw bytes, as they arrive. Returns a CommandResult whose ``stdout`` is
+        empty (the bytes went to *on_bytes*) and whose ``stderr`` is the
+        command's stderr. *cancel* and *timeout* work as in :meth:`run`
+        (``SSHTimeoutError`` carries the result so far); an exception raised by
+        *on_bytes* stops the command and is raised as it is."""
+        def _do():
+            started_at, start = time.time(), time.monotonic()
+            deadline = None if not timeout else start + timeout
+            err = bytearray()
+
+            def result(code, cancelled=False):
+                return CommandResult(command, code, "", err.decode(encoding, "replace"),
+                                     time.monotonic() - start, host=self.config.host,
+                                     started_at=started_at, cancelled=cancelled)
+            watch = _CancelWatch(cancel)     # a bad cancel fails before the command starts
+            self._emit(logging.INFO, f"$ {command}  (bytes)")
+            chan = self.open_channel(command, pty=pty, window_size=window_size)
+            failed = None                # the caller's on_bytes raised this
+            with watch:
+                watch.guard(chan)
+                try:
+                    chan.settimeout(0.1)
+                    while True:
+                        if watch.check():
+                            watch.hangup(chan)
+                            return result(-1, cancelled=True)
+                        try:
+                            data = chan.recv(1 << 20)
+                        except socket.timeout:
+                            data = None
+                        if data:
+                            try:
+                                on_bytes(data)
+                            except BaseException as exc:   # (Ctrl+C too)
+                                failed = exc
+                                watch.hangup(chan)
+                                break
+                        while chan.recv_stderr_ready():
+                            err.extend(chan.recv_stderr(65536))
+                        if data == b"":
+                            break
+                        if deadline is not None and time.monotonic() > deadline:
+                            raise SSHTimeoutError(
+                                f"Command timed out after {timeout}s: {command!r}",
+                                result=result(-1))
+                    if failed is not None:
+                        raise _PassThrough()
+                    if watch.check():    # the watcher closed the channel first
+                        return result(-1, cancelled=True)
+                    # the exit status follows the end of the output (a server
+                    # that never sends one: -1, after a while)
+                    status_end = time.monotonic() + 5.0
+                    while not chan.exit_status_ready() and time.monotonic() < status_end:
+                        if watch.check():
+                            return result(-1, cancelled=True)
+                        time.sleep(0.05)
+                    while chan.recv_stderr_ready():
+                        err.extend(chan.recv_stderr(65536))
+                    return result(chan.recv_exit_status() if chan.exit_status_ready()
+                                  else -1)
+                except _PassThrough:
+                    pass                 # raised below, as it is
+                except (paramiko.SSHException, OSError, EOFError) as exc:
+                    if watch.cancelled:
+                        return result(-1, cancelled=True)
+                    raise SSHCommandError(command, result(-1)) from exc
+                finally:
+                    watch.release(chan)
+                    try:
+                        chan.close()
+                    except Exception:
+                        pass
+            raise failed
+        return self._guard("exec_bytes", _do, safe=safe)
 
     # After the exit status arrives, output is drained until the remote closes
     # the stream. A child the command left in the background can hold that
@@ -1518,7 +2889,7 @@ class SSHHandler:
     _PROMPT_SCAN = 8192
 
     def _exec(self, command, *, timeout, get_pty, environment, encoding,
-              prompt=None, label=None) -> CommandResult:
+              prompt=None, label=None, cancel=None) -> CommandResult:
         """Run *command* on its own channel and return a CommandResult.
 
         stdout and stderr are drained WHILE waiting for the exit status, and the
@@ -1541,19 +2912,22 @@ class SSHHandler:
         deadline = None if not timeout else start + timeout
         out, err = bytearray(), bytearray()
 
-        def result(code: int, note: str = "") -> CommandResult:
+        def result(code: int, note: str = "", cancelled: bool = False) -> CommandResult:
             stderr_text = err.decode(encoding, errors="replace")
             if note:
                 stderr_text = (stderr_text.rstrip() + "\n" + note).strip()
             return CommandResult(shown, code, out.decode(encoding, errors="replace"),
                                  stderr_text, time.monotonic() - start,
-                                 host=self.config.host, started_at=started_at)
+                                 host=self.config.host, started_at=started_at,
+                                 cancelled=cancelled)
 
         chan = None
+        watch = _CancelWatch(cancel).__enter__()
         try:
             open_timeout = min(t for t in (timeout, self.config.connect_timeout,
                                            3600.0) if t)
             chan = transport.open_session(timeout=open_timeout)
+            watch.guard(chan)
             if get_pty:
                 self._request(chan, open_timeout, chan.get_pty)
             if environment:
@@ -1608,12 +2982,17 @@ class SSHHandler:
                     raise SSHTimeoutError(
                         f"Command timed out after {timeout}s: {shown!r}",
                         result=result(-1))
+                if watch.check():
+                    watch.hangup(chan)
+                    return result(-1, cancelled=True)
                 if progressed:
                     idle = 0.001
                 else:
                     time.sleep(idle)
                     idle = min(idle * 2, 0.05)
 
+            if watch.check():            # the watcher closed the channel first
+                return result(-1, cancelled=True)
             if rejected:
                 return result(-1, "the reply to the password prompt was not accepted")
             # exit_status_ready() is also true for a channel that closed without
@@ -1622,9 +3001,13 @@ class SSHHandler:
         except SSHTimeoutError:
             raise
         except (paramiko.SSHException, OSError, EOFError) as exc:
+            if watch.check():
+                return result(-1, cancelled=True)
             raise SSHCommandError(shown, result(-1, str(exc))) from exc
         finally:
+            watch.__exit__(None, None, None)
             if chan is not None:
+                watch.release(chan)
                 try:
                     chan.close()
                 except Exception:
@@ -1653,19 +3036,22 @@ class SSHHandler:
     # ------------------------------------------------------------------ #
     def iter_lines(self, command: str, *, timeout: Optional[float] = None,
                    stop_event=None, get_pty: bool = False, encoding: str = "utf-8",
-                   idle_poll: float = 0.4, combine_stderr: bool = True):
+                   idle_poll: float = 0.4, combine_stderr: bool = True,
+                   cancel=None, _status: Optional[dict] = None):
         """
         Run a (possibly never-ending) command and yield its stdout **line by
         line, live** as it arrives. Ideal for `slog2info -w`, `tail -f`,
         `journalctl -f`, `dmesg -w`, etc.
 
         Stop by: breaking out of the loop, setting ``stop_event`` (a
-        threading.Event), or ``timeout`` seconds elapsing. The channel is always
-        closed on exit.
+        threading.Event), ``cancel`` (an Event or a callable returning True,
+        looked at every 0.25 s at least: the command also gets SIGHUP), or
+        ``timeout`` seconds elapsing. The channel is always closed on exit.
 
         >>> for line in ssh.iter_lines("tail -f /var/log/syslog"):
         ...     print(line)
         """
+        fired = _cancel_test(cancel)     # a bad cancel fails here, before anything starts
         to = self.config.connect_timeout
         chan = self.transport.open_session(timeout=to)
         try:
@@ -1681,13 +3067,18 @@ class SSHHandler:
         except BaseException:
             chan.close()
             raise
-        chan.settimeout(idle_poll)
+        chan.settimeout(idle_poll if fired is None else min(idle_poll, 0.2))
         self._emit(logging.INFO, f"$ {command}  (streaming)")
         start = time.time()
         buf = b""
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
+                    break
+                if fired is not None and fired():
+                    if _status is not None:
+                        _status["cancelled"] = True
+                    _send_signal(chan, "HUP")
                     break
                 if timeout and (time.time() - start) > timeout:
                     break
@@ -1716,7 +3107,8 @@ class SSHHandler:
                stop_on_match: bool = False, save_to: Optional[str] = None,
                append: bool = True, clean: bool = True,
                timeout: Optional[float] = None, combine_stderr: bool = True,
-               stop_event=None, encoding: str = "utf-8", safe: Optional[bool] = None):
+               stop_event=None, encoding: str = "utf-8", cancel=None,
+               safe: Optional[bool] = None):
         """
         Consume a streaming command with built-in matching and file logging.
 
@@ -1726,7 +3118,12 @@ class SSHHandler:
         :param stop_on_match: stop as soon as a line matches (send/expect style).
         :param save_to:       local file path to tee every line into.
         :param append:        append (default) vs overwrite the save file.
-        :returns:             dict with 'lines' (count) and 'matches' (list).
+        :param cancel:        a threading.Event, or a callable returning True to
+                              stop (besides ``stop_event``): looked at every
+                              0.25 s at least; the command gets SIGHUP and the
+                              result says ``cancelled``.
+        :returns:             dict with 'lines' (count), 'matches' (list),
+                              'matched', 'saved_to' and 'cancelled'.
         """
         import re
         from .results import strip_ansi
@@ -1734,6 +3131,7 @@ class SSHHandler:
         def _do():
             pat = re.compile(match) if isinstance(match, str) else match
             matches, count = [], 0
+            status = {"cancelled": False}
             fh = None
             if save_to:
                 target = os.path.abspath(os.path.expanduser(save_to))
@@ -1742,7 +3140,8 @@ class SSHHandler:
             try:
                 for line in self.iter_lines(command, timeout=timeout,
                                             stop_event=stop_event, encoding=encoding,
-                                            combine_stderr=combine_stderr):
+                                            combine_stderr=combine_stderr,
+                                            cancel=cancel, _status=status):
                     if clean:
                         line = strip_ansi(line)
                     count += 1
@@ -1758,7 +3157,8 @@ class SSHHandler:
                         if stop_on_match:
                             break
                 return {"lines": count, "matches": matches,
-                        "matched": bool(matches), "saved_to": save_to}
+                        "matched": bool(matches), "saved_to": save_to,
+                        "cancelled": status["cancelled"]}
             finally:
                 if fh:
                     fh.close()
@@ -2688,33 +4088,82 @@ class SSHHandler:
             _close_soon(new)          # another thread won, or the link was replaced
         raise SSHNotConnectedError(f"Not connected to {self.config.host}.")
 
-    def open_sftp(self) -> paramiko.SFTPClient:
+    def open_sftp(self, timeout: Optional[float] = None) -> paramiko.SFTPClient:
         """A NEW SFTP client of the caller's own (close it when done) — for a
-        worker thread; same timeouts and errors as :meth:`sftp`."""
-        return self._new_sftp(self.client)
+        worker thread; same timeouts and errors as :meth:`sftp`.
 
-    def _new_sftp(self, client: paramiko.SSHClient) -> paramiko.SFTPClient:
+        *timeout*: seconds the SFTP subsystem may take to start (default
+        ``config.sftp_start_timeout``, 20). A target that accepted the login but
+        stopped answering waited an hour; past *timeout* the connection is
+        closed and :class:`SSHTimeoutError` raised (the next call reconnects)."""
+        return self._new_sftp(self.client, timeout)
+
+    def _new_sftp(self, client: paramiko.SSHClient,
+                  start_timeout: Optional[float] = None) -> paramiko.SFTPClient:
         t = client.get_transport()
         if t is None or not t.is_active():
             raise SSHNotConnectedError(f"Disconnected from {self.config.host}.")
         to = self.config.connect_timeout
-        try:
-            chan = t.open_session(timeout=to)
+        limit = (self.config.sftp_start_timeout if start_timeout is None
+                 else start_timeout)
+        # One deadline for the channel, the subsystem request and the version
+        # handshake together: past it the connection is closed (what waits on
+        # it wakes up) — the guard GenLab ran as a thread of its own.
+        lock, state = threading.Lock(), {"started": False, "expired": False}
+
+        def expire():
+            with lock:
+                if state["started"]:
+                    return
+                state["expired"] = True
             try:
-                self._request(chan, to, chan.invoke_subsystem, "sftp")
+                t.close()
+            except Exception:
+                pass
+        timer = None
+        if limit:
+            timer = threading.Timer(limit, expire)
+            timer.daemon = True
+            timer.start()
+
+        def too_late() -> SSHTimeoutError:
+            msg = (f"SFTP did not start within {limit:g} s - the target accepted "
+                   f"the login but stopped answering")
+            self._emit(logging.WARNING, f"{self.config.host}: {msg}; the connection "
+                                        f"was closed.")
+            return SSHTimeoutError(msg)
+        try:
+            bounds = [x for x in (to, limit) if x]
+            chan = t.open_session(timeout=min(bounds) if bounds else None)
+            try:
+                # the deadline above bounds the request; without one, its own
+                self._request(chan, None if limit else to, chan.invoke_subsystem, "sftp")
                 # bounds every SFTP request, the version handshake below included
                 # (Paramiko's default is to wait for ever on a silent link)
                 chan.settimeout(self.config.sftp_timeout or None)
-                return paramiko.SFTPClient(chan)
+                sftp = paramiko.SFTPClient(chan)
             except BaseException:
                 chan.close()
                 raise
+            with lock:
+                if not state["expired"]:
+                    state["started"] = True
+            if not state["started"]:
+                raise too_late()
+            return sftp
         except SSHError:
+            if state["expired"]:
+                raise too_late() from None
             raise
         except (paramiko.SSHException, EOFError, OSError) as exc:
+            if state["expired"]:
+                raise too_late() from exc
             raise SSHTransferError(
                 f"Could not start SFTP on {self.config.host}: {exc or type(exc).__name__}"
                 f" (is an SFTP server enabled on that machine?)") from exc
+        finally:
+            if timer is not None:
+                timer.cancel()
 
     # How many symlinked folders deep a recursive walk follows. A link loop is
     # normally caught by comparing real paths, but that relies on the server's
@@ -2944,7 +4393,7 @@ class SSHHandler:
     # file's mode and owner — and written in place, as 2.0 did, where replacing
     # would change what the file is (hard links, devices) or cannot be done.
     def push(self, local_path: str, remote_path: str, *, recursive: bool = False,
-             make_dirs: bool = True, callback=None, sftp=None,
+             make_dirs: bool = True, callback=None, sftp=None, cancel=None,
              safe: Optional[bool] = None):
         """Upload a file or directory (SFTP). Returns TransferResult.
 
@@ -2958,10 +4407,18 @@ class SSHHandler:
         one hard link, is not a regular file (``/dev/null``, a FIFO, a device),
         sits in a folder that is not writable, would lose its owner, or there is
         no room for a second copy. A symbolic link is followed: the file it
-        points at is replaced."""
+        points at is replaced.
+
+        ``cancel`` (a threading.Event, or a callable returning True to stop) is
+        looked at with every chunk and at least every 0.25 s: the transfer
+        stops, the file being written is left as it was (as for a failure), and
+        :class:`SSHCancelledError` is raised. A transfer that gets no further
+        within 2 s has its SFTP channel closed (the connection stays usable);
+        one stuck writing into a full send buffer is freed only when the
+        connection itself goes."""
         return self._guard("push", self._push, local_path, remote_path,
                            recursive=recursive, make_dirs=make_dirs,
-                           callback=callback, sftp=sftp, safe=safe)
+                           callback=callback, sftp=sftp, cancel=cancel, safe=safe)
 
     def _transfer_failed(self, exc, sftp, shared: bool, what: str):
         """The SSHTransferError for a failed push / pull. A request that timed out
@@ -2972,17 +4429,63 @@ class SSHHandler:
         return SSHTransferError(f"Failed to {what}: {exc or type(exc).__name__}")
 
     def _push(self, local_path, remote_path, *, recursive, make_dirs, callback,
-              sftp=None):
+              sftp=None, cancel=None):
+        with _CancelWatch(cancel, grace=self._TRANSFER_GRACE) as watch:
+            return self._push_watched(local_path, remote_path, recursive=recursive,
+                                      make_dirs=make_dirs, callback=callback,
+                                      sftp=sftp, watch=watch)
+
+    # A cancelled transfer stops at its next chunk; one that does not get to
+    # one this soon (a stalled link) has its SFTP channel closed.
+    _TRANSFER_GRACE = 2.0
+
+    def _cancellable(self, callback, watch):
+        """*callback* for a transfer, raising _Cancelled once *watch* fired —
+        before each file too (its ``_turbossh_check``)."""
+        if not watch.active:
+            return callback
+
+        def check():
+            if watch.check():
+                raise _Cancelled()
+
+        def cb(done, total):
+            check()
+            if callback is not None:
+                callback(done, total)
+        cb._turbossh_check = check
+        return cb
+
+    def _transfer_cancelled(self, watch, sftp, shared: bool, what: str):
+        """The SSHCancelledError of a cancelled push / pull. A shared SFTP client
+        whose channel the watcher had to close is dropped."""
+        if shared and sftp is not None:
+            try:
+                chan = sftp.get_channel()
+            except Exception:
+                chan = None
+            if chan is None or chan.closed:
+                self._drop_shared_sftp(only=sftp)
+        self._emit(logging.WARNING, f"{what}: cancelled.")
+        return SSHCancelledError(f"{what} was cancelled.")
+
+    def _push_watched(self, local_path, remote_path, *, recursive, make_dirs,
+                      callback, sftp, watch):
         local_path = os.path.expanduser(local_path)
         remote_path = self._rnorm(remote_path)
         if not os.path.exists(local_path):
             raise SSHTransferError(f"Local path does not exist: {local_path}")
         start = time.time()
         shared = sftp is None
+        what = f"push {local_path} -> {remote_path}"
+        callback = self._cancellable(callback, watch)
+        if watch.check():
+            raise self._transfer_cancelled(watch, None, shared, what)
         try:
             # inside the try: a target without an SFTP server, or a link that
             # dies here, is a transfer error like any other
             sftp = sftp or self.sftp()
+            watch.guard(_SftpChannel(sftp))
             if os.path.isdir(local_path):
                 if not recursive:
                     raise SSHTransferError(f"{local_path} is a directory; "
@@ -2997,11 +4500,16 @@ class SSHHandler:
                 self._emit(logging.INFO, f"PUSH {local_path} -> {remote_path}")
                 self._put_file(sftp, local_path, remote_path, callback, existing)
                 size, count = os.path.getsize(local_path), 1
+        except _Cancelled as exc:
+            raise self._transfer_cancelled(watch, sftp, shared, what) from exc
         except SSHError:
+            if watch.cancelled:
+                raise self._transfer_cancelled(watch, sftp, shared, what) from None
             raise
         except (IOError, OSError, EOFError, paramiko.SSHException) as exc:
-            raise self._transfer_failed(
-                exc, sftp, shared, f"push {local_path} -> {remote_path}") from exc
+            if watch.cancelled:
+                raise self._transfer_cancelled(watch, sftp, shared, what) from exc
+            raise self._transfer_failed(exc, sftp, shared, what) from exc
         return TransferResult(local_path, remote_path, "push", "sftp", size,
                               time.time() - start, count)
 
@@ -3073,13 +4581,16 @@ class SSHHandler:
 
     def _put_file(self, sftp, local, remote, callback,
                   existing=_transfer.UNKNOWN) -> None:
+        check = getattr(callback, "_turbossh_check", None)
+        if check is not None:
+            check()                      # cancelled: not the next file
         how = _transfer.put_file(sftp, local, remote, callback=callback,
                                  existing=existing)
         if how:
             self._emit(logging.INFO, f"{remote} was written {how}.")
 
     def pull(self, remote_path: str, local_path: str, *, recursive: bool = False,
-             make_dirs: bool = True, callback=None, sftp=None,
+             make_dirs: bool = True, callback=None, sftp=None, cancel=None,
              safe: Optional[bool] = None):
         """Download a file or directory (SFTP). Returns TransferResult.
 
@@ -3087,10 +4598,11 @@ class SSHHandler:
         aborted part-way leaves no partial file behind and an existing local file
         as it was. A recursive pull never writes outside *local_path*: remote
         names that aren't valid here (``a:b``, ``CON``, a trailing dot on
-        Windows) are saved under a safe name, with a warning."""
+        Windows) are saved under a safe name, with a warning. ``cancel`` works
+        as in :meth:`push`: a cancelled pull leaves no partial file."""
         return self._guard("pull", self._pull, remote_path, local_path,
                            recursive=recursive, make_dirs=make_dirs,
-                           callback=callback, sftp=sftp, safe=safe)
+                           callback=callback, sftp=sftp, cancel=cancel, safe=safe)
 
     @staticmethod
     def _sftp_get(sftp, remote: str, local: str, callback) -> None:
@@ -3101,18 +4613,33 @@ class SSHHandler:
         place only when complete (keeping the old file's permissions): a failed
         or aborted download leaves an existing file untouched and no partial
         file behind. Through a symlink, the file it points at is replaced."""
+        check = getattr(callback, "_turbossh_check", None)
+        if check is not None:
+            check()                      # cancelled: not the next file
         _, how = _transfer.get_file(sftp, remote_path, local_path, callback)
         if how:
             self._emit(logging.INFO, f"{local_path} was written {how}.")
 
     def _pull(self, remote_path, local_path, *, recursive, make_dirs, callback,
-              sftp=None):
+              sftp=None, cancel=None):
+        with _CancelWatch(cancel, grace=self._TRANSFER_GRACE) as watch:
+            return self._pull_watched(remote_path, local_path, recursive=recursive,
+                                      make_dirs=make_dirs, callback=callback,
+                                      sftp=sftp, watch=watch)
+
+    def _pull_watched(self, remote_path, local_path, *, recursive, make_dirs,
+                      callback, sftp, watch):
         remote_path = self._rnorm(remote_path)
         local_path = os.path.expanduser(local_path)
         start = time.time()
         shared = sftp is None
+        what = f"pull {remote_path} -> {local_path}"
+        callback = self._cancellable(callback, watch)
+        if watch.check():
+            raise self._transfer_cancelled(watch, None, shared, what)
         try:
             sftp = sftp or self.sftp()
+            watch.guard(_SftpChannel(sftp))
             # Verify the remote path exists FIRST, so a missing source never
             # leaves anything behind locally.
             if not self._remote_exists(sftp, remote_path):
@@ -3130,11 +4657,16 @@ class SSHHandler:
                 self._emit(logging.INFO, f"PULL {remote_path} -> {local_path}")
                 self._get_file(sftp, remote_path, local_path, callback)
                 size, count = os.path.getsize(local_path), 1
+        except _Cancelled as exc:
+            raise self._transfer_cancelled(watch, sftp, shared, what) from exc
         except SSHError:
+            if watch.cancelled:
+                raise self._transfer_cancelled(watch, sftp, shared, what) from None
             raise
         except (IOError, OSError, EOFError, paramiko.SSHException) as exc:
-            raise self._transfer_failed(
-                exc, sftp, shared, f"pull {remote_path} -> {local_path}") from exc
+            if watch.cancelled:
+                raise self._transfer_cancelled(watch, sftp, shared, what) from exc
+            raise self._transfer_failed(exc, sftp, shared, what) from exc
         return TransferResult(remote_path, local_path, "pull", "sftp", size,
                               time.time() - start, count)
 

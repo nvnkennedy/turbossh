@@ -108,6 +108,67 @@ with SSHHandler(cfg) as ssh:
     ...
 ```
 
+**Head units that log in without a password.** A QNX or RichOS head unit often
+takes SSH's `none` login: no password and no key. Give no password (or
+`password=""`) and no key file, and TurboSSH tries `none` first, then a blank
+password and your keys and agent, all on one connection. When you have keys
+(`~/.ssh/id_*`, or an agent holding some), they go before the blank password: a
+blank password is a "Failed password" line a fail2ban counts, and a strict
+`MaxAuthTries` can run out before the right key. The server's answer to `none`
+lists the methods it allows, so the others are skipped. Afterwards
+`ssh.auth_method` says what worked: `"none"`, `"password"`,
+`"empty-password"`, `"key"` or `"agent"`. Pass `allow_none_auth=False` to skip
+the `none` attempt.
+
+```python
+ssh = SSHHandler(SSHConfig(host="10.0.0.9", username="root"))
+ssh.connect()
+ssh.auth_method                  # "none"
+```
+
+**Fast links and quick checks.** These settings tune the connection:
+- `window_size` and `max_packet_size` set the SSH window and the largest packet
+  of every channel. `window_size=2**26` (64 MiB) lets a 5 MB screenshot or a
+  live audio stream through without waiting for window updates.
+- `tcp_nodelay=True` sends small writes at once (touch events, request and
+  reply).
+- `keepalive_interval=5` shows a target that powered off as a dead connection
+  within seconds.
+- `max_retries=1` is exactly one attempt, with no retry and no wait: right for
+  a check that runs every second.
+
+```python
+cfg = SSHConfig(host="10.0.0.9", username="root", window_size=2**26,
+                tcp_nodelay=True, keepalive_interval=5, max_retries=1)
+```
+
+**Is the target up?** `ssh.check(timeout=5)` makes one full login on a
+connection of its own, closes it, and says what happened. The handler's own
+connection is left alone. It returns a dict with `ok`, `kind`, `seconds`,
+`banner` (the server's version string) and `error`. `kind` is one of:
+- `"ok"`: logged in;
+- `"refused"`: the network is up, the SSH server is not (yet);
+- `"reset"`: the connection was closed during the handshake;
+- `"banner-timeout"`: connected, but no SSH greeting in time;
+- `"auth-failed"`;
+- `"timeout"`: no TCP answer;
+- `"unreachable"`: no route to the host, or it is down;
+- `"cancelled"` or `"error"`.
+
+Lines a server prints before its SSH greeting are accepted. A boot watch can
+count two or three `"ok"` in a row as booted, and three `"timeout"` or
+`"unreachable"` in a row as off; `"refused"` and `"reset"` mean the target is
+there. `check()` logs nothing below a warning, so it can poll every second.
+
+```python
+state = ssh.check(timeout=3)
+if state["kind"] == "refused":
+    print("network up, SSH server still starting")
+```
+
+`connect(cancel=stop)` stops at once when `stop` is set (see
+[Running commands](#running-commands)).
+
 **In the GUI.**
 1. Click **New session** in the left sidebar (or right-click the sidebar →
    *New session…*).
@@ -150,6 +211,63 @@ res.duration      # seconds it took
 ssh.run("reboot", check=True)        # raise SSHCommandError on a non-zero exit
 ssh.sudo("mount -o remount,rw /")    # sudo; the password is sent only if sudo asks
 ssh.run_many(["sync", "reboot"])     # several commands over one channel
+```
+
+**Stopping a command.** Every blocking call takes `cancel`: a
+`threading.Event`, or a callable that returns True to stop. It is checked at
+least every 0.25 s. When it fires, the command's channel is closed (the remote
+command gets SIGHUP) and the call comes back at once. The connection stays
+usable.
+- `run` returns its result with `cancelled=True` and the output so far; with
+  `check=True` it raises `SSHCancelledError` instead.
+- `stream` returns its dict with `"cancelled": True`.
+- `open_shell().read_until(..., cancel=...)` returns a `ShellResult` with
+  `cancelled=True`; the shell's channel is closed.
+- `push` and `pull` raise `SSHCancelledError` and leave no partial file.
+- `connect` raises `SSHCancelledError` and closes the half-made connection.
+
+```python
+import threading
+stop = threading.Event()          # set it from a Stop button or another thread
+res = ssh.run("long_test.sh", cancel=stop)
+if res.cancelled:
+    print(f"stopped after {res.duration:.1f} s")
+```
+
+**Targets whose exec sessions cannot start programs.** On some QNX head units
+a plain exec session fails (`sh: mount: cannot execute`) while an interactive
+login works. `ssh.run_login(command)` runs the command in a login shell with a
+pty. It waits for the prompt, turns echo and the prompts off, runs the command
+between markers, and returns its exit code and its output (no echoed input, no
+prompts). Each call is a fresh login shell, and the command runs in a subshell
+there, so a syntax error, `exit 3` or `set -e` ends only the command and its
+status comes back. A shell that closes early raises `SSHConnectionError`;
+`timeout` and `cancel` work as for `run`. The command is typed into a terminal,
+so keep it free of tabs and control characters, and its lines under 4 KB. To make `run()` itself work this way, set
+`command_mode`:
+- `"login"` runs every command in a login shell;
+- `"auto"` tries `uname` once per handler: by exec, then by exec with a pty,
+  then in the login shell. The way that works is kept for the handler's life,
+  and `ssh.command_way` says which it was.
+
+```python
+cfg = SSHConfig(host="10.0.0.9", username="root", command_mode="auto")
+with SSHHandler(cfg) as ssh:
+    ssh.run("mount").text         # works where exec alone cannot
+    ssh.run_login("echo $PATH")   # one command in a login shell
+```
+
+**Binary streams.** `ssh.open_channel(command)` starts a command on a channel
+of its own and returns the paramiko `Channel`. It is unbuffered and you read
+the raw bytes: a screenshot sent with `cat`, or raw PCM audio from `parec`
+(keep `pty=False`, so line ends are not translated). `ssh.exec_bytes(command,
+on_bytes)` hands the bytes to your callback chunk by chunk and returns the exit
+code and stderr; it takes `cancel` and `timeout` too. For anything else,
+`ssh.transport` is the connection's paramiko `Transport`.
+
+```python
+with open("shot.png", "wb") as fh:
+    ssh.exec_bytes("cat /tmp/shot.png", fh.write)
 ```
 
 **In the GUI.** Open the session's **Terminal** tab and just type — it's a real
@@ -228,6 +346,16 @@ for root, dirs, files in ssh.walk("/etc/network"):
 SCP is there too — `ssh.scp_push(...)` / `ssh.scp_pull(...)` — for servers where
 it's faster or SFTP is disabled.
 
+`push` and `pull` take `cancel` too (see [Running commands](#running-commands)).
+A cancelled transfer leaves the target file as it was, as a failed one does.
+
+Starting SFTP cannot hang. A target that accepted the login but stopped
+answering used to keep the caller waiting for an hour. Now SFTP has to start
+within `sftp_start_timeout` seconds (20 by default; `open_sftp(timeout=...)` for
+a client of your own). Past that, the connection is closed and
+`SSHTimeoutError` is raised: "SFTP did not start within 20 s - the target
+accepted the login but stopped answering". The next call reconnects.
+
 A transfer never leaves a half-written file under the real name. `push`,
 `pull`, the GUI's uploads and downloads and the remote editor all write to a
 temporary `.<name>.<n>.tsp` next to the target. They rename it over the target
@@ -272,6 +400,49 @@ print(list_serial_ports())                        # what's plugged in
 with SerialHandler("COM5", baudrate=115200) as ser:
     ser.write("version\n")
     ser.stream(on_line=print, match="login:")     # follow it
+```
+
+**Ports that come and go.** Pass `auto_reopen=True` to keep a session alive when
+the port goes away while it is open: a USB console that is unplugged, or an ECU
+power cycle that drops its USB-serial adapter.
+- The handler closes the dead handle and tries to open the same port again,
+  with the same settings, about once a second, until it is back or you call
+  `close()`.
+- Meanwhile reads do not raise. `read_available()` returns `b""` after its usual
+  timeout, and `iter_lines()` and `stream()` keep going, still stopping on
+  `stop_event` or their `timeout`.
+- A write while the port is gone raises `SerialMissingError`, so your code
+  decides whether to wait and send it again.
+- When the port is back, an INFO line says how long it was gone, and
+  `on_gap(started, ended)` is called with the two `time.time()` values. An
+  exception from the callback is logged and ignored.
+
+Errors are typed. `open()` raises `SerialBusyError` when another program has
+the port open ("Access is denied", "Zugriff verweigert"), `SerialMissingError`
+when there is no such port, and `SerialError` otherwise. Every `SerialError` has
+a `kind` of `"busy"`, `"missing"` or `"error"`, and the OS error is chained.
+Without `auto_reopen`, a port that goes away makes reads and writes raise
+`SerialMissingError`.
+
+One thread may read while another writes, also across a reopen. Reads take
+turns with reads and writes with writes, each write goes out whole, a write
+never waits behind a read that is waiting for data, and `close()` is safe from
+any thread. `write_bytes` keeps its write timeout.
+
+```python
+from turbossh import SerialHandler, SerialBusyError, SerialMissingError
+
+def gap(started, ended):
+    print(f"console was gone for {ended - started:.1f} s")
+
+try:
+    with SerialHandler("COM5", baudrate=115200, auto_reopen=True, on_gap=gap) as ser:
+        for line in ser.iter_lines(timeout=600):   # survives ECU power cycles
+            print(line)
+except SerialBusyError:
+    print("COM5 is open in another program")
+except SerialMissingError:
+    print("COM5 is not there")
 ```
 
 `write()` gives up when no byte has gone out for `write_timeout` seconds (5 by
@@ -675,14 +846,15 @@ turbossh-docs         # open the documentation
 
 ## Results & errors
 
-- `CommandResult` — `.exit_code`, `.stdout`, `.stderr`, `.text`, `.duration`, `.ok`
+- `CommandResult` — `.exit_code`, `.stdout`, `.stderr`, `.text`, `.duration`, `.ok`, `.cancelled`
 - `TransferResult` — `.size_bytes`, `.duration`, `.human_speed`, `.files`
 - `OperationResult` — the safe-mode wrapper: `bool(res)`, `.value`, `.error`,
   `.unwrap()`
 
 Raise mode (the default) gives you typed exceptions to catch precisely —
 `SSHConnectionError`, `SSHAuthenticationError`, `SSHTimeoutError`,
-`SSHCommandError`, `SSHTransferError`, `SerialError`, `WinRMError`,
+`SSHCommandError`, `SSHCancelledError`, `SSHTransferError`, `SerialError`
+(with `SerialBusyError` and `SerialMissingError`), `WinRMError`,
 `CredentialError`, all under `SSHError`. Safe mode (`SSHHandler(cfg, safe=True)`)
 turns every call into an `OperationResult` instead.
 
